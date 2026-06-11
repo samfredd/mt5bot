@@ -1,0 +1,293 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum Role {
+  ADMIN
+  MANAGER
+  VIEWER
+}
+
+enum TradingMode {
+  MANUAL
+  SEMI_AUTO
+  AUTO
+  COPY
+}
+
+enum TradeDirection {
+  BUY
+  SELL
+}
+
+enum TradeStatus {
+  ANALYZED
+  PENDING_APPROVAL
+  APPROVED
+  REJECTED
+  RISK_BLOCKED
+  EXECUTED
+  FAILED
+  CLOSED
+  CANCELLED
+}
+
+enum ApprovalChannel {
+  DASHBOARD
+  TELEGRAM
+  WHATSAPP
+}
+
+enum NewsImpact {
+  LOW
+  MEDIUM
+  HIGH
+}
+
+enum NotificationChannel {
+  WEB
+  TELEGRAM
+  WHATSAPP
+  EMAIL
+}
+
+model User {
+  id                 String         @id @default(cuid())
+  email              String         @unique
+  passwordHash       String
+  role               Role           @default(VIEWER)
+  totpSecret         String?
+  totpEnabled        Boolean        @default(false)
+  liveTradingEnabled Boolean        @default(false)
+  createdAt          DateTime       @default(now())
+  accounts           Mt5Account[]
+  strategies         Strategy[]
+  riskSettings       RiskSettings?
+  trades             Trade[]
+  telegramUsers      TelegramUser[]
+  whatsappUsers      WhatsappUser[]
+  notifications      Notification[]
+  copyTraders        CopyTrader[]
+  notificationPrefs  Json           @default("{}")
+}
+
+model Mt5Account {
+  id                String   @id @default(cuid())
+  userId            String
+  user              User     @relation(fields: [userId], references: [id])
+  label             String
+  login             String
+  server            String
+  isDemo            Boolean  @default(true)
+  verified          Boolean  @default(false)
+  // AES-256-GCM encrypted investor/trade password; never stored in plaintext
+  passwordEnc       String?
+  createdAt         DateTime @default(now())
+  trades            Trade[]
+}
+
+model Strategy {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id])
+  name      String
+  type      String // trend_following | scalping | swing | price_action | news_aware | copy | custom
+  enabled   Boolean  @default(false)
+  // symbols, timeframes, entry/exit rules, SL/TP logic, lot sizing,
+  // maxTradesPerDay, sessions, newsBehavior, riskLimits
+  config    Json
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  trades    Trade[]
+}
+
+model RiskSettings {
+  id                     String  @id @default(cuid())
+  userId                 String  @unique
+  user                   User    @relation(fields: [userId], references: [id])
+  maxRiskPerTradePct     Float   @default(1.0)
+  maxDailyLossPct        Float   @default(3.0)
+  maxWeeklyLossPct       Float   @default(6.0)
+  maxDrawdownPct         Float   @default(10.0)
+  maxOpenTrades          Int     @default(5)
+  maxTradesPerSymbol     Int     @default(2)
+  maxTradesPerDay        Int     @default(10)
+  maxLotSize             Float   @default(0.5)
+  minRiskReward          Float   @default(1.5)
+  requireStopLoss        Boolean @default(true)
+  requireTakeProfit      Boolean @default(false)
+  maxSpreadPoints        Float   @default(30)
+  maxAtrVolatilityPct    Float   @default(3.0)
+  newsRiskLimit          NewsImpact @default(MEDIUM)
+  pauseBeforeNewsMin     Int     @default(30)
+  pauseAfterNewsMin      Int     @default(30)
+  allowNewsTrading       Boolean @default(false)
+  allowedSessions        Json    @default("[\"london\",\"newyork\"]")
+  equityProtectionPct    Float   @default(80.0)
+  copyExposureLimitPct   Float   @default(20.0)
+  maxDailyCopiedTrades   Int     @default(10)
+  // Circuit breaker: stop opening trades after N consecutive losses today
+  maxConsecutiveLosses   Int     @default(3)
+}
+
+model Trade {
+  id            String         @id @default(cuid())
+  userId        String
+  user          User           @relation(fields: [userId], references: [id])
+  accountId     String?
+  account       Mt5Account?    @relation(fields: [accountId], references: [id])
+  strategyId    String?
+  strategy      Strategy?      @relation(fields: [strategyId], references: [id])
+  symbol        String
+  direction     TradeDirection
+  lots          Float
+  entryPrice    Float?
+  stopLoss      Float?
+  takeProfit    Float?
+  status        TradeStatus
+  mode          TradingMode
+  mt5Ticket     String?
+  profit        Float?
+  openedAt      DateTime?
+  closedAt      DateTime?
+  createdAt     DateTime       @default(now())
+  // Full decision trail: strategy signal, AI verdict, risk checks, news risk
+  explanation   Json           @default("{}")
+  aiAnalysisId  String?
+  aiAnalysis    AiAnalysisLog? @relation(fields: [aiAnalysisId], references: [id])
+  approval      TradeApproval?
+  copiedTrade   CopiedTrade?
+}
+
+model TradeApproval {
+  id          String           @id @default(cuid())
+  tradeId     String           @unique
+  trade       Trade            @relation(fields: [tradeId], references: [id])
+  requestedAt DateTime         @default(now())
+  expiresAt   DateTime
+  decidedAt   DateTime?
+  decidedBy   String?
+  channel     ApprovalChannel?
+  status      String           @default("pending") // pending | approved | rejected | expired
+}
+
+model CopyTrader {
+  id           String        @id @default(cuid())
+  userId       String
+  user         User          @relation(fields: [userId], references: [id])
+  name         String
+  source       String // manual | signal_provider id / url
+  active       Boolean       @default(false)
+  // winRate, profitFactor, drawdown, avgMonthlyReturn, consistency,
+  // accountAgeMonths, tradingFrequency, avgTradeDurationH, lossStreakMax,
+  // symbolSpecialization, lotBehavior, newsBehavior
+  metrics      Json          @default("{}")
+  riskScore    Float         @default(50)
+  // lotMultiplier, fixedLot, maxRiskPerCopiedTradePct, symbolsAllowed,
+  // symbolsBlocked, stopAfterDrawdownPct, stopAfterLossStreak
+  copyRules    Json          @default("{}")
+  createdAt    DateTime      @default(now())
+  copiedTrades CopiedTrade[]
+}
+
+model CopiedTrade {
+  id           String     @id @default(cuid())
+  copyTraderId String
+  copyTrader   CopyTrader @relation(fields: [copyTraderId], references: [id])
+  tradeId      String     @unique
+  trade        Trade      @relation(fields: [tradeId], references: [id])
+  sourceRef    String?
+  createdAt    DateTime   @default(now())
+}
+
+model NewsEvent {
+  id        String     @id @default(cuid())
+  title     String
+  country   String?
+  currency  String?
+  impact    NewsImpact
+  eventTime DateTime
+  forecast  String?
+  previous  String?
+  source    String
+  raw       Json       @default("{}")
+  createdAt DateTime   @default(now())
+
+  @@unique([title, eventTime])
+}
+
+model AiAnalysisLog {
+  id         String   @id @default(cuid())
+  symbol     String
+  model      String
+  prompt     String
+  response   Json
+  decision   String?
+  confidence Float?
+  valid      Boolean  @default(true)
+  createdAt  DateTime @default(now())
+  trades     Trade[]
+}
+
+model TelegramUser {
+  id         String  @id @default(cuid())
+  userId     String
+  user       User    @relation(fields: [userId], references: [id])
+  telegramId String  @unique
+  chatId     String?
+  verified   Boolean @default(false)
+  linkCode   String?
+}
+
+model WhatsappUser {
+  id       String  @id @default(cuid())
+  userId   String
+  user     User    @relation(fields: [userId], references: [id])
+  phone    String  @unique
+  verified Boolean @default(false)
+  linkCode String?
+}
+
+model Notification {
+  id        String              @id @default(cuid())
+  userId    String
+  user      User                @relation(fields: [userId], references: [id])
+  channel   NotificationChannel
+  type      String
+  title     String
+  body      String
+  status    String              @default("pending") // pending | sent | failed
+  createdAt DateTime            @default(now())
+  sentAt    DateTime?
+}
+
+model AuditLog {
+  id        String   @id @default(cuid())
+  userId    String?
+  actor     String // user email / "system" / "telegram:<id>" / "whatsapp:<phone>"
+  category  String // auth | trade | risk | strategy | news | copy | telegram | whatsapp | system
+  action    String
+  detail    Json     @default("{}")
+  createdAt DateTime @default(now())
+
+  @@index([category, createdAt])
+}
+
+model ErrorLog {
+  id        String   @id @default(cuid())
+  source    String
+  message   String
+  detail    Json     @default("{}")
+  createdAt DateTime @default(now())
+}
+
+model SystemSetting {
+  key       String   @id
+  value     Json
+  updatedAt DateTime @updatedAt
+}

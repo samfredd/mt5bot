@@ -1,0 +1,54 @@
+# Real-mode bridge: MetaTrader 5 terminal + Windows Python under Wine.
+#
+#   docker compose --profile real build
+#   docker compose --profile real up -d mt5-bridge-real
+#
+# NOTE: x86_64 image (~5 GB, long first build). On Apple Silicon it runs
+# emulated — workable for testing, but prefer an x86_64 Linux host or a
+# Windows VPS for production trading.
+FROM ubuntu:22.04
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    WINEPREFIX=/opt/wineprefix \
+    WINEDEBUG=-all \
+    DISPLAY=:99
+
+RUN dpkg --add-architecture i386 && apt-get update && \
+    apt-get install -y --no-install-recommends wget ca-certificates xvfb x11vnc winbind && \
+    mkdir -pm755 /etc/apt/keyrings && \
+    wget -qO /etc/apt/keyrings/winehq-archive.key https://dl.winehq.org/wine-builds/winehq.key && \
+    wget -qNP /etc/apt/sources.list.d/ https://dl.winehq.org/wine-builds/ubuntu/dists/jammy/winehq-jammy.sources && \
+    apt-get update && apt-get install -y --install-recommends winehq-stable && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# Initialize the Wine prefix
+RUN xvfb-run -a wineboot --init && wineserver -w
+
+# Windows Python under Wine — the MetaTrader5 package only works on
+# Windows Python, so the bridge itself runs under Wine too.
+ARG PY_VERSION=3.12.7
+RUN wget -q "https://www.python.org/ftp/python/${PY_VERSION}/python-${PY_VERSION}-amd64.exe" -O /tmp/python.exe && \
+    xvfb-run -a wine /tmp/python.exe /quiet InstallAllUsers=1 PrependPath=1 Include_doc=0 Include_tcltk=0 && \
+    wineserver -w && rm /tmp/python.exe
+
+# MetaTrader 5 terminal (silent install; /auto exits non-zero under Wine even on success)
+RUN wget -q "https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5setup.exe" -O /tmp/mt5setup.exe && \
+    (xvfb-run -a wine /tmp/mt5setup.exe /auto || true) && \
+    wineserver -w && rm /tmp/mt5setup.exe && \
+    test -f "$WINEPREFIX/drive_c/Program Files/MetaTrader 5/terminal64.exe"
+
+# Bridge dependencies inside Wine Python
+RUN xvfb-run -a wine python -m pip install --no-cache-dir MetaTrader5 fastapi uvicorn pydantic && \
+    wineserver -w
+
+WORKDIR /app
+COPY main.py entrypoint-real.sh ./
+RUN chmod +x entrypoint-real.sh
+
+EXPOSE 5001
+ENV MT5_MOCK=false \
+    MT5_PATH="C:\\Program Files\\MetaTrader 5\\terminal64.exe" \
+    MT5_PORTABLE=true \
+    PORT=5001
+
+CMD ["./entrypoint-real.sh"]

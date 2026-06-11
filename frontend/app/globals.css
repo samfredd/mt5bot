@@ -1,0 +1,92 @@
+@import "tailwindcss";
+
+@theme {
+  /* OLED dark, midnight-blue cast — fintech/trading design system */
+  --color-bg: #0a0e14;
+  --color-surface: #10151d;
+  --color-surface-2: #151c26;
+  --color-surface-3: #1b2430;
+  --color-line: #1e2936;
+  --color-line-strong: #2a3848;
+  --color-ink: #e6edf3;
+  --color-ink-dim: #8b98a9;
+  --color-ink-faint: #5c6878;
+  --color-primary: #14b8a6;
+  --color-primary-dim: #0f766e;
+  --color-accent: #38bdf8;
+  --color-up: #34d399;
+  --color-down: #f87171;
+  --color-warn: #fbbf24;
+  --color-violet: #a78bfa;
+
+  --font-sans: var(--font-inter), ui-sans-serif, system-ui, -apple-system, sans-serif;
+}
+
+body {
+  background: var(--color-bg);
+  color: var(--color-ink);
+  font-feature-settings: "cv11";
+}
+
+/* Numbers should never jiggle — tabular figures everywhere data lives */
+.tnum {
+  font-variant-numeric: tabular-nums;
+}
+
+@layer components {
+  .card {
+    @apply rounded-2xl border border-line bg-surface p-5;
+  }
+  .card-hover {
+    @apply transition-colors duration-200 hover:border-line-strong;
+  }
+  .btn,
+  .btn-primary,
+  .btn-danger,
+  .btn-ghost {
+    @apply inline-flex cursor-pointer items-center justify-center gap-2 rounded-xl px-4 py-2.5 text-sm font-medium transition-all duration-200 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent disabled:cursor-not-allowed disabled:opacity-50;
+  }
+  .btn-primary {
+    @apply bg-primary-dim text-white hover:bg-primary;
+  }
+  .btn-danger {
+    @apply bg-red-950 text-red-300 ring-1 ring-red-900 hover:bg-red-900 hover:text-red-100;
+  }
+  .btn-ghost {
+    @apply bg-surface-2 text-ink-dim ring-1 ring-line hover:bg-surface-3 hover:text-ink;
+  }
+  .btn-sm {
+    @apply px-3 py-1.5 text-xs rounded-lg;
+  }
+  .input {
+    @apply w-full rounded-xl border border-line bg-bg px-3 py-2.5 text-sm text-ink placeholder:text-ink-faint transition-colors duration-200 focus:border-primary focus:outline-none;
+  }
+  .label {
+    @apply mb-1 block text-xs font-medium text-ink-dim;
+  }
+  .section-title {
+    @apply mb-4 flex items-center gap-2 text-sm font-semibold text-ink;
+  }
+  .chip {
+    @apply inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-xs font-medium;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+::selection {
+  background: rgba(20, 184, 166, 0.3);
+}
+
+/* Slim scrollbars that match the theme */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--color-line-strong) transparent;
+}

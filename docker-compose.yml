@@ -1,0 +1,57 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: mt5bot
+      POSTGRES_PASSWORD: mt5bot
+      POSTGRES_DB: mt5bot
+    # Host port 5433 to avoid clashing with any local Postgres on 5432.
+    ports: ["5433:5432"]
+    volumes: [pgdata:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mt5bot"]
+      interval: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    ports: ["6379:6379"]
+
+  # ollama:
+  #   image: ollama/ollama:latest
+  #   ports: ["11434:11434"]
+  #   volumes: [ollama:/root/.ollama]
+  #   profiles: ["ai"]   # start with: docker compose --profile ai up
+
+  mt5-bridge:
+    build: ./mt5-bridge
+    environment:
+      MT5_MOCK: "true"
+      BRIDGE_API_KEY: ${MT5_BRIDGE_API_KEY:-change-me-bridge-key}
+    ports: ["5001:5001"]
+
+  backend:
+    build: ./backend
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql://mt5bot:mt5bot@postgres:5432/mt5bot
+      REDIS_URL: redis://redis:6379
+      MT5_BRIDGE_URL: http://mt5-bridge:5001
+      OLLAMA_URL: http://localhost:11434
+    ports: ["4000:4000"]
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_started }
+      mt5-bridge: { condition: service_started }
+
+  frontend:
+    build: ./frontend
+    environment:
+      NEXT_PUBLIC_API_URL: http://localhost:4000
+      NEXT_PUBLIC_WS_URL: ws://localhost:4000/ws
+    ports: ["3000:3000"]
+    depends_on: [backend]
+
+volumes:
+  pgdata:
+  # ollama:
