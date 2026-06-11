@@ -16,6 +16,7 @@ logged to stdout (the backend additionally writes its own audit trail).
 import logging
 import os
 import random
+import sys
 import threading
 import time
 import uuid
@@ -24,6 +25,7 @@ from datetime import datetime, timedelta, timezone
 from fastapi import Depends, FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from filling import select_filling_mode
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
