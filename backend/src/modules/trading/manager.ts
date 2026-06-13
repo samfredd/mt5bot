@@ -33,7 +33,28 @@ export async function managePositions(): Promise<void> {
 
   for (const trade of openTrades) {
     const pos = byTicket.get(trade.mt5Ticket!);
-    if (!pos || !trade.stopLoss || !trade.entryPrice) continue;
+    if (!pos) continue;
+
+    // Time-based exit: the user chose a maximum duration for this trade.
+    if (trade.closeAfterMin && trade.openedAt &&
+        Date.now() - trade.openedAt.getTime() >= trade.closeAfterMin * 60_000) {
+      const result = await mt5.closePosition(pos.ticket, "system:time-exit").catch(() => ({ ok: false as const }));
+      if (result.ok) {
+        await prisma.trade.update({
+          where: { id: trade.id },
+          data: { status: "CLOSED", closedAt: new Date(), profit: (result as { profit?: number }).profit ?? null },
+        });
+        await audit({
+          actor: "system:time-exit", userId: trade.userId, category: "trade", action: "time_exit",
+          detail: { tradeId: trade.id, ticket: pos.ticket, symbol: pos.symbol, afterMin: trade.closeAfterMin },
+        });
+        await notify(trade.userId, "trade_closed", `Time exit: ${pos.symbol}`,
+          `Position ${pos.ticket} closed after its ${trade.closeAfterMin}-minute duration limit.`);
+      }
+      continue;
+    }
+
+    if (!trade.stopLoss || !trade.entryPrice) continue;
 
     const isBuy = pos.type === "buy";
     const entry = pos.price_open;

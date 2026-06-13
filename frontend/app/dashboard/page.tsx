@@ -9,16 +9,17 @@ import { NewsPanel } from "@/components/NewsPanel";
 import { SettingsPanel } from "@/components/SettingsPanel";
 import { PerformancePanel } from "@/components/PerformancePanel";
 import { ActivityPanel } from "@/components/ActivityPanel";
+import { BacktestPanel } from "@/components/BacktestPanel";
 import { NotificationsBell } from "@/components/NotificationsBell";
 import {
-  IconActivity, IconChart, IconCopy, IconHome, IconNews, IconSettings,
+  IconActivity, IconChart, IconCopy, IconFlask, IconHome, IconNews, IconSettings,
   IconStrategy, IconTrades, IconUp, IconDown, IconWallet, IconShield, IconZap, IconX,
 } from "@/components/icons";
 
 export interface Overview {
   account: { balance: number; equity: number; margin: number; free_margin: number; margin_level: number; currency: string; is_demo: boolean };
   botState: { status: string; mode: string; emergencyStop: boolean; demoMode: boolean; liveTradingEnabled: boolean };
-  openTrades: { ticket: string; symbol: string; type: string; volume: number; price_open: number; sl: number | null; tp: number | null; profit: number }[];
+  openTrades: { ticket: string; symbol: string; type: string; volume: number; price_open: number; price_current?: number; sl: number | null; tp: number | null; profit: number; time?: string }[];
   floatingPnl: number;
   dailyPnl: number;
   pendingApprovals: number;
@@ -31,6 +32,7 @@ const NAV = [
   { id: "Trades", label: "Trades", icon: IconTrades },
   { id: "Activity", label: "Activity", icon: IconActivity },
   { id: "Performance", label: "Performance", icon: IconChart },
+  { id: "Backtest", label: "Backtest", icon: IconFlask },
   { id: "Strategies", label: "Strategies", icon: IconStrategy },
   { id: "Copy Trading", label: "Copy Trading", icon: IconCopy },
   { id: "News", label: "News", icon: IconNews },
@@ -54,18 +56,40 @@ export default function Dashboard() {
   useEffect(() => {
     void refresh();
     const interval = setInterval(refresh, 5000);
-    const ws = new WebSocket(WS_URL);
-    ws.onmessage = (msg) => {
-      try {
-        const { event, data: d } = JSON.parse(msg.data);
-        if (event === "notification") {
-          setToast(`${d.title} — ${d.body}`.slice(0, 180));
-          setNotifTick((n) => n + 1);
-        }
-        if (event === "trade" || event === "approval_request" || event === "emergency_stop") void refresh();
-      } catch { /* ignore */ }
+
+    // Live push updates with auto-reconnect: the backend restarts (dev) or the
+    // socket can drop, and without reconnecting the dashboard would silently
+    // stop updating until a manual refresh.
+    let ws: WebSocket | null = null;
+    let stopped = false;
+    let retry: ReturnType<typeof setTimeout> | null = null;
+
+    const connect = () => {
+      if (stopped) return;
+      ws = new WebSocket(WS_URL);
+      ws.onmessage = (msg) => {
+        try {
+          const { event, data: d } = JSON.parse(msg.data);
+          if (event === "notification") {
+            setToast(`${d.title} — ${d.body}`.slice(0, 180));
+            setNotifTick((n) => n + 1);
+          }
+          // Reflect bot state instantly (start/pause/mode/guardian/emergency).
+          if (event === "bot_state") setData((prev) => (prev ? { ...prev, botState: { ...prev.botState, ...d } } : prev));
+          if (event === "trade" || event === "approval_request" || event === "emergency_stop" || event === "scanner") void refresh();
+        } catch { /* ignore */ }
+      };
+      ws.onclose = () => { if (!stopped) retry = setTimeout(connect, 2000); };
+      ws.onerror = () => ws?.close();
     };
-    return () => { clearInterval(interval); ws.close(); };
+    connect();
+
+    return () => {
+      stopped = true;
+      clearInterval(interval);
+      if (retry) clearTimeout(retry);
+      ws?.close();
+    };
   }, [refresh]);
 
   // Auto-dismiss toast after 5s
@@ -118,8 +142,9 @@ export default function Dashboard() {
             </div>
             <div className="mt-2 flex items-center justify-between">
               <span className="text-ink-faint">Account</span>
-              <span className={`chip ${s.demoMode ? "bg-emerald-950 text-up" : "bg-red-950 text-down"}`}>
-                <IconShield size={11} /> {s.demoMode ? "Demo" : "LIVE"}
+              {/* Truth comes from the broker, not a local flag */}
+              <span className={`chip ${data?.account.is_demo !== false ? "bg-emerald-950 text-up" : "bg-red-950 text-down"}`}>
+                <IconShield size={11} /> {data?.account.is_demo !== false ? "Demo" : "REAL"}
               </span>
             </div>
           </div>
@@ -147,6 +172,7 @@ export default function Dashboard() {
                   </div>
                 </div>
               )}
+              <HealthBadge />
               <NotificationsBell liveEvent={notifTick} />
             </div>
           </div>
@@ -187,6 +213,7 @@ export default function Dashboard() {
           {tab === "Trades" && <TradesPanel openTrades={data?.openTrades ?? []} onChanged={refresh} />}
           {tab === "Activity" && <ActivityPanel />}
           {tab === "Performance" && <PerformancePanel />}
+          {tab === "Backtest" && <BacktestPanel />}
           {tab === "Strategies" && <StrategiesPanel />}
           {tab === "Copy Trading" && <CopyPanel />}
           {tab === "News" && <NewsPanel />}
@@ -199,6 +226,45 @@ export default function Dashboard() {
 
 function fmt(n: number) {
   return n.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+}
+
+interface Health {
+  ok: boolean;
+  degraded: string[];
+  mt5Bridge: { ok: boolean; mock: boolean; connected: boolean };
+  ai: { reachable: boolean; modelPresent: boolean; model: string; recentValidRate: number | null; recentSamples: number; lastValidAt: string | null };
+}
+
+/**
+ * Live AI/bridge health. Polls /health so you can SEE when the model is down
+ * (Ollama stopped, or the model isn't pulled) — in that state the bot vetoes
+ * every trade, so this turning red explains "why no trades".
+ */
+function HealthBadge() {
+  const [h, setH] = useState<Health | null>(null);
+  useEffect(() => {
+    const load = () => api<Health>("/health").then(setH).catch(() => setH(null));
+    void load();
+    const t = setInterval(load, 15000);
+    return () => clearInterval(t);
+  }, []);
+
+  const ai = h?.ai;
+  const aiOk = !!ai && ai.reachable && ai.modelPresent;
+  const title = !h
+    ? "Health unknown — backend unreachable"
+    : aiOk
+      ? `AI online — model ${ai!.model}${ai!.recentValidRate !== null ? ` · ${Math.round(ai!.recentValidRate * 100)}% of last ${ai!.recentSamples} calls valid` : " · no calls yet"}`
+      : !ai?.reachable
+        ? "AI OFFLINE — Ollama unreachable. The bot vetoes every trade until it's back. Start Ollama (e.g. `ollama serve`)."
+        : `AI DEGRADED — model "${ai.model}" not pulled. Run: ollama pull ${ai.model}`;
+
+  return (
+    <span title={title} className={`chip ${aiOk ? "bg-emerald-950 text-up" : "bg-red-950 text-down"}`}>
+      <span className={`h-2 w-2 rounded-full ${aiOk ? "bg-up animate-pulse" : "bg-down"}`} />
+      AI {aiOk ? "online" : !ai?.reachable ? "offline" : "no model"}
+    </span>
+  );
 }
 
 function modeLabel(mode: string) {

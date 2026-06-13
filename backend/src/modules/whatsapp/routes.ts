@@ -4,6 +4,7 @@ import { config } from "../../config.js";
 import { prisma } from "../../lib/prisma.js";
 import { audit } from "../../lib/audit.js";
 import { mt5 } from "../mt5/client.js";
+import { currentAccountId } from "../mt5/account.js";
 import { getBotState, setBotState } from "../system/state.js";
 import { decideTrade, emergencyStopAll } from "../trading/service.js";
 import { latestNews } from "../news/service.js";
@@ -76,7 +77,12 @@ export async function whatsappRoutes(app: FastifyInstance) {
     }
     if (text === "today's profit" || text === "todays profit") {
       const dayStart = new Date(); dayStart.setHours(0, 0, 0, 0);
-      const agg = await prisma.trade.aggregate({ _sum: { profit: true }, where: { userId, closedAt: { gte: dayStart } } });
+      // Per-account: today's P/L for the account the terminal is on.
+      const accountId = await currentAccountId(userId);
+      const agg = await prisma.trade.aggregate({
+        _sum: { profit: true },
+        where: { userId, closedAt: { gte: dayStart }, ...(accountId ? { accountId } : {}) },
+      });
       return respond(`Today's closed P/L: ${(agg._sum.profit ?? 0).toFixed(2)}`);
     }
     if (text === "latest news") {

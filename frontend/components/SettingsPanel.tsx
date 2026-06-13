@@ -27,8 +27,6 @@ export function SettingsPanel() {
   const [risk, setRisk] = useState<Risk>({});
   const [message, setMessage] = useState("");
   const [link, setLink] = useState("");
-  const [totpSetup, setTotpSetup] = useState<{ secret: string; otpauthUrl: string } | null>(null);
-  const [totpCode, setTotpCode] = useState("");
 
   const load = useCallback(async () => {
     try { setRisk(await api<Risk>("/api/risk-settings")); } catch { /* noop */ }
@@ -51,20 +49,10 @@ export function SettingsPanel() {
     } catch (err) { setLink(err instanceof Error ? err.message : "failed"); }
   }
 
-  async function setup2fa() {
-    const res = await api<{ secret: string; otpauthUrl: string }>("/auth/2fa/setup", { method: "POST" });
-    setTotpSetup(res);
-  }
-
-  async function enable2fa() {
-    try {
-      await api("/auth/2fa/enable", { method: "POST", body: { token: totpCode } });
-      setMessage("2FA enabled."); setTotpSetup(null);
-    } catch (err) { setMessage(err instanceof Error ? err.message : "failed"); }
-  }
-
   return (
     <div className="space-y-6">
+      <AccountSection onMsg={setMessage} />
+
       <section className="card">
         <h2 className="section-title"><IconShield size={15} className="text-primary" /> Risk settings</h2>
         <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-4">
@@ -113,25 +101,6 @@ export function SettingsPanel() {
       </section>
 
       <section className="card">
-        <h2 className="section-title">Two-factor authentication</h2>
-        <p className="mb-3 text-xs text-ink-dim">Required for any live-trading action (enabling live mode, approving live trades).</p>
-        {!totpSetup ? (
-          <button onClick={setup2fa} className="btn-ghost">Set up 2FA</button>
-        ) : (
-          <div className="space-y-3 text-sm">
-            <p className="text-ink-dim">Add this secret to your authenticator app:</p>
-            <p className="tnum rounded-xl bg-bg p-3 font-mono text-warn">{totpSetup.secret}</p>
-            <div className="flex gap-2">
-              <label htmlFor="totp-code" className="sr-only">6-digit code</label>
-              <input id="totp-code" className="input tnum !w-36" placeholder="6-digit code" inputMode="numeric"
-                value={totpCode} onChange={(e) => setTotpCode(e.target.value)} />
-              <button onClick={enable2fa} className="btn-primary">Verify & enable</button>
-            </div>
-          </div>
-        )}
-      </section>
-
-      <section className="card">
         <button onClick={() => { setToken(null); window.location.href = "/login"; }} className="btn-ghost">
           <IconLogout size={15} /> Sign out
         </button>
@@ -139,6 +108,131 @@ export function SettingsPanel() {
 
       {message && <p className="text-sm text-warn" role="status">{message}</p>}
     </div>
+  );
+}
+
+interface AccountsData {
+  saved: { id: string; label: string; login: string; server: string; isDemo: boolean; verified: boolean }[];
+  current: { login: string; balance: number; currency: string; is_demo: boolean } | null;
+  userLiveEnabled: boolean;
+}
+
+function AccountSection({ onMsg }: { onMsg: (m: string) => void }) {
+  const [data, setData] = useState<AccountsData | null>(null);
+  const [form, setForm] = useState({ label: "", login: "", password: "", server: "" });
+  const [busy, setBusy] = useState(false);
+
+  const load = useCallback(async () => {
+    try { setData(await api<AccountsData>("/api/mt5/accounts")); } catch { /* noop */ }
+  }, []);
+  useEffect(() => { void load(); }, [load]);
+
+  async function connect(e: React.FormEvent) {
+    e.preventDefault();
+    const isLikelyReal = !form.server.toLowerCase().includes("demo");
+    if (isLikelyReal && !confirm(
+      `"${form.server}" does not look like a demo server.\n\nConnecting switches the WHOLE terminal to this account, and the bot will trade REAL MONEY on it once live trading is enabled.\n\nContinue?`,
+    )) return;
+    setBusy(true);
+    onMsg("");
+    try {
+      const res = await api<{ ok: boolean; balance?: number; currency?: string; account: { isDemo: boolean } }>("/api/mt5/connect", {
+        method: "POST",
+        body: { label: form.label || `${form.login}@${form.server}`, login: form.login, password: form.password, server: form.server },
+      });
+      onMsg(`Connected: ${form.login} on ${form.server} (${res.account.isDemo ? "DEMO" : "REAL"}) — balance ${res.balance?.toFixed(2)} ${res.currency ?? ""}.`);
+      setForm({ label: "", login: "", password: "", server: "" });
+      await load();
+    } catch (err) {
+      onMsg(err instanceof Error ? err.message : "connection failed");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function reconnect(id: string) {
+    onMsg("");
+    try {
+      const res = await api<{ ok: boolean; login: string; isDemo: boolean }>(`/api/mt5/accounts/${id}/reconnect`, { method: "POST" });
+      onMsg(`Reconnected to ${res.login} (${res.isDemo ? "DEMO" : "REAL"}).`);
+      await load();
+    } catch (err) { onMsg(err instanceof Error ? err.message : "reconnect failed"); }
+  }
+
+  async function toggleLive(enable: boolean) {
+    onMsg("");
+    if (enable && !confirm("Enable LIVE trading? The bot will be allowed to place real-money trades on a real account (demo accounts are unaffected). The risk engine and approval flow still apply.")) return;
+    try {
+      await api(enable ? "/auth/live/enable" : "/auth/live/disable", { method: "POST", body: {} });
+      onMsg(enable ? "Live trading ENABLED." : "Live trading disabled.");
+      await load();
+    } catch (err) { onMsg(err instanceof Error ? err.message : "failed"); }
+  }
+
+  return (
+    <section className="card">
+      <h2 className="section-title">MT5 account & live trading</h2>
+
+      {data?.current && (
+        <div className="mb-4 flex flex-wrap items-center gap-3 rounded-xl bg-surface-2 px-4 py-3 text-sm">
+          <span className={`chip ${data.current.is_demo ? "bg-emerald-950 text-up" : "bg-red-950 text-down"}`}>
+            {data.current.is_demo ? "DEMO" : "REAL"}
+          </span>
+          <span className="font-medium">Connected: {data.current.login}</span>
+          <span className="tnum text-ink-dim">{data.current.balance.toFixed(2)} {data.current.currency}</span>
+          <span className="ml-auto flex items-center gap-2">
+            <span className="text-xs text-ink-faint">Live trading</span>
+            {data.userLiveEnabled ? (
+              <button onClick={() => toggleLive(false)} className="btn btn-sm bg-emerald-900 text-emerald-100 hover:bg-emerald-800">Enabled — click to disable</button>
+            ) : (
+              <button onClick={() => toggleLive(true)} className="btn-danger btn-sm">Locked — click to enable</button>
+            )}
+          </span>
+        </div>
+      )}
+
+      <form onSubmit={connect} className="grid grid-cols-2 items-end gap-3 lg:grid-cols-5">
+        <div>
+          <label htmlFor="acc-label" className="label">Label</label>
+          <input id="acc-label" className="input" placeholder="e.g. Real account" value={form.label}
+            onChange={(e) => setForm({ ...form, label: e.target.value })} />
+        </div>
+        <div>
+          <label htmlFor="acc-login" className="label">Account number</label>
+          <input id="acc-login" className="input tnum" inputMode="numeric" placeholder="12345678" value={form.login}
+            onChange={(e) => setForm({ ...form, login: e.target.value })} required />
+        </div>
+        <div>
+          <label htmlFor="acc-server" className="label">Server (exact name)</label>
+          <input id="acc-server" className="input" placeholder="Broker-Demo" value={form.server}
+            onChange={(e) => setForm({ ...form, server: e.target.value })} required />
+        </div>
+        <div>
+          <label htmlFor="acc-pass" className="label">Password</label>
+          <input id="acc-pass" className="input" type="password" autoComplete="off" value={form.password}
+            onChange={(e) => setForm({ ...form, password: e.target.value })} required />
+        </div>
+        <button disabled={busy} className="btn-primary">{busy ? "Connecting…" : "Switch account"}</button>
+      </form>
+      <p className="mt-2 text-xs text-ink-faint">
+        Switching changes the account for the whole terminal. Credentials are encrypted at rest and never logged.
+      </p>
+
+      {data && data.saved.length > 0 && (
+        <div className="mt-4 space-y-2">
+          {data.saved.map((a) => (
+            <div key={a.id} className="flex flex-wrap items-center justify-between gap-2 rounded-xl bg-surface-2 px-4 py-2.5 text-sm">
+              <span className="flex items-center gap-2">
+                <span className={`chip !text-[10px] ${a.isDemo ? "bg-emerald-950 text-up" : "bg-red-950 text-down"}`}>{a.isDemo ? "DEMO" : "REAL"}</span>
+                <span className="font-medium">{a.label}</span>
+                <span className="tnum text-xs text-ink-faint">{a.login} · {a.server}</span>
+              </span>
+              <button onClick={() => reconnect(a.id)} className="btn-ghost btn-sm">Reconnect</button>
+            </div>
+          ))}
+        </div>
+      )}
+    </section>
   );
 }
 

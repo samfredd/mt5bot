@@ -1,13 +1,15 @@
 import { prisma } from "../../lib/prisma.js";
 import { audit } from "../../lib/audit.js";
+import { config } from "../../config.js";
 import { mt5 } from "../mt5/client.js";
 import { buildMarketAnalysis } from "../analysis/engine.js";
 import { assessNewsRisk } from "../news/service.js";
 import { evaluateStrategy, deriveLevels } from "../strategy/service.js";
 import { askModel } from "../ai/service.js";
 import { buildTradePrompt } from "../ai/prompts.js";
-import { calculateLots, validateTrade, type RiskContext, type TradeProposal } from "../risk/engine.js";
-import { getBotState } from "../system/state.js";
+import { calculateLots, countConsecutiveLosses, equityGuardianBreaches, validateTrade, type RiskContext, type TradeProposal } from "../risk/engine.js";
+import { accountIdForLogin, currentAccountId } from "../mt5/account.js";
+import { getBotState, setBotState } from "../system/state.js";
 import { notify } from "../notifications/service.js";
 import { broadcast } from "../ws/hub.js";
 import type { Strategy, User } from "@prisma/client";
@@ -61,7 +63,15 @@ export async function evaluateAndMaybeTrade(user: User, strategy: Strategy, symb
     `${signal.strategyName}: signal=${signal.direction}; reasons: ${signal.reasons.join("; ")}`,
     `maxRiskPerTrade=${settings.maxRiskPerTradePct}%, minRR=${settings.minRiskReward}, newsLimit=${settings.newsRiskLimit}`,
   );
-  const { decision: ai, logId } = await askModel(prompt, symbol);
+  const { decision: ai, logId, valid: aiValid } = await askModel(prompt, symbol);
+
+  // AI unreachable/invalid is NOT the same as a real "avoid" — record it
+  // distinctly so a down model shows up in the activity log instead of
+  // looking like the AI simply disagreed.
+  if (!aiValid) {
+    await audit({ actor: "system", userId: user.id, category: "ai", action: "ai_unavailable", detail: { symbol, signal: signal.direction } });
+    return null;
+  }
 
   const aiAgrees = ai.decision === signal.direction && ai.confidence >= signal.config.entry.minConfidence;
   if (!aiAgrees) {
@@ -77,10 +87,11 @@ export async function evaluateAndMaybeTrade(user: User, strategy: Strategy, symb
 
   // 5. Position sizing
   const account = await mt5.accountInfo();
+  const accountId = await accountIdForLogin(user.id, account.login, account);
   const lots =
     signal.config.lotSizing.method === "fixed"
       ? signal.config.lotSizing.fixedLots
-      : calculateLots(account.balance, signal.config.lotSizing.riskPct, levels.entry, levels.stopLoss, settings.maxLotSize);
+      : calculateLots(symbol, account.balance, signal.config.lotSizing.riskPct, levels.entry, levels.stopLoss, settings.maxLotSize);
 
   const proposal: TradeProposal = {
     symbol,
@@ -106,7 +117,7 @@ export async function evaluateAndMaybeTrade(user: User, strategy: Strategy, symb
     const failed = risk.checks.filter((c) => !c.passed).map((c) => `${c.name}: ${c.detail}`);
     const trade = await prisma.trade.create({
       data: {
-        userId: user.id, strategyId: strategy.id, symbol, direction: proposal.direction === "buy" ? "BUY" : "SELL",
+        userId: user.id, accountId, strategyId: strategy.id, symbol, direction: proposal.direction === "buy" ? "BUY" : "SELL",
         lots: proposal.lots, entryPrice: proposal.entry, stopLoss: proposal.stopLoss, takeProfit: proposal.takeProfit,
         status: "RISK_BLOCKED", mode: state.mode, aiAnalysisId: logId, explanation: explanation as object,
       },
@@ -121,7 +132,7 @@ export async function evaluateAndMaybeTrade(user: User, strategy: Strategy, symb
   if (state.mode === "MANUAL") {
     const trade = await prisma.trade.create({
       data: {
-        userId: user.id, strategyId: strategy.id, symbol, direction: proposal.direction === "buy" ? "BUY" : "SELL",
+        userId: user.id, accountId, strategyId: strategy.id, symbol, direction: proposal.direction === "buy" ? "BUY" : "SELL",
         lots: proposal.lots, entryPrice: proposal.entry, stopLoss: proposal.stopLoss, takeProfit: proposal.takeProfit,
         status: "ANALYZED", mode: state.mode, aiAnalysisId: logId, explanation: explanation as object,
       },
@@ -134,7 +145,7 @@ export async function evaluateAndMaybeTrade(user: User, strategy: Strategy, symb
   if (state.mode === "SEMI_AUTO") {
     const trade = await prisma.trade.create({
       data: {
-        userId: user.id, strategyId: strategy.id, symbol, direction: proposal.direction === "buy" ? "BUY" : "SELL",
+        userId: user.id, accountId, strategyId: strategy.id, symbol, direction: proposal.direction === "buy" ? "BUY" : "SELL",
         lots: proposal.lots, entryPrice: proposal.entry, stopLoss: proposal.stopLoss, takeProfit: proposal.takeProfit,
         status: "PENDING_APPROVAL", mode: state.mode, aiAnalysisId: logId, explanation: explanation as object,
         approval: { create: { expiresAt: new Date(Date.now() + APPROVAL_TTL_MIN * 60_000) } },
@@ -154,7 +165,11 @@ export async function evaluateAndMaybeTrade(user: User, strategy: Strategy, symb
 export async function executeTrade(
   user: User,
   proposal: TradeProposal,
-  opts: { strategyId?: string; aiLogId?: string; explanation: Record<string, unknown>; mode: "MANUAL" | "SEMI_AUTO" | "AUTO" | "COPY"; actor: string; existingTradeId?: string },
+  opts: {
+    strategyId?: string; aiLogId?: string; explanation: Record<string, unknown>;
+    mode: "MANUAL" | "SEMI_AUTO" | "AUTO" | "COPY"; actor: string; existingTradeId?: string;
+    durationMin?: number;
+  },
 ) {
   const result = await mt5.placeOrder(
     { symbol: proposal.symbol, direction: proposal.direction, volume: proposal.lots, sl: proposal.stopLoss ?? undefined, tp: proposal.takeProfit ?? undefined, comment: "mt5bot" },
@@ -162,11 +177,18 @@ export async function executeTrade(
   );
 
   const data = {
+    // The order went to whatever account the terminal is on NOW — stamp it
+    // even on approval-time execution, where it may differ from creation.
+    accountId: await currentAccountId(user.id),
     status: result.ok ? ("EXECUTED" as const) : ("FAILED" as const),
-    mt5Ticket: result.ticket ?? null,
+    // Store the position id (falling back to the order ticket): it is what
+    // reconciliation, close and modify all match on. On a netting account the
+    // order ticket would mismatch the merged position and break attribution.
+    mt5Ticket: result.position_id ?? result.ticket ?? null,
     entryPrice: result.price ?? proposal.entry,
     openedAt: result.ok ? new Date() : null,
     lots: proposal.lots, // approver may have changed the size
+    closeAfterMin: opts.durationMin ?? null,
     explanation: { ...opts.explanation, execution: { ok: result.ok, ticket: result.ticket, error: result.error } } as object,
   };
 
@@ -199,7 +221,7 @@ export async function decideTrade(
   approve: boolean,
   decidedBy: string,
   channel: "DASHBOARD" | "TELEGRAM" | "WHATSAPP",
-  opts: { lots?: number } = {},
+  opts: { lots?: number; durationMin?: number } = {},
 ) {
   const trade = await prisma.trade.findUnique({ where: { id: tradeId }, include: { approval: true, user: true } });
   if (!trade || trade.status !== "PENDING_APPROVAL" || !trade.approval) {
@@ -254,9 +276,10 @@ export async function decideTrade(
   const explanation = (trade.explanation ?? {}) as Record<string, unknown>;
   await executeTrade(trade.user, proposal, {
     strategyId: trade.strategyId ?? undefined, aiLogId: trade.aiAnalysisId ?? undefined,
-    explanation: { ...explanation, approval: { decidedBy, channel, chosenLots: proposal.lots } }, mode: trade.mode, actor: decidedBy, existingTradeId: trade.id,
+    explanation: { ...explanation, approval: { decidedBy, channel, chosenLots: proposal.lots, durationMin: opts.durationMin } },
+    mode: trade.mode, actor: decidedBy, existingTradeId: trade.id, durationMin: opts.durationMin,
   });
-  return { ok: true, message: `Trade approved and executed (${proposal.lots} lots).` };
+  return { ok: true, message: `Trade approved and executed (${proposal.lots} lots${opts.durationMin ? `, auto-closes after ${opts.durationMin} min` : ""}).` };
 }
 
 export async function buildRiskContext(
@@ -274,30 +297,33 @@ export async function buildRiskContext(
   const dayStart = new Date(); dayStart.setHours(0, 0, 0, 0);
   const weekStart = new Date(dayStart); weekStart.setDate(weekStart.getDate() - weekStart.getDay());
 
+  // Daily/weekly loss limits and the loss-streak breaker are per account —
+  // losses on a previous account must not block trading on this one.
+  const accountId = await accountIdForLogin(user.id, account.login, account);
+  const scope = accountId ? { userId: user.id, accountId } : { userId: user.id };
+
   const [tradesToday, copiedToday, dailyAgg, weeklyAgg, peak, closedToday] = await Promise.all([
-    prisma.trade.count({ where: { userId: user.id, status: "EXECUTED", createdAt: { gte: dayStart } } }),
-    prisma.trade.count({ where: { userId: user.id, mode: "COPY", status: "EXECUTED", createdAt: { gte: dayStart } } }),
-    prisma.trade.aggregate({ _sum: { profit: true }, where: { userId: user.id, closedAt: { gte: dayStart } } }),
-    prisma.trade.aggregate({ _sum: { profit: true }, where: { userId: user.id, closedAt: { gte: weekStart } } }),
-    prisma.systemSetting.findUnique({ where: { key: "peak_equity" } }),
+    prisma.trade.count({ where: { ...scope, status: "EXECUTED", createdAt: { gte: dayStart } } }),
+    prisma.trade.count({ where: { ...scope, mode: "COPY", status: "EXECUTED", createdAt: { gte: dayStart } } }),
+    prisma.trade.aggregate({ _sum: { profit: true }, where: { ...scope, closedAt: { gte: dayStart } } }),
+    prisma.trade.aggregate({ _sum: { profit: true }, where: { ...scope, closedAt: { gte: weekStart } } }),
+    // Peak equity (drawdown reference) is tracked per account for the same reason.
+    prisma.systemSetting.findUnique({ where: { key: accountId ? `peak_equity:${accountId}` : "peak_equity" } }),
     prisma.trade.findMany({
-      where: { userId: user.id, status: "CLOSED", closedAt: { gte: dayStart } },
+      where: { ...scope, status: "CLOSED", closedAt: { gte: dayStart } },
       orderBy: { closedAt: "desc" },
       select: { profit: true },
       take: 20,
     }),
   ]);
 
-  let consecutiveLosses = 0;
-  for (const t of closedToday) {
-    if ((t.profit ?? 0) < 0) consecutiveLosses++;
-    else break;
-  }
+  const consecutiveLosses = countConsecutiveLosses(closedToday);
 
   const peakEquity = Math.max(Number((peak?.value as { value?: number })?.value ?? 0), account.equity);
+  const peakKey = accountId ? `peak_equity:${accountId}` : "peak_equity";
   await prisma.systemSetting.upsert({
-    where: { key: "peak_equity" },
-    create: { key: "peak_equity", value: { value: peakEquity } },
+    where: { key: peakKey },
+    create: { key: peakKey, value: { value: peakEquity } },
     update: { value: { value: peakEquity } },
   });
 
@@ -322,7 +348,8 @@ export async function buildRiskContext(
     isLiveAccount: !account.is_demo,
     liveTradingEnabled: state.liveTradingEnabled,
     userLiveEnabled: user.liveTradingEnabled,
-    twoFactorVerified: opts.twoFactorVerified ?? false,
+    // When the 2FA requirement is switched off, the gate counts as satisfied.
+    twoFactorVerified: opts.twoFactorVerified ?? !config.REQUIRE_2FA,
     accountVerified: !!verifiedAccount || account.is_demo,
   };
 }
@@ -338,7 +365,6 @@ export function sessionNow(): string {
 
 /** Emergency stop: halt the bot AND flatten all open positions. */
 export async function emergencyStopAll(actor: string, userId: string) {
-  const { setBotState } = await import("../system/state.js");
   await setBotState({ emergencyStop: true, status: "emergency_stop" }, actor);
   const positions = await mt5.positions();
   const closed: string[] = [];
@@ -350,4 +376,45 @@ export async function emergencyStopAll(actor: string, userId: string) {
   await notify(userId, "emergency_stop", "EMERGENCY STOP ACTIVATED", `All trading halted. Closed ${closed.length} position(s).`);
   broadcast("emergency_stop", { closed });
   return closed;
+}
+
+/**
+ * Equity guardian: when equity falls through the protection floor, close all
+ * open positions and PAUSE (recoverable — not a hard emergency stop). The
+ * risk engine only BLOCKS new trades at this threshold; this actually stops
+ * the bleeding on positions already open.
+ *
+ * Runs only while the bot is "running", which makes it self-limiting: once it
+ * pauses, it won't fire again until the operator resumes (so it can't thrash,
+ * and after a flatten — equity ≈ balance — it wouldn't re-trip anyway).
+ */
+export async function enforceEquityGuardian(): Promise<void> {
+  const state = await getBotState();
+  if (state.status !== "running" || state.emergencyStop) return;
+
+  const user = await prisma.user.findFirst({ where: { role: "ADMIN" }, orderBy: { createdAt: "asc" } });
+  const settings = user && (await prisma.riskSettings.findUnique({ where: { userId: user.id } }));
+  if (!user || !settings) return;
+
+  const account = await mt5.accountInfo().catch(() => null);
+  if (!account) return;
+  const positions = await mt5.positions().catch(() => []);
+  if (!positions.length) return; // nothing to protect
+
+  const breaches = equityGuardianBreaches(account, settings);
+  if (!breaches.length) return;
+
+  const closed: string[] = [];
+  for (const p of positions) {
+    const r = await mt5.closePosition(p.ticket, "system:equity-guardian").catch(() => ({ ok: false as const }));
+    if (r.ok) closed.push(p.ticket);
+  }
+  await setBotState({ status: "paused" }, "system:equity-guardian");
+  await audit({
+    actor: "system:equity-guardian", userId: user.id, category: "risk", action: "equity_guardian_flatten",
+    detail: { breaches, balance: account.balance, equity: account.equity, closed },
+  });
+  await notify(user.id, "emergency_stop", "Equity guardian: positions flattened",
+    `${breaches.join("; ")}. Closed ${closed.length} position(s) and paused the bot. Review before resuming.`);
+  broadcast("emergency_stop", { closed, reason: "equity_guardian" });
 }

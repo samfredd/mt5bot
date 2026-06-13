@@ -4,7 +4,7 @@ import { askModel } from "../ai/service.js";
 import { buildTraderEvaluationPrompt } from "../ai/prompts.js";
 import { mt5 } from "../mt5/client.js";
 import { assessNewsRisk } from "../news/service.js";
-import { validateTrade, type TradeProposal } from "../risk/engine.js";
+import { calculateLots, countConsecutiveLosses, validateTrade, type TradeProposal } from "../risk/engine.js";
 import { buildRiskContext, executeTrade, sessionNow } from "../trading/service.js";
 import { notify } from "../notifications/service.js";
 import type { CopyTrader, User } from "@prisma/client";
@@ -75,12 +75,13 @@ interface CopyRules {
 
 /**
  * Mirror one source trade. Copy trades go through the SAME risk engine as
- * everything else — copy mode is never a bypass.
+ * everything else — copy mode is never a bypass. Source lots are optional:
+ * human signals often omit size, in which case we size from risk settings.
  */
 export async function copySourceTrade(
   user: User,
   trader: CopyTrader,
-  source: { symbol: string; direction: "buy" | "sell"; lots: number; sl?: number; tp?: number; ref?: string },
+  source: { symbol: string; direction: "buy" | "sell"; lots?: number; sl?: number; tp?: number; ref?: string },
 ) {
   const rules = (trader.copyRules ?? {}) as CopyRules;
 
@@ -90,7 +91,7 @@ export async function copySourceTrade(
   if (rules.symbolsBlocked?.includes(source.symbol)) {
     return reject(user, trader, source, `symbol ${source.symbol} is blocked`);
   }
-  if (rules.maxSourceLot && source.lots > rules.maxSourceLot) {
+  if (rules.maxSourceLot && source.lots !== undefined && source.lots > rules.maxSourceLot) {
     return reject(user, trader, source, `abnormal source lot size ${source.lots} (max ${rules.maxSourceLot}) — possible martingale`);
   }
 
@@ -99,20 +100,33 @@ export async function copySourceTrade(
     where: { userId: user.id, mode: "COPY", copiedTrade: { copyTraderId: trader.id }, status: "CLOSED" },
     orderBy: { closedAt: "desc" }, take: 20,
   });
-  let streak = 0;
-  for (const t of recent) { if ((t.profit ?? 0) < 0) streak++; else break; }
+  const streak = countConsecutiveLosses(recent);
   if (rules.stopAfterLossStreak && streak >= rules.stopAfterLossStreak) {
     await prisma.copyTrader.update({ where: { id: trader.id }, data: { active: false } });
     await notify(user.id, "copy_update", `Stopped copying ${trader.name}`, `Loss streak of ${streak} hit the configured limit.`);
     return reject(user, trader, source, `auto-stopped: loss streak ${streak}`);
   }
 
-  const lots = rules.fixedLot ?? Math.max(0.01, Math.round(source.lots * (rules.lotMultiplier ?? 1) * 100) / 100);
   const tick = await mt5.tick(source.symbol);
   const entry = source.direction === "buy" ? tick.ask : tick.bid;
 
   const settings = await prisma.riskSettings.findUnique({ where: { userId: user.id } });
   if (!settings) return reject(user, trader, source, "no risk settings configured");
+
+  // Sizing priority: fixed lot rule → mirror source lots × multiplier →
+  // risk-based from the signal's stop distance → minimum lot.
+  let lots: number;
+  if (rules.fixedLot) {
+    lots = rules.fixedLot;
+  } else if (source.lots !== undefined) {
+    lots = Math.max(0.01, Math.round(source.lots * (rules.lotMultiplier ?? 1) * 100) / 100);
+  } else if (source.sl) {
+    const account0 = await mt5.accountInfo();
+    const riskPct = rules.maxRiskPerCopiedTradePct ?? settings.maxRiskPerTradePct;
+    lots = calculateLots(source.symbol, account0.balance, riskPct, entry, source.sl, settings.maxLotSize);
+  } else {
+    lots = 0.01;
+  }
   const news = await assessNewsRisk(source.symbol, settings);
   const account = await mt5.accountInfo();
 

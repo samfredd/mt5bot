@@ -13,6 +13,8 @@ import { strategyRoutes } from "./modules/strategy/routes.js";
 import { copyRoutes } from "./modules/copy/routes.js";
 import { newsRoutes } from "./modules/news/routes.js";
 import { analyticsRoutes } from "./modules/analytics/routes.js";
+import { mt5Routes } from "./modules/mt5/routes.js";
+import { backtestRoutes } from "./modules/backtest/routes.js";
 import { whatsappRoutes } from "./modules/whatsapp/routes.js";
 import { addClient } from "./modules/ws/hub.js";
 import { createTelegramBot } from "./modules/telegram/bot.js";
@@ -22,7 +24,11 @@ import { logError } from "./lib/audit.js";
 async function main() {
   const app = Fastify({ loggerInstance: logger });
 
-  await app.register(cors, { origin: [config.FRONTEND_URL], credentials: true });
+  await app.register(cors, {
+    // In development allow any localhost port (preview/dev servers).
+    origin: config.NODE_ENV === "production" ? [config.FRONTEND_URL] : /^https?:\/\/localhost(:\d+)?$/,
+    credentials: true,
+  });
   await app.register(rateLimit, { max: 200, timeWindow: "1 minute" });
   await app.register(websocket);
   // Applied directly on the root instance (not via register) so the
@@ -60,6 +66,8 @@ async function main() {
   await app.register(copyRoutes);
   await app.register(newsRoutes);
   await app.register(analyticsRoutes);
+  await app.register(mt5Routes);
+  await app.register(backtestRoutes);
   await app.register(whatsappRoutes);
 
   app.setErrorHandler(async (err: Error & { statusCode?: number }, _req, reply) => {

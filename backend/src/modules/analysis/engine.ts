@@ -29,7 +29,7 @@ export interface MarketAnalysis {
   summary: string;
 }
 
-function detectSession(now = new Date()): string {
+export function detectSession(now = new Date()): string {
   const h = now.getUTCHours();
   if (h >= 0 && h < 7) return "asia";
   if (h >= 7 && h < 12) return "london";

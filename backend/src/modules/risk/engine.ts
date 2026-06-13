@@ -1,4 +1,5 @@
 import type { RiskSettings } from "@prisma/client";
+import { valuePerPointPerLot } from "./instruments.js";
 
 /**
  * The risk engine is the FINAL authority on every trade — manual, AI,
@@ -97,9 +98,10 @@ export function validateTrade(p: TradeProposal, ctx: RiskContext): RiskResult {
 
   // --- Per-trade monetary risk ---
   if (hasSl && ctx.account.balance > 0) {
-    // Approximation: assumes ~$10 per point per 1.0 lot (standard FX lot).
-    const points = Math.abs(p.entry - (p.stopLoss as number));
-    const approxRisk = points * p.lots * 100000 * 0.0001 * 10;
+    // Money at risk = stop distance × per-lot value-per-point, so this is
+    // correct across FX majors, JPY pairs, metals, indices and crypto.
+    const stopDist = Math.abs(p.entry - (p.stopLoss as number));
+    const approxRisk = stopDist * p.lots * valuePerPointPerLot(p.symbol, p.entry);
     const riskPct = (approxRisk / ctx.account.balance) * 100;
     add("max_risk_per_trade", riskPct <= s.maxRiskPerTradePct * 1.5, `~${riskPct.toFixed(2)}% of balance (max ${s.maxRiskPerTradePct}%)`);
   }
@@ -162,8 +164,52 @@ export function validateTrade(p: TradeProposal, ctx: RiskContext): RiskResult {
   return { ok, checks, adjustedLots };
 }
 
-/** Position sizing from risk percentage and stop distance. */
+/**
+ * Most-recent run of losing trades, for the circuit breaker. `trades` must be
+ * ordered most-recent-first. A trade whose profit is not yet reconciled
+ * (`null`) is SKIPPED — never treated as a win — so an attribution gap can't
+ * silently reset the breaker and let revenge-trading through.
+ */
+export function countConsecutiveLosses(trades: { profit: number | null }[]): number {
+  let streak = 0;
+  for (const t of trades) {
+    if (t.profit === null) continue; // unknown outcome — don't count, don't reset
+    if (t.profit < 0) streak++;
+    else break;
+  }
+  return streak;
+}
+
+/**
+ * Capital-protection guardian: returns the reasons (if any) to FLATTEN all
+ * open positions, not just block new ones. Pure so it can be tested.
+ *
+ * Triggers on the equity-protection floor only — equity below a fraction of
+ * balance is realized+floating loss against deposited capital. Drawdown from
+ * peak is deliberately NOT used here (peak includes floating gains, so it
+ * would flatten winners on ordinary pullbacks); that stays a new-trade gate.
+ */
+export function equityGuardianBreaches(
+  account: { balance: number; equity: number },
+  settings: Pick<RiskSettings, "equityProtectionPct">,
+): string[] {
+  const breaches: string[] = [];
+  if (account.balance > 0) {
+    const equityPct = (account.equity / account.balance) * 100;
+    if (equityPct < settings.equityProtectionPct) {
+      breaches.push(`equity at ${equityPct.toFixed(1)}% of balance (protection floor ${settings.equityProtectionPct}%)`);
+    }
+  }
+  return breaches;
+}
+
+/**
+ * Position sizing from risk percentage and stop distance. `symbol` is
+ * required so the per-lot value is correct for the instrument (gold, JPY
+ * pairs, indices and crypto are NOT $10/pip on a 100k contract).
+ */
 export function calculateLots(
+  symbol: string,
   balance: number,
   riskPct: number,
   entry: number,
@@ -173,8 +219,8 @@ export function calculateLots(
   const riskAmount = balance * (riskPct / 100);
   const stopDist = Math.abs(entry - stopLoss);
   if (stopDist <= 0) return 0.01;
-  // Approximate $ per price-unit per lot for FX majors (100k contract).
-  const perLotRisk = stopDist * 100000;
+  const perLotRisk = stopDist * valuePerPointPerLot(symbol, entry);
+  if (perLotRisk <= 0) return 0.01;
   const lots = riskAmount / perLotRisk;
   return Math.min(Math.max(Math.round(lots * 100) / 100, 0.01), maxLot);
 }

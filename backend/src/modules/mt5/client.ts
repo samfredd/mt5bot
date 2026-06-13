@@ -16,6 +16,8 @@ export interface AccountInfo {
   margin_level: number;
   currency: string;
   is_demo: boolean;
+  // Broker server name; absent until the bridge is restarted on a build that sends it.
+  server?: string;
 }
 
 export interface Position {
@@ -24,6 +26,7 @@ export interface Position {
   type: "buy" | "sell";
   volume: number;
   price_open: number;
+  price_current?: number;
   sl: number | null;
   tp: number | null;
   profit: number;
@@ -59,12 +62,51 @@ export interface OrderRequest {
 export interface OrderResult {
   ok: boolean;
   ticket?: string;
+  // The position identifier — what positions/history/close/modify all key on.
+  // Equals `ticket` on hedging accounts; the aggregate position on netting.
+  position_id?: string;
   price?: number;
   error?: string;
   retcode?: number;
 }
 
-async function bridge<T>(path: string, init?: RequestInit & { body?: string }): Promise<T> {
+/**
+ * Map a requested symbol to the broker's actual tradeable name. Many brokers
+ * append a tag (Exness: `EURUSD` → `EURUSDm`; others use `.r`, `-ECN`, `c`).
+ * Conservative on purpose: only a separator-prefixed tag or a short LOWERCASE
+ * tag counts, so `BTCUSD` never silently resolves to `BTCUSDT` (a different
+ * instrument). Returns the original when nothing matches — let the bridge 404.
+ */
+export function matchBrokerSymbol(requested: string, available: string[]): string {
+  if (!available.length) return requested;
+  const want = requested.toUpperCase();
+  const exact = available.find((s) => s === requested) ?? available.find((s) => s.toUpperCase() === want);
+  if (exact) return exact;
+  const isBrokerTag = (tag: string) => /^[._-][A-Za-z0-9]{1,5}$/.test(tag) || /^[a-z]{1,5}$/.test(tag);
+  const matches = available
+    .filter((s) => s.toUpperCase().startsWith(want) && isBrokerTag(s.slice(requested.length)))
+    .sort((a, b) => a.length - b.length); // prefer the shortest tag
+  return matches[0] ?? requested;
+}
+
+let brokerSymbolCache: { list: string[]; ts: number } | null = null;
+async function brokerSymbols(): Promise<string[]> {
+  if (brokerSymbolCache && Date.now() - brokerSymbolCache.ts < 10 * 60_000) return brokerSymbolCache.list;
+  try {
+    const list = await bridge<{ symbols: string[] }>("/symbols").then((r) => r.symbols);
+    brokerSymbolCache = { list, ts: Date.now() };
+    return list;
+  } catch {
+    return brokerSymbolCache?.list ?? [];
+  }
+}
+
+/** Resolve a requested symbol to the broker's name (cached symbol list). */
+async function resolveSymbol(symbol: string): Promise<string> {
+  return matchBrokerSymbol(symbol, await brokerSymbols());
+}
+
+async function bridge<T>(path: string, init?: RequestInit & { body?: string; timeoutMs?: number }): Promise<T> {
   const url = `${config.MT5_BRIDGE_URL}${path}`;
   const started = Date.now();
   try {
@@ -75,7 +117,7 @@ async function bridge<T>(path: string, init?: RequestInit & { body?: string }): 
         "x-api-key": config.MT5_BRIDGE_API_KEY,
         ...(init?.headers ?? {}),
       },
-      signal: AbortSignal.timeout(15000),
+      signal: AbortSignal.timeout(init?.timeoutMs ?? 15000),
     });
     const json = (await res.json()) as T & { error?: string };
     logger.debug({ path, ms: Date.now() - started, status: res.status }, "mt5 bridge call");
@@ -93,20 +135,49 @@ export const mt5 = {
   positions: () => bridge<{ positions: Position[] }>("/positions").then((r) => r.positions),
   history: (days = 30) =>
     bridge<{ deals: unknown[] }>(`/history?days=${days}`).then((r) => r.deals),
-  tick: (symbol: string) => bridge<Tick>(`/tick/${encodeURIComponent(symbol)}`),
-  candles: (symbol: string, timeframe: string, count = 200) =>
-    bridge<{ candles: Candle[] }>(
-      `/candles/${encodeURIComponent(symbol)}?timeframe=${timeframe}&count=${count}`,
-    ).then((r) => r.candles),
+  async tick(symbol: string) {
+    return bridge<Tick>(`/tick/${encodeURIComponent(await resolveSymbol(symbol))}`);
+  },
+  async candles(symbol: string, timeframe: string, count = 200) {
+    const sym = await resolveSymbol(symbol);
+    return bridge<{ candles: Candle[] }>(
+      `/candles/${encodeURIComponent(sym)}?timeframe=${timeframe}&count=${count}`,
+      // Large history requests trigger an MT5 server download on first use.
+      { timeoutMs: count > 1000 ? 120_000 : 15_000 },
+    ).then((r) => r.candles);
+  },
   symbols: () => bridge<{ symbols: string[] }>("/symbols").then((r) => r.symbols),
+  /** Expose the resolver so callers can normalize a symbol once if needed. */
+  resolveSymbol,
+
+  /** Switch the terminal to another account. Password is never logged. */
+  async connect(
+    creds: { login: string; password: string; server: string },
+    actor: string,
+  ): Promise<{ ok: boolean; login?: string; is_demo?: boolean; balance?: number; currency?: string; error?: string }> {
+    await audit({ actor, category: "mt5", action: "account_switch_request", detail: { login: creds.login, server: creds.server } });
+    const result = await bridge<{ ok: boolean; login?: string; is_demo?: boolean; balance?: number; currency?: string; error?: string }>("/connect", {
+      method: "POST",
+      body: JSON.stringify({ login: Number(creds.login), password: creds.password, server: creds.server }),
+    });
+    await audit({
+      actor, category: "mt5", action: "account_switch_result",
+      detail: { login: creds.login, server: creds.server, ok: result.ok, is_demo: result.is_demo, error: result.error },
+    });
+    return result;
+  },
 
   async placeOrder(req: OrderRequest, actor: string): Promise<OrderResult> {
-    await audit({ actor, category: "mt5", action: "order_request", detail: { ...req } });
+    // Resolve to the broker's real symbol so the order doesn't fail when the
+    // strategy/scanner used an un-suffixed name. Record any remap.
+    const brokerSymbol = await resolveSymbol(req.symbol);
+    const sent = { ...req, symbol: brokerSymbol };
+    await audit({ actor, category: "mt5", action: "order_request", detail: { ...sent, requestedSymbol: req.symbol } });
     const result = await bridge<OrderResult>("/order", {
       method: "POST",
-      body: JSON.stringify(req),
+      body: JSON.stringify(sent),
     });
-    await audit({ actor, category: "mt5", action: "order_result", detail: { req, result } });
+    await audit({ actor, category: "mt5", action: "order_result", detail: { req: sent, requestedSymbol: req.symbol, result } });
     return result;
   },
 

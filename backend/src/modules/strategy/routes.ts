@@ -14,7 +14,13 @@ export async function strategyRoutes(app: FastifyInstance) {
 
   app.post("/api/strategies", { preHandler: [app.requireRole("ADMIN", "MANAGER")] }, async (req, reply) => {
     const body = z.object({ name: z.string().min(1), type: z.string().min(1), config: StrategyConfigSchema }).safeParse(req.body);
-    if (!body.success) return reply.code(400).send({ error: "invalid strategy", issues: body.error.issues });
+    if (!body.success) {
+      const issue = body.error.issues[0];
+      return reply.code(400).send({
+        error: `invalid strategy — ${issue?.path.join(".") || "config"}: ${issue?.message ?? "unknown error"}`,
+        issues: body.error.issues,
+      });
+    }
     const strategy = await prisma.strategy.create({
       data: { userId: req.user.id, name: body.data.name, type: body.data.type, config: body.data.config as object },
     });
@@ -29,7 +35,13 @@ export async function strategyRoutes(app: FastifyInstance) {
       enabled: z.boolean().optional(),
       config: StrategyConfigSchema.optional(),
     }).safeParse(req.body);
-    if (!body.success) return reply.code(400).send({ error: "invalid update", issues: body.error.issues });
+    if (!body.success) {
+      const issue = body.error.issues[0];
+      return reply.code(400).send({
+        error: `invalid update — ${issue?.path.join(".") || "config"}: ${issue?.message ?? "unknown error"}`,
+        issues: body.error.issues,
+      });
+    }
     const existing = await prisma.strategy.findFirst({ where: { id, userId: req.user.id } });
     if (!existing) return reply.code(404).send({ error: "not found" });
     const strategy = await prisma.strategy.update({

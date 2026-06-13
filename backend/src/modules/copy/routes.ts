@@ -101,7 +101,8 @@ export async function copyRoutes(app: FastifyInstance) {
     const body = z.object({
       symbol: z.string().min(3),
       direction: z.enum(["buy", "sell"]),
-      lots: z.number().positive(),
+      // Optional: human signals often omit size — we size from risk settings.
+      lots: z.number().positive().optional(),
       sl: z.number().positive().optional(),
       tp: z.number().positive().optional(),
       ref: z.string().optional(),

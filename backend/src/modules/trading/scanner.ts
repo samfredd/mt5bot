@@ -1,6 +1,7 @@
 import { prisma } from "../../lib/prisma.js";
 import { audit } from "../../lib/audit.js";
 import { mt5 } from "../mt5/client.js";
+import { accountIdForLogin } from "../mt5/account.js";
 import { buildMarketAnalysis, type MarketAnalysis } from "../analysis/engine.js";
 import { assessNewsRisk } from "../news/service.js";
 import { askModel } from "../ai/service.js";
@@ -112,10 +113,16 @@ export interface ScanResult {
   candidates: { symbol: string; direction: string; score: number }[];
   suggested: { tradeId: string; symbol: string; direction: string; lots: number } | null;
   skippedReason?: string;
+  /** Full scoring detail when the user directed a specific symbol. */
+  directedAnalysis?: { symbol: string; direction: string | null; score: number; reasons: string[] };
 }
 
-export async function runScanner(trigger: "schedule" | "manual" = "schedule"): Promise<ScanResult> {
+export async function runScanner(
+  trigger: "schedule" | "manual" = "schedule",
+  opts: { symbol?: string } = {},
+): Promise<ScanResult> {
   const empty: ScanResult = { scanned: 0, candidates: [], suggested: null };
+  const directed = opts.symbol?.toUpperCase();
   const state = await getBotState();
   if (state.emergencyStop || state.status !== "running") {
     return { ...empty, skippedReason: `bot is ${state.emergencyStop ? "emergency-stopped" : state.status}` };
@@ -127,15 +134,25 @@ export async function runScanner(trigger: "schedule" | "manual" = "schedule"): P
   const settings = user && (await prisma.riskSettings.findUnique({ where: { userId: user.id } }));
   if (!user || !settings) return { ...empty, skippedReason: "no admin user / risk settings" };
 
-  const dayStart = new Date(); dayStart.setHours(0, 0, 0, 0);
-  const suggestedToday = await prisma.trade.count({
-    where: { userId: user.id, createdAt: { gte: dayStart }, explanation: { path: ["scanner"], equals: true } },
-  });
-  if (suggestedToday >= cfg.maxPerDay) return { ...empty, skippedReason: `daily suggestion cap reached (${cfg.maxPerDay})` };
+  // Daily cap applies to the autonomous sweep, not to explicit user requests.
+  if (!directed) {
+    const dayStart = new Date(); dayStart.setHours(0, 0, 0, 0);
+    const suggestedToday = await prisma.trade.count({
+      where: { userId: user.id, createdAt: { gte: dayStart }, explanation: { path: ["scanner"], equals: true } },
+    });
+    if (suggestedToday >= cfg.maxPerDay) return { ...empty, skippedReason: `daily suggestion cap reached (${cfg.maxPerDay})` };
+  }
 
-  // 1. Score the whole watchlist
+  // A directed request lowers the confluence bar to 2 (AI + risk still gate),
+  // because the user explicitly asked for this symbol's best setup.
+  const symbolsToScan = directed ? [directed] : cfg.symbols;
+  const minScore = directed ? Math.min(cfg.minScore, 2) : cfg.minScore;
+  let directedAnalysis: ScanResult["directedAnalysis"];
+
+  // 1. Score the watchlist (or the single directed symbol)
   const candidates: Candidate[] = [];
-  for (const symbol of cfg.symbols) {
+  const fetchErrors: string[] = []; // symbols the bridge could not price
+  for (const symbol of symbolsToScan) {
     try {
       const tick = await mt5.tick(symbol);
       const candlesByTf = {
@@ -145,17 +162,37 @@ export async function runScanner(trigger: "schedule" | "manual" = "schedule"): P
       };
       const analysis = buildMarketAnalysis(symbol, tick, candlesByTf);
       const s = scoreSymbol(analysis);
-      if (s.direction && s.score >= cfg.minScore) {
+      if (directed) directedAnalysis = { symbol, direction: s.direction, score: s.score, reasons: s.reasons };
+      if (s.direction && s.score >= minScore) {
         candidates.push({ symbol, direction: s.direction, score: s.score, reasons: s.reasons, analysis });
       }
     } catch {
-      /* symbol unavailable — skip */
+      fetchErrors.push(symbol);
+      if (directed) return { ...empty, skippedReason: `could not fetch market data for ${symbol} — is the symbol name correct? (your broker may use a suffix, e.g. ${symbol}m)` };
     }
   }
   const summary = candidates.map((c) => ({ symbol: c.symbol, direction: c.direction, score: c.score }));
-  broadcast("scanner", { trigger, scanned: cfg.symbols.length, candidates: summary });
-  await audit({ actor: `scanner:${trigger}`, userId: user.id, category: "strategy", action: "market_scan", detail: { scanned: cfg.symbols.length, candidates: summary } });
-  if (!candidates.length) return { scanned: cfg.symbols.length, candidates: [], suggested: null, skippedReason: "no setup met the confluence bar" };
+  broadcast("scanner", { trigger, scanned: symbolsToScan.length, candidates: summary, fetchErrors, directed });
+  await audit({ actor: `scanner:${trigger}`, userId: user.id, category: "strategy", action: "market_scan", detail: { scanned: symbolsToScan.length, candidates: summary, fetchErrors, directed } });
+
+  // Every symbol failed to price — this is a config/connectivity problem, not
+  // "no setups". Surface it loudly instead of looking like an idle scan.
+  if (fetchErrors.length === symbolsToScan.length) {
+    return {
+      scanned: symbolsToScan.length, candidates: [], suggested: null, directedAnalysis,
+      skippedReason: `no market data for any watchlist symbol (${fetchErrors.join(", ")}). The bot can't see prices — check the symbol names match your broker (e.g. EURUSD vs EURUSDm) and that the bridge/terminal is connected.`,
+    };
+  }
+
+  if (!candidates.length) {
+    const errNote = fetchErrors.length ? ` (${fetchErrors.length} symbol(s) had no market data: ${fetchErrors.join(", ")})` : "";
+    return {
+      scanned: symbolsToScan.length, candidates: [], suggested: null, directedAnalysis,
+      skippedReason: directed
+        ? `no tradeable setup on ${directed} right now — ${directedAnalysis?.direction ? `direction ${directedAnalysis.direction} but confluence only ${directedAnalysis.score}` : "no clear direction"}`
+        : `no setup met the confluence bar${errNote}`,
+    };
+  }
 
   // 2. Best candidate first; skip symbols that already have a pending suggestion
   candidates.sort((a, b) => b.score - a.score);
@@ -172,7 +209,16 @@ export async function runScanner(trigger: "schedule" | "manual" = "schedule"): P
       `Autonomous scanner: ${best.direction.toUpperCase()} candidate on ${best.symbol}, confluence score ${best.score} — ${best.reasons.join("; ")}`,
       `maxRiskPerTrade=${settings.maxRiskPerTradePct}%, minRR=${settings.minRiskReward}`,
     );
-    const { decision: ai, logId } = await askModel(prompt, best.symbol);
+    const { decision: ai, logId, valid: aiValid } = await askModel(prompt, best.symbol);
+    // If the AI is unreachable it would veto every candidate identically —
+    // stop and say so plainly rather than reporting a vague "no setup".
+    if (!aiValid) {
+      await audit({ actor: `scanner:${trigger}`, userId: user.id, category: "ai", action: "ai_unavailable", detail: { symbol: best.symbol, scanner: true } });
+      return {
+        scanned: symbolsToScan.length, candidates: summary, directedAnalysis, suggested: null,
+        skippedReason: "AI model offline — suggestions paused. Start Ollama and confirm the model is pulled (see Settings / health).",
+      };
+    }
     if (ai.decision !== best.direction || ai.confidence < 0.65) {
       await audit({ actor: `scanner:${trigger}`, userId: user.id, category: "ai", action: "ai_veto", detail: { symbol: best.symbol, scanner: true, signal: best.direction, ai: ai.decision, confidence: ai.confidence, reasoning: ai.reasoning } });
       continue;
@@ -187,7 +233,7 @@ export async function runScanner(trigger: "schedule" | "manual" = "schedule"): P
     const stopLoss = ai.suggested_stop_loss ?? (best.direction === "buy" ? entry - slDist : entry + slDist);
     const takeProfit = ai.suggested_take_profit ?? (best.direction === "buy" ? entry + tpDist : entry - tpDist);
     const account = await mt5.accountInfo();
-    const suggestedLots = calculateLots(account.balance, settings.maxRiskPerTradePct, entry, stopLoss, settings.maxLotSize);
+    const suggestedLots = calculateLots(best.symbol, account.balance, settings.maxRiskPerTradePct, entry, stopLoss, settings.maxLotSize);
 
     // 5. Risk pre-check with the suggested size
     const proposal: TradeProposal = { symbol: best.symbol, direction: best.direction, lots: suggestedLots, entry, stopLoss, takeProfit };
@@ -201,7 +247,7 @@ export async function runScanner(trigger: "schedule" | "manual" = "schedule"): P
     // 6. Create the suggestion — always approval-gated, never auto-executed
     const trade = await prisma.trade.create({
       data: {
-        userId: user.id, symbol: best.symbol,
+        userId: user.id, accountId: await accountIdForLogin(user.id, account.login, account), symbol: best.symbol,
         direction: best.direction === "buy" ? "BUY" : "SELL",
         lots: suggestedLots, entryPrice: entry, stopLoss, takeProfit,
         status: "PENDING_APPROVAL", mode: "SEMI_AUTO", aiAnalysisId: logId,
@@ -225,8 +271,8 @@ export async function runScanner(trigger: "schedule" | "manual" = "schedule"): P
       `Dashboard: Trades tab · Telegram: /approve_trade ${trade.id} <lots> · Expires in 30 min.`);
     broadcast("approval_request", { tradeId: trade.id, symbol: best.symbol, direction: best.direction, lots: suggestedLots, scanner: true });
 
-    return { scanned: cfg.symbols.length, candidates: summary, suggested: { tradeId: trade.id, symbol: best.symbol, direction: best.direction, lots: suggestedLots } };
+    return { scanned: symbolsToScan.length, candidates: summary, directedAnalysis, suggested: { tradeId: trade.id, symbol: best.symbol, direction: best.direction, lots: suggestedLots } };
   }
 
-  return { scanned: cfg.symbols.length, candidates: summary, suggested: null, skippedReason: "candidates vetoed by AI/news/risk or already pending" };
+  return { scanned: symbolsToScan.length, candidates: summary, suggested: null, directedAnalysis, skippedReason: "candidates vetoed by AI/news/risk or already pending" };
 }

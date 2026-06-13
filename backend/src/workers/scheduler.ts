@@ -5,7 +5,7 @@ import { config } from "../config.js";
 import { getBotState } from "../modules/system/state.js";
 import { refreshCalendar } from "../modules/news/service.js";
 import { refreshHeadlines } from "../modules/news/headlines.js";
-import { evaluateAndMaybeTrade } from "../modules/trading/service.js";
+import { evaluateAndMaybeTrade, enforceEquityGuardian } from "../modules/trading/service.js";
 import { managePositions } from "../modules/trading/manager.js";
 import { getScannerConfig, runScanner } from "../modules/trading/scanner.js";
 import { mt5 } from "../modules/mt5/client.js";
@@ -36,9 +36,16 @@ async function analysisTick() {
       await managePositions().catch((err) =>
         logError("scheduler", "position management failed", { error: String(err) }),
       );
+      // Capital-protection guardian: may flatten + pause if equity breaches
+      // the floor. Runs before new-trade evaluation so a tripped guardian
+      // stops this tick from opening anything.
+      await enforceEquityGuardian().catch((err) =>
+        logError("scheduler", "equity guardian failed", { error: String(err) }),
+      );
     }
 
-    if (state.status !== "running" || state.emergencyStop) return;
+    // Re-read: the guardian may have just paused the bot.
+    if ((await getBotState()).status !== "running" || state.emergencyStop) return;
 
     // Autonomous scanner on its own cadence (independent of strategies).
     const scannerCfg = await getScannerConfig();
@@ -75,9 +82,16 @@ async function analysisTick() {
  * breaker both depend on accurate per-trade profit.
  */
 async function syncClosedTrades() {
-  const open = await prisma.trade.findMany({ where: { status: "EXECUTED", mt5Ticket: { not: null } } });
+  // Only reconcile trades belonging to the account the terminal is connected
+  // to — another account's open trades are simply not visible right now, NOT
+  // closed. Legacy trades without an account stamp keep the old behavior.
+  const info = await mt5.accountInfo().catch(() => null);
+  if (!info) return; // bridge down — nothing can be reconciled safely
+  const accountScope = { OR: [{ accountId: null }, { account: { login: String(info.login) } }] };
+
+  const open = await prisma.trade.findMany({ where: { status: "EXECUTED", mt5Ticket: { not: null }, ...accountScope } });
   const needBackfill = await prisma.trade.findMany({
-    where: { status: "CLOSED", profit: null, mt5Ticket: { not: null }, closedAt: { gte: new Date(Date.now() - 7 * 86400_000) } },
+    where: { status: "CLOSED", profit: null, mt5Ticket: { not: null }, closedAt: { gte: new Date(Date.now() - 7 * 86400_000) }, ...accountScope },
   });
   if (!open.length && !needBackfill.length) return;
 
@@ -101,6 +115,13 @@ async function syncClosedTrades() {
 
   for (const trade of justClosed) {
     const profit = profitFor(trade.mt5Ticket!);
+    if (profit === null) {
+      // Closed but no matching deal yet — the loss-streak breaker and loss
+      // limits will under-read until backfill resolves it. Surface it.
+      await logError("scheduler", "trade closed without attributable profit", {
+        tradeId: trade.id, symbol: trade.symbol, positionId: trade.mt5Ticket,
+      });
+    }
     const closed = await prisma.trade.update({
       where: { id: trade.id },
       data: { status: "CLOSED", closedAt: new Date(), profit },

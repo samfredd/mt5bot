@@ -4,8 +4,10 @@ import { prisma } from "../../lib/prisma.js";
 import { audit } from "../../lib/audit.js";
 import { logger } from "../../lib/logger.js";
 import { mt5 } from "../mt5/client.js";
+import { currentAccountId } from "../mt5/account.js";
 import { getBotState, setBotState } from "../system/state.js";
 import { decideTrade, emergencyStopAll } from "../trading/service.js";
+import { copySourceTrade } from "../copy/service.js";
 import { latestNews } from "../news/service.js";
 import { requireTwoFactor } from "../auth/service.js";
 
@@ -88,7 +90,12 @@ export function createTelegramBot(): Bot | null {
   bot.command("profit", async (ctx) => {
     const link = await guard(ctx, "/profit"); if (!link) return;
     const dayStart = new Date(); dayStart.setHours(0, 0, 0, 0);
-    const agg = await prisma.trade.aggregate({ _sum: { profit: true }, where: { userId: link.userId, closedAt: { gte: dayStart } } });
+    // Per-account: today's P/L for the account the terminal is on.
+    const accountId = await currentAccountId(link.userId);
+    const agg = await prisma.trade.aggregate({
+      _sum: { profit: true },
+      where: { userId: link.userId, closedAt: { gte: dayStart }, ...(accountId ? { accountId } : {}) },
+    });
     const positions = await mt5.positions();
     const floating = positions.reduce((a, p) => a + p.profit, 0);
     await ctx.reply(`Today's closed P/L: ${(agg._sum.profit ?? 0).toFixed(2)}\nFloating P/L: ${floating.toFixed(2)}`);
@@ -177,6 +184,86 @@ export function createTelegramBot(): Bot | null {
       `Max open: ${rs.maxOpenTrades} | Max lot: ${rs.maxLotSize} | Min R:R ${rs.minRiskReward}\n` +
       `News limit: ${rs.newsRiskLimit} | SL required: ${rs.requireStopLoss}\n` +
       `(Change settings in the web dashboard.)`);
+  });
+
+  /**
+   * Real-trader signal copying: forward any human trader's signal message to
+   * this bot (or add the bot to a signal group). The signal is parsed
+   * (regex + AI), attributed to the original trader via the forward origin,
+   * and routed through that trader's copy rules and the full risk engine.
+   */
+  bot.on("message:text", async (ctx) => {
+    const text = ctx.message.text;
+    if (text.startsWith("/")) return; // commands handled above
+    const isPrivate = ctx.chat?.type === "private";
+
+    const link = await linkedUser(ctx);
+    if (!link) return; // never react to strangers (and stay silent in groups)
+
+    const { looksLikeSignal, parseSignal } = await import("../copy/signal-parser.js");
+    if (!looksLikeSignal(text)) {
+      if (isPrivate) await ctx.reply("That doesn't look like a trade signal. Forward a message like: BUY EURUSD SL 1.0800 TP 1.0950");
+      return;
+    }
+    const signal = await parseSignal(text);
+    await audit({
+      actor: `telegram:${ctx.from?.id}`, userId: link.userId, category: "copy",
+      action: "signal_received", detail: { text: text.slice(0, 300), parsed: signal as unknown as Record<string, unknown> },
+    });
+    if (!signal) {
+      if (isPrivate) await ctx.reply("I couldn't extract a clear signal (need at least a symbol and buy/sell).");
+      return;
+    }
+
+    // Attribute the signal to the human trader it came from.
+    const origin = (ctx.message as unknown as {
+      forward_origin?: { type: string; chat?: { title?: string }; sender_user?: { first_name?: string; last_name?: string }; sender_user_name?: string };
+    }).forward_origin;
+    const traderName =
+      origin?.chat?.title ??
+      (origin?.sender_user ? `${origin.sender_user.first_name ?? ""} ${origin.sender_user.last_name ?? ""}`.trim() : undefined) ??
+      origin?.sender_user_name ??
+      (ctx.chat?.type !== "private" ? (ctx.chat as { title?: string }).title : undefined) ??
+      "Forwarded signals";
+
+    let trader = await prisma.copyTrader.findFirst({
+      where: { userId: link.userId, name: { equals: traderName, mode: "insensitive" } },
+    });
+    if (!trader) {
+      trader = await prisma.copyTrader.create({
+        data: {
+          userId: link.userId, name: traderName, source: `telegram:${ctx.chat?.id}`,
+          active: false, riskScore: 60,
+          metrics: { note: "auto-created from Telegram signal — metrics unknown" } as object,
+          copyRules: { stopAfterLossStreak: 5, maxSourceLot: 1 } as object,
+        },
+      });
+      await ctx.reply(
+        `📡 New trader profile created: "${traderName}" (from this signal's origin).\n` +
+        `It starts INACTIVE for safety — review and press Copy in the dashboard's Copy Trading tab, then forward signals again.`,
+      );
+      return;
+    }
+    if (!trader.active) {
+      await ctx.reply(`"${trader.name}" is not active. Activate it in the dashboard's Copy Trading tab to copy this signal.`);
+      return;
+    }
+
+    const user = await prisma.user.findUnique({ where: { id: link.userId } });
+    const trade = await copySourceTrade(user!, trader, {
+      symbol: signal.symbol, direction: signal.direction, lots: signal.lots,
+      sl: signal.sl, tp: signal.tp, ref: `telegram:${ctx.message.message_id}`,
+    });
+    if (trade && trade.status === "EXECUTED") {
+      await ctx.reply(
+        `✅ Copied ${trader.name}: ${signal.direction.toUpperCase()} ${signal.symbol} ${trade.lots} lots @ ${trade.entryPrice}` +
+        `${trade.stopLoss ? ` | SL ${trade.stopLoss}` : ""}${trade.takeProfit ? ` | TP ${trade.takeProfit}` : ""} (ticket ${trade.mt5Ticket})`,
+      );
+    } else if (trade) {
+      await ctx.reply(`Copy attempt recorded but not executed (status: ${trade.status}). Check the dashboard for details.`);
+    } else {
+      await ctx.reply(`❌ Signal rejected by copy rules or the risk engine — see the Activity tab for the exact reason.`);
+    }
   });
 
   bot.catch((err) => logger.error({ err: String(err.error) }, "telegram bot error"));

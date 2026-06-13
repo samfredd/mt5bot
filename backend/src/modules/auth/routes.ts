@@ -4,6 +4,8 @@ import { randomBytes } from "node:crypto";
 import { authenticator } from "otplib";
 import { prisma } from "../../lib/prisma.js";
 import { audit } from "../../lib/audit.js";
+import { config } from "../../config.js";
+import { setBotState } from "../system/state.js";
 import { registerUser, verifyLogin, verifyTotp } from "./service.js";
 
 const Credentials = z.object({ email: z.string().email(), password: z.string().min(8) });
@@ -45,20 +47,27 @@ export async function authRoutes(app: FastifyInstance) {
     return { ok: true };
   });
 
-  // --- Live trading enable: admin + 2FA, the explicit unlock ritual ---
+  // --- Live trading enable: admin-only; TOTP required only when REQUIRE_2FA=true ---
   app.post("/auth/live/enable", { preHandler: [app.requireRole("ADMIN")] }, async (req, reply) => {
-    const { token } = z.object({ token: z.string() }).parse(req.body);
-    const user = await prisma.user.findUnique({ where: { id: req.user.id } });
-    if (!user?.totpEnabled || !user.totpSecret || !verifyTotp(user.totpSecret, token)) {
-      return reply.code(403).send({ error: "valid 2FA token required to enable live trading" });
+    const { token } = z.object({ token: z.string().optional() }).parse(req.body ?? {});
+    if (!config.LIVE_TRADING_ENABLED) {
+      return reply.code(409).send({ error: "platform kill switch is off — set LIVE_TRADING_ENABLED=true in the backend .env first" });
     }
-    await prisma.user.update({ where: { id: user.id }, data: { liveTradingEnabled: true } });
-    await audit({ actor: req.user.email, userId: user.id, category: "auth", action: "live_trading_enabled_by_user" });
-    return { ok: true, note: "User-level live flag set. Platform still requires LIVE_TRADING_ENABLED=true in the environment." };
+    if (config.REQUIRE_2FA) {
+      const user = await prisma.user.findUnique({ where: { id: req.user.id } });
+      if (!user?.totpEnabled || !user.totpSecret || !token || !verifyTotp(user.totpSecret, token)) {
+        return reply.code(403).send({ error: "valid 2FA token required to enable live trading" });
+      }
+    }
+    await prisma.user.update({ where: { id: req.user.id }, data: { liveTradingEnabled: true } });
+    await setBotState({ liveTradingEnabled: true, demoMode: false }, req.user.email);
+    await audit({ actor: req.user.email, userId: req.user.id, category: "auth", action: "live_trading_enabled_by_user" });
+    return { ok: true };
   });
 
   app.post("/auth/live/disable", { preHandler: [app.authenticate] }, async (req) => {
     await prisma.user.update({ where: { id: req.user.id }, data: { liveTradingEnabled: false } });
+    await setBotState({ liveTradingEnabled: false }, req.user.email);
     await audit({ actor: req.user.email, userId: req.user.id, category: "auth", action: "live_trading_disabled_by_user" });
     return { ok: true };
   });

@@ -1,5 +1,6 @@
 import type { FastifyInstance } from "fastify";
 import { prisma } from "../../lib/prisma.js";
+import { currentAccountId } from "../mt5/account.js";
 
 /**
  * Performance analytics computed from actual closed-trade history.
@@ -58,11 +59,21 @@ function computeBucket(label: string, profits: number[]): Bucket {
 
 export async function analyticsRoutes(app: FastifyInstance) {
   app.get("/api/analytics", { preHandler: [app.authenticate] }, async (req) => {
-    const { days } = req.query as { days?: string };
+    const { days, account } = req.query as { days?: string; account?: string };
     const since = new Date(Date.now() - Math.min(Number(days ?? 90), 365) * 86400_000);
 
+    // Stats are per trading account (default: the connected one) — mixing
+    // accounts would make win rate / profit factor meaningless. ?account=all
+    // keeps the old combined view.
+    const accountId = account === "all"
+      ? null
+      : account && account !== "current"
+        ? account
+        : await currentAccountId(req.user.id);
+    const accountScope = accountId ? { accountId } : {};
+
     const trades = await prisma.trade.findMany({
-      where: { userId: req.user.id, status: "CLOSED", profit: { not: null }, closedAt: { gte: since } },
+      where: { userId: req.user.id, ...accountScope, status: "CLOSED", profit: { not: null }, closedAt: { gte: since } },
       include: { strategy: { select: { name: true } } },
       orderBy: { closedAt: "asc" },
     });
@@ -91,7 +102,7 @@ export async function analyticsRoutes(app: FastifyInstance) {
       .map(([date, pnl]) => ({ date, pnl: Number(pnl.toFixed(2)) }));
 
     const pendingProfit = await prisma.trade.count({
-      where: { userId: req.user.id, status: "CLOSED", profit: null, closedAt: { gte: since } },
+      where: { userId: req.user.id, ...accountScope, status: "CLOSED", profit: null, closedAt: { gte: since } },
     });
 
     return {

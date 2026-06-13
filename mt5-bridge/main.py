@@ -56,6 +56,12 @@ class ModifyRequest(BaseModel):
     tp: float | None = None
 
 
+class ConnectRequest(BaseModel):
+    login: int
+    password: str
+    server: str
+
+
 # ---------------------------------------------------------------------------
 # Mock broker
 # ---------------------------------------------------------------------------
@@ -157,11 +163,15 @@ class MockBroker:
                 "margin_level": round((equity / margin) * 100, 2) if margin else 100000.0,
                 "currency": "USD",
                 "is_demo": True,
+                "server": "MockBroker-Demo",
             }
 
     def open_positions(self) -> list[dict]:
         with self.lock:
-            return [{**p, "profit": self._pnl(p)} for p in self.positions.values()]
+            return [
+                {**p, "profit": self._pnl(p), "price_current": round(self.prices[p["symbol"]], 5 if self.prices[p["symbol"]] < 100 else 2)}
+                for p in self.positions.values()
+            ]
 
     def place(self, req: OrderRequest) -> dict:
         with self.lock:
@@ -174,7 +184,8 @@ class MockBroker:
                 "time": datetime.now(timezone.utc).isoformat(),
             }
             log.info("MOCK ORDER %s %s %s %.2f lots @ %s sl=%s tp=%s", ticket, req.direction, req.symbol, req.volume, price, req.sl, req.tp)
-            return {"ok": True, "ticket": ticket, "price": price, "retcode": 10009}
+            # Mock has one ticket per position, so position_id == ticket.
+            return {"ok": True, "ticket": ticket, "position_id": ticket, "price": price, "retcode": 10009}
 
     def tick_unlocked(self, symbol: str) -> dict:
         if symbol not in self.prices:
@@ -255,17 +266,27 @@ class RealBroker:
             kwargs["portable"] = True
         # Optional explicit terminal path (required in the Wine container).
         path = os.environ.get("MT5_PATH")
-        args = (path,) if path else ()
+        self._init_args = (path,) if path else ()
+        self._init_kwargs = kwargs
+        self._initialize()
+        log.info("connected to MetaTrader 5 terminal")
+
+    def _initialize(self) -> None:
         # Under Wine the terminal can take a while to come up — retry.
         retries = int(os.environ.get("MT5_INIT_RETRIES", "6"))
         for attempt in range(retries):
-            if mt5.initialize(*args, **kwargs):
-                break
-            log.warning("MT5 initialize attempt %d/%d failed: %s", attempt + 1, retries, mt5.last_error())
+            if self.mt5.initialize(*self._init_args, **self._init_kwargs):
+                return
+            log.warning("MT5 initialize attempt %d/%d failed: %s", attempt + 1, retries, self.mt5.last_error())
             time.sleep(10)
-        else:
-            raise RuntimeError(f"MT5 initialize failed after {retries} attempts: {mt5.last_error()}")
-        log.info("connected to MetaTrader 5 terminal")
+        raise RuntimeError(f"MT5 initialize failed after {retries} attempts: {self.mt5.last_error()}")
+
+    def reinitialize(self) -> None:
+        """Tear down and re-open the IPC channel to the terminal. Needed after
+        an IPC timeout, which can leave the channel in a wedged state."""
+        self.mt5.shutdown()
+        self._initialize()
+        log.info("reinitialized MetaTrader 5 terminal connection")
 
     def account(self) -> dict:
         info = self.mt5.account_info()
@@ -276,6 +297,7 @@ class RealBroker:
             "margin": info.margin, "free_margin": info.margin_free,
             "margin_level": info.margin_level or 0.0, "currency": info.currency,
             "is_demo": info.trade_mode == 0,
+            "server": info.server,
         }
 
     def tick(self, symbol: str) -> dict:
@@ -310,7 +332,8 @@ class RealBroker:
             {
                 "ticket": str(p.ticket), "symbol": p.symbol,
                 "type": "buy" if p.type == 0 else "sell", "volume": p.volume,
-                "price_open": p.price_open, "sl": p.sl or None, "tp": p.tp or None,
+                "price_open": p.price_open, "price_current": p.price_current,
+                "sl": p.sl or None, "tp": p.tp or None,
                 "profit": p.profit,
                 "time": datetime.fromtimestamp(p.time, tz=timezone.utc).isoformat(),
             }
@@ -339,8 +362,21 @@ class RealBroker:
         if result is None:
             return {"ok": False, "error": str(mt5.last_error())}
         ok = result.retcode == mt5.TRADE_RETCODE_DONE
+        # Resolve the POSITION identifier (not just the order ticket). They are
+        # equal on a hedging account, but on a netting account a new order
+        # merges into the existing position whose id is the first order's
+        # ticket — the backend reconciles/closes/modifies by this id.
+        position_id = str(result.order) if ok else None
+        if ok and getattr(result, "deal", 0):
+            try:
+                deals = mt5.history_deals_get(ticket=int(result.deal))
+                if deals:
+                    position_id = str(deals[0].position_id)
+            except Exception as exc:  # noqa: BLE001 — fall back to order ticket
+                log.warning("could not resolve position_id from deal %s: %s", result.deal, exc)
         return {
             "ok": ok, "ticket": str(result.order) if ok else None,
+            "position_id": position_id,
             "price": result.price, "retcode": result.retcode,
             "error": None if ok else f"retcode {result.retcode}: {result.comment}",
         }
@@ -428,7 +464,8 @@ def tick(symbol: str) -> dict:
 
 @app.get("/candles/{symbol}", dependencies=[Depends(require_key)])
 def candles(symbol: str, timeframe: str = "H1", count: int = 200) -> dict:
-    return {"candles": broker.candles(symbol, timeframe, min(count, 1000))}
+    # Large counts are for backtesting (MT5 keeps years of H1 history).
+    return {"candles": broker.candles(symbol, timeframe, min(count, 50000))}
 
 
 @app.get("/symbols", dependencies=[Depends(require_key)])
@@ -437,6 +474,36 @@ def symbols() -> dict:
         return {"symbols": list(MOCK_SYMBOLS.keys())}
     syms = broker.mt5.symbols_get() or []  # type: ignore[union-attr]
     return {"symbols": [s.name for s in syms]}
+
+
+@app.post("/connect", dependencies=[Depends(require_key)])
+def connect(req: ConnectRequest) -> dict:
+    """Switch the terminal to another account (demo or real). Credentials are
+    used for the login call only and never logged or stored here."""
+    if MOCK:
+        log.info("MOCK CONNECT login=%s server=%s", req.login, req.server)
+        return {"ok": True, "login": str(req.login), "is_demo": True, "balance": broker.balance}
+    # Switching to a server the terminal hasn't seen before can take well over
+    # the package's 60s default while it fetches the server config.
+    timeout_ms = int(os.environ.get("MT5_LOGIN_TIMEOUT_MS", "90000"))
+    ok = broker.mt5.login(req.login, password=req.password, server=req.server, timeout=timeout_ms)  # type: ignore[union-attr]
+    if not ok:
+        err = broker.mt5.last_error()  # type: ignore[union-attr]
+        if err and err[0] == -10005:  # IPC timeout leaves the channel wedged — re-open and retry once
+            log.warning("login hit IPC timeout for login=%s, reinitializing terminal connection", req.login)
+            try:
+                broker.reinitialize()  # type: ignore[union-attr]
+            except RuntimeError as exc:
+                return {"ok": False, "error": str(exc)}
+            ok = broker.mt5.login(req.login, password=req.password, server=req.server, timeout=timeout_ms)  # type: ignore[union-attr]
+            if not ok:
+                err = broker.mt5.last_error()  # type: ignore[union-attr]
+    if not ok:
+        log.warning("account switch failed for login=%s server=%s: %s", req.login, req.server, err)
+        return {"ok": False, "error": str(err)}
+    info = broker.account()
+    log.info("switched terminal to account %s on %s (demo=%s)", req.login, req.server, info["is_demo"])
+    return {"ok": True, "login": info["login"], "is_demo": info["is_demo"], "balance": info["balance"], "currency": info["currency"]}
 
 
 @app.post("/order", dependencies=[Depends(require_key)])
@@ -458,6 +525,13 @@ def close(ticket: str) -> dict:
 
 
 if __name__ == "__main__":
+    import asyncio
+
     import uvicorn
 
-    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", "5001")))
+    if sys.platform == "win32":
+        # The default proactor loop's AcceptEx can die with WinError 87 after a
+        # system stall/sleep, silently breaking the listener. The selector loop
+        # doesn't have that failure mode and handles this traffic level fine.
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", "5001")), loop="asyncio")

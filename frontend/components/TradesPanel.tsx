@@ -16,8 +16,28 @@ interface Trade {
   mode: string;
   profit: number | null;
   createdAt: string;
+  openedAt?: string | null;
+  closedAt?: string | null;
+  closeAfterMin?: number | null;
   strategy?: { name: string } | null;
   explanation?: Record<string, unknown>;
+}
+
+function fmtDuration(ms: number): string {
+  if (ms < 0) return "—";
+  const m = Math.floor(ms / 60000);
+  if (m < 60) return `${m}m`;
+  const h = Math.floor(m / 60);
+  if (h < 48) return `${h}h ${m % 60}m`;
+  return `${Math.floor(h / 24)}d ${h % 24}h`;
+}
+
+function modeBadge(t: Trade): { label: string; cls: string } {
+  if ((t.explanation as { scanner?: boolean } | undefined)?.scanner) return { label: "AI scan", cls: "bg-violet-950 text-violet" };
+  if (t.mode === "COPY") return { label: "Copy", cls: "bg-teal-950 text-primary" };
+  if (t.mode === "AUTO") return { label: "Auto", cls: "bg-sky-950 text-accent" };
+  if (t.mode === "SEMI_AUTO") return { label: "Semi", cls: "bg-amber-950 text-warn" };
+  return { label: "Manual", cls: "bg-surface-3 text-ink-dim" };
 }
 
 export function TradesPanel({ openTrades, onChanged }: { openTrades: Overview["openTrades"]; onChanged: () => void }) {
@@ -25,11 +45,27 @@ export function TradesPanel({ openTrades, onChanged }: { openTrades: Overview["o
   const [message, setMessage] = useState("");
   const [detail, setDetail] = useState<Trade | null>(null);
   const [lotInputs, setLotInputs] = useState<Record<string, string>>({});
+  const [durations, setDurations] = useState<Record<string, string>>({});
+  const [range, setRange] = useState<{ from: string; to: string }>({ from: "", to: "" });
+  // History is per trading account: "current" (default) shows only the
+  // account the terminal is connected to; "all" shows every account.
+  const [accountScope, setAccountScope] = useState<"current" | "all">("current");
 
   const load = useCallback(async () => {
-    try { setTrades(await api<Trade[]>("/api/trades?limit=50")); } catch { /* noop */ }
-  }, []);
+    try {
+      const params = new URLSearchParams({ limit: "100", account: accountScope });
+      if (range.from) params.set("from", new Date(range.from).toISOString());
+      if (range.to) params.set("to", new Date(`${range.to}T23:59:59`).toISOString());
+      setTrades(await api<Trade[]>(`/api/trades?${params}`));
+    } catch { /* noop */ }
+  }, [range, accountScope]);
   useEffect(() => { void load(); }, [load]);
+
+  function preset(daysBack: number) {
+    const to = new Date();
+    const from = new Date(Date.now() - daysBack * 86400_000);
+    setRange({ from: from.toISOString().slice(0, 10), to: to.toISOString().slice(0, 10) });
+  }
 
   async function act(path: string, body?: unknown) {
     setMessage("");
@@ -81,11 +117,24 @@ export function TradesPanel({ openTrades, onChanged }: { openTrades: Overview["o
                         className="input tnum !w-28" value={lotValue}
                         onChange={(e) => setLotInputs({ ...lotInputs, [t.id]: e.target.value })} />
                     </div>
+                    <div>
+                      <label htmlFor={`dur-${t.id}`} className="label">Max duration</label>
+                      <select id={`dur-${t.id}`} className="input cursor-pointer !w-32"
+                        value={durations[t.id] ?? ""} onChange={(e) => setDurations({ ...durations, [t.id]: e.target.value })}>
+                        <option value="">No limit</option>
+                        <option value="60">1 hour</option>
+                        <option value="240">4 hours</option>
+                        <option value="480">8 hours</option>
+                        <option value="1440">1 day</option>
+                        <option value="4320">3 days</option>
+                      </select>
+                    </div>
                     <button
                       onClick={() => {
                         const lots = Number(lotValue);
                         if (!(lots > 0)) { setMessage("Enter a valid lot size."); return; }
-                        void act(`/api/trades/${t.id}/approve`, { lots });
+                        const durationMin = durations[t.id] ? Number(durations[t.id]) : undefined;
+                        void act(`/api/trades/${t.id}/approve`, { lots, durationMin });
                       }}
                       className="btn bg-emerald-800 text-white hover:bg-emerald-700">
                       <IconCheck size={15} /> Approve
@@ -104,51 +153,154 @@ export function TradesPanel({ openTrades, onChanged }: { openTrades: Overview["o
 
       <section className="card">
         <h2 className="section-title">Open positions</h2>
+        {openTrades.length > 0 && <ExposureStrip positions={openTrades} />}
         {openTrades.length === 0 && (
           <p className="py-6 text-center text-sm text-ink-faint">No open positions. New trades appear here the moment they execute.</p>
         )}
-        <div className="space-y-2">
-          {openTrades.map((p) => (
-            <div key={p.ticket} className="flex flex-wrap items-center justify-between gap-2 rounded-xl bg-surface-2 px-4 py-3 text-sm">
-              <div className="flex items-center gap-2.5">
-                <DirectionBadge direction={p.type.toUpperCase()} />
-                <span className="font-medium">{p.symbol}</span>
-                <span className="tnum text-xs text-ink-dim">{p.volume} lots @ {p.price_open}</span>
-                <span className="tnum hidden text-xs text-ink-faint sm:inline">SL {p.sl ?? "—"} · TP {p.tp ?? "—"}</span>
-              </div>
-              <div className="flex items-center gap-3">
-                <span className={`tnum flex items-center gap-1 font-semibold ${p.profit >= 0 ? "text-up" : "text-down"}`}>
-                  {p.profit >= 0 ? <IconUp size={13} /> : <IconDown size={13} />}
-                  {p.profit >= 0 ? "+" : ""}{p.profit.toFixed(2)}
-                </span>
-                <button onClick={() => { if (confirm(`Close position ${p.ticket} (${p.symbol})?`)) void act(`/api/positions/${p.ticket}/close`); }}
-                  className="btn-danger btn-sm">Close</button>
-              </div>
-            </div>
-          ))}
-        </div>
+        {openTrades.length > 0 && (
+          <div className="overflow-x-auto">
+            <table className="w-full text-left text-xs">
+              <thead className="text-ink-faint">
+                <tr>
+                  <th className="py-2 pr-3 font-medium">Opened</th>
+                  <th className="pr-3 font-medium">Held</th>
+                  <th className="pr-3 font-medium">Symbol</th>
+                  <th className="pr-3 font-medium">Dir</th>
+                  <th className="pr-3 font-medium">Lots</th>
+                  <th className="pr-3 font-medium">Entry</th>
+                  <th className="pr-3 font-medium">Now</th>
+                  <th className="pr-3 font-medium">SL</th>
+                  <th className="pr-3 font-medium">TP</th>
+                  <th className="pr-3 font-medium" title="Profit measured in multiples of the initial risk (entry to stop distance)">R</th>
+                  <th className="pr-3 font-medium">P/L</th>
+                  <th className="pr-1" />
+                </tr>
+              </thead>
+              <tbody className="tnum">
+                {openTrades.map((p) => {
+                  const isBuy = p.type === "buy";
+                  const risk = p.sl != null ? Math.abs(p.price_open - p.sl) : null;
+                  const move = p.price_current != null ? (isBuy ? p.price_current - p.price_open : p.price_open - p.price_current) : null;
+                  const rMult = risk && risk > 0 && move != null ? move / risk : null;
+                  return (
+                    <tr key={p.ticket} className="border-t border-line">
+                      <td className="py-2.5 pr-3 text-ink-faint">
+                        {p.time ? new Date(p.time).toLocaleString(undefined, { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }) : "—"}
+                      </td>
+                      <td className="pr-3 text-ink-dim">{p.time ? fmtDuration(Date.now() - new Date(p.time).getTime()) : "—"}</td>
+                      <td className="pr-3 font-sans font-medium text-ink">{p.symbol}</td>
+                      <td className="pr-3"><DirectionBadge direction={p.type.toUpperCase()} small /></td>
+                      <td className="pr-3">{p.volume}</td>
+                      <td className="pr-3 text-ink-dim">{p.price_open}</td>
+                      <td className="pr-3 text-ink">{p.price_current ?? "—"}</td>
+                      <td className="pr-3 text-ink-dim">{p.sl ?? <span className="text-down">none</span>}</td>
+                      <td className="pr-3 text-ink-dim">{p.tp ?? "—"}</td>
+                      <td className={`pr-3 font-medium ${rMult == null ? "text-ink-faint" : rMult >= 0 ? "text-up" : "text-down"}`}>
+                        {rMult != null ? `${rMult >= 0 ? "+" : ""}${rMult.toFixed(2)}R` : "—"}
+                      </td>
+                      <td className={`pr-3 font-semibold ${p.profit >= 0 ? "text-up" : "text-down"}`}>
+                        {p.profit >= 0 ? "+" : ""}{p.profit.toFixed(2)}
+                      </td>
+                      <td className="pr-1">
+                        <button onClick={() => { if (confirm(`Close position ${p.ticket} (${p.symbol})?`)) void act(`/api/positions/${p.ticket}/close`); }}
+                          className="btn-danger btn-sm">Close</button>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        )}
       </section>
 
       <ManualTrade onDone={() => { void load(); onChanged(); }} />
 
       <section className="card">
-        <h2 className="section-title">Trade history & decisions</h2>
-        {trades.length === 0 && <p className="py-6 text-center text-sm text-ink-faint">No trades yet.</p>}
-        <div className="max-h-96 space-y-1 overflow-auto">
-          {trades.map((t) => (
-            <button key={t.id} onClick={() => setDetail(t)}
-              className="flex w-full cursor-pointer flex-wrap items-center justify-between gap-2 rounded-lg px-3 py-2 text-left text-xs transition-colors hover:bg-surface-2">
-              <span className="flex items-center gap-2">
-                <span className="tnum text-ink-faint">{new Date(t.createdAt).toLocaleString()}</span>
-                <DirectionBadge direction={t.direction} small />
-                <span className="font-medium text-ink">{t.symbol}</span>
-                <span className="tnum text-ink-faint">{t.lots}</span>
-              </span>
-              <span className={`tnum font-medium ${statusColor(t.status)}`}>
-                {statusLabel(t.status)}{t.profit != null ? ` · ${t.profit >= 0 ? "+" : ""}${t.profit.toFixed(2)}` : ""}
-              </span>
-            </button>
-          ))}
+        <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
+          <h2 className="section-title !mb-0">Trade history & decisions</h2>
+          <div className="flex flex-wrap items-center gap-1.5">
+            <label htmlFor="hist-account" className="sr-only">Account scope</label>
+            <select id="hist-account" className="input !w-36 !py-1.5 !text-xs cursor-pointer" value={accountScope}
+              onChange={(e) => setAccountScope(e.target.value as "current" | "all")}>
+              <option value="current">This account</option>
+              <option value="all">All accounts</option>
+            </select>
+            <button onClick={() => preset(1)} className="btn-ghost btn-sm">Today</button>
+            <button onClick={() => preset(7)} className="btn-ghost btn-sm">7d</button>
+            <button onClick={() => preset(30)} className="btn-ghost btn-sm">30d</button>
+            <label htmlFor="hist-from" className="sr-only">From date</label>
+            <input id="hist-from" type="date" className="input !w-36 !py-1.5 !text-xs" value={range.from}
+              onChange={(e) => setRange({ ...range, from: e.target.value })} />
+            <span className="text-xs text-ink-faint">→</span>
+            <label htmlFor="hist-to" className="sr-only">To date</label>
+            <input id="hist-to" type="date" className="input !w-36 !py-1.5 !text-xs" value={range.to}
+              onChange={(e) => setRange({ ...range, to: e.target.value })} />
+            {(range.from || range.to) && (
+              <button onClick={() => setRange({ from: "", to: "" })} className="btn-ghost btn-sm">Clear</button>
+            )}
+          </div>
+        </div>
+        {trades.length === 0 && (
+          <p className="py-6 text-center text-sm text-ink-faint">
+            {range.from || range.to
+              ? "No trades in this period."
+              : accountScope === "current" ? "No trades on this account yet." : "No trades yet."}
+          </p>
+        )}
+        {(range.from || range.to) && trades.length > 0 && (
+          <p className="mb-2 text-xs text-ink-faint">{trades.length} trade(s) in the selected period.</p>
+        )}
+        <div className="max-h-[28rem] overflow-auto">
+          <table className="w-full text-left text-xs">
+            <thead className="sticky top-0 bg-surface text-ink-faint">
+              <tr>
+                <th className="py-2 pr-3 font-medium">Date</th>
+                <th className="pr-3 font-medium">Symbol</th>
+                <th className="pr-3 font-medium">Dir</th>
+                <th className="pr-3 font-medium">Lots</th>
+                <th className="pr-3 font-medium">Origin</th>
+                <th className="pr-3 font-medium">Entry</th>
+                <th className="pr-3 font-medium">SL / TP</th>
+                <th className="pr-3 font-medium">Held</th>
+                <th className="pr-3 font-medium">Status</th>
+                <th className="pr-3 text-right font-medium">P/L</th>
+              </tr>
+            </thead>
+            <tbody className="tnum">
+              {trades.map((t) => {
+                const badge = modeBadge(t);
+                const held = t.openedAt && t.closedAt
+                  ? fmtDuration(new Date(t.closedAt).getTime() - new Date(t.openedAt).getTime())
+                  : t.openedAt && t.status === "EXECUTED"
+                    ? fmtDuration(Date.now() - new Date(t.openedAt).getTime())
+                    : "—";
+                return (
+                  <tr key={t.id} onClick={() => setDetail(t)}
+                    className="cursor-pointer border-t border-line transition-colors hover:bg-surface-2"
+                    title="Click for the full decision trail">
+                    <td className="py-2.5 pr-3 text-ink-faint">
+                      {new Date(t.createdAt).toLocaleString(undefined, { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })}
+                    </td>
+                    <td className="pr-3 font-sans font-medium text-ink">{t.symbol}</td>
+                    <td className="pr-3"><DirectionBadge direction={t.direction} small /></td>
+                    <td className="pr-3">{t.lots}</td>
+                    <td className="pr-3">
+                      <span className={`chip !px-1.5 !py-0.5 !text-[10px] ${badge.cls}`}>{badge.label}</span>
+                      {t.strategy && <span className="ml-1.5 font-sans text-[10px] text-ink-faint">{t.strategy.name}</span>}
+                    </td>
+                    <td className="pr-3 text-ink-dim">{t.entryPrice ?? "—"}</td>
+                    <td className="pr-3 text-ink-faint">{t.stopLoss ?? "—"} / {t.takeProfit ?? "—"}</td>
+                    <td className="pr-3 text-ink-dim">{held}</td>
+                    <td className={`pr-3 font-sans font-medium ${statusColor(t.status)}`}>{statusLabel(t.status)}</td>
+                    <td className={`pr-3 text-right font-semibold ${t.profit == null ? "text-ink-faint" : t.profit >= 0 ? "text-up" : "text-down"}`}>
+                      {t.profit != null ? `${t.profit >= 0 ? "+" : ""}${t.profit.toFixed(2)}` : "—"}
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
         </div>
       </section>
 
@@ -167,6 +319,37 @@ export function TradesPanel({ openTrades, onChanged }: { openTrades: Overview["o
           </div>
         </div>
       )}
+    </div>
+  );
+}
+
+function ExposureStrip({ positions }: { positions: Overview["openTrades"] }) {
+  const longLots = positions.filter((p) => p.type === "buy").reduce((a, p) => a + p.volume, 0);
+  const shortLots = positions.filter((p) => p.type === "sell").reduce((a, p) => a + p.volume, 0);
+  const floating = positions.reduce((a, p) => a + p.profit, 0);
+  const protectedCount = positions.filter((p) => p.sl != null).length;
+  const items: { label: string; value: string; tone?: "up" | "down" | "warn" }[] = [
+    { label: "Positions", value: String(positions.length) },
+    { label: "Long / Short", value: `${longLots.toFixed(2)} / ${shortLots.toFixed(2)} lots` },
+    {
+      label: "Floating P/L", value: `${floating >= 0 ? "+" : ""}${floating.toFixed(2)}`,
+      tone: floating >= 0 ? "up" : "down",
+    },
+    {
+      label: "Stop-protected", value: `${protectedCount}/${positions.length}`,
+      tone: protectedCount < positions.length ? "warn" : undefined,
+    },
+  ];
+  return (
+    <div className="mb-4 grid grid-cols-2 gap-2 sm:grid-cols-4">
+      {items.map((i) => (
+        <div key={i.label} className="rounded-xl bg-surface-2 px-3 py-2">
+          <div className="text-[10px] uppercase tracking-wide text-ink-faint">{i.label}</div>
+          <div className={`tnum text-sm font-semibold ${i.tone === "up" ? "text-up" : i.tone === "down" ? "text-down" : i.tone === "warn" ? "text-warn" : "text-ink"}`}>
+            {i.value}
+          </div>
+        </div>
+      ))}
     </div>
   );
 }
@@ -271,9 +454,19 @@ function Section({ title, children }: { title: string; children: React.ReactNode
 }
 
 function ManualTrade({ onDone }: { onDone: () => void }) {
-  const [form, setForm] = useState({ symbol: "EURUSD", direction: "buy", lots: "0.01", stopLoss: "", takeProfit: "" });
+  const [form, setForm] = useState({ symbol: "EURUSD", direction: "buy", lots: "0.01", stopLoss: "", takeProfit: "", durationMin: "" });
+  const [symbols, setSymbols] = useState<string[]>(["EURUSD"]);
   const [message, setMessage] = useState("");
   const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    void (async () => {
+      try {
+        const r = await api<{ symbols: string[] }>("/api/symbols");
+        if (r.symbols.length) setSymbols(r.symbols);
+      } catch { /* keep fallback */ }
+    })();
+  }, []);
 
   async function submit(e: React.FormEvent) {
     e.preventDefault();
@@ -286,6 +479,7 @@ function ManualTrade({ onDone }: { onDone: () => void }) {
           symbol: form.symbol, direction: form.direction, lots: Number(form.lots),
           stopLoss: form.stopLoss ? Number(form.stopLoss) : null,
           takeProfit: form.takeProfit ? Number(form.takeProfit) : null,
+          durationMin: form.durationMin ? Number(form.durationMin) : undefined,
         },
       });
       setMessage("Trade submitted — passed all risk checks.");
@@ -303,8 +497,11 @@ function ManualTrade({ onDone }: { onDone: () => void }) {
       <form onSubmit={submit} className="grid grid-cols-2 items-end gap-3 sm:grid-cols-3 lg:grid-cols-6">
         <div>
           <label htmlFor="mt-symbol" className="label">Symbol</label>
-          <input id="mt-symbol" className="input" value={form.symbol}
-            onChange={(e) => setForm({ ...form, symbol: e.target.value.toUpperCase() })} required />
+          <select id="mt-symbol" className="input cursor-pointer" value={form.symbol}
+            onChange={(e) => setForm({ ...form, symbol: e.target.value })} required>
+            {!symbols.includes(form.symbol) && <option value={form.symbol}>{form.symbol}</option>}
+            {symbols.map((s) => <option key={s} value={s}>{s}</option>)}
+          </select>
         </div>
         <div>
           <label htmlFor="mt-dir" className="label">Direction</label>
@@ -326,6 +523,18 @@ function ManualTrade({ onDone }: { onDone: () => void }) {
           <label htmlFor="mt-tp" className="label">Take profit</label>
           <input id="mt-tp" className="input tnum" inputMode="decimal" value={form.takeProfit}
             onChange={(e) => setForm({ ...form, takeProfit: e.target.value })} placeholder="optional" />
+        </div>
+        <div>
+          <label htmlFor="mt-dur" className="label">Max duration</label>
+          <select id="mt-dur" className="input cursor-pointer" value={form.durationMin}
+            onChange={(e) => setForm({ ...form, durationMin: e.target.value })}>
+            <option value="">No limit</option>
+            <option value="60">1 hour</option>
+            <option value="240">4 hours</option>
+            <option value="480">8 hours</option>
+            <option value="1440">1 day</option>
+            <option value="4320">3 days</option>
+          </select>
         </div>
         <button disabled={busy} className="btn-primary">{busy ? "Submitting…" : "Submit trade"}</button>
       </form>

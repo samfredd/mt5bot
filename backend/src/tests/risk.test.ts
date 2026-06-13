@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { calculateLots, validateTrade, type RiskContext, type TradeProposal } from "../modules/risk/engine.js";
+import { calculateLots, countConsecutiveLosses, equityGuardianBreaches, validateTrade, type RiskContext, type TradeProposal } from "../modules/risk/engine.js";
 
 const settings = {
   id: "rs1", userId: "u1",
@@ -130,6 +130,17 @@ describe("risk engine", () => {
     });
   });
 
+  it("enforces the per-trade risk cap on gold (instrument-aware)", () => {
+    // 3.0 lots gold, $20 stop = $6000 risk on a $10k balance = 60% ≫ 1%.
+    // The old FX-only approximation under-counted this ~1000x and let it pass.
+    const goldTrade: TradeProposal = {
+      symbol: "XAUUSD", direction: "buy", lots: 3.0,
+      entry: 2350, stopLoss: 2330, takeProfit: 2400,
+    };
+    const r = validateTrade(goldTrade, ctx({ settings: { ...settings, maxLotSize: 5 } as RiskContext["settings"] }));
+    expect(r.checks.find((c) => c.name === "max_risk_per_trade")?.passed).toBe(false);
+  });
+
   describe("copy trade limits", () => {
     it("enforces daily copied-trade cap", () => {
       const r = validateTrade({ ...goodTrade, isCopyTrade: true }, ctx({ copiedTradesToday: 10 }));
@@ -138,15 +149,71 @@ describe("risk engine", () => {
   });
 });
 
+describe("countConsecutiveLosses (circuit-breaker input)", () => {
+  const L = { profit: -10 };
+  const W = { profit: 20 };
+  const U = { profit: null }; // unreconciled close
+
+  it("counts the most-recent run of losses", () => {
+    expect(countConsecutiveLosses([L, L, L, W])).toBe(3);
+  });
+  it("stops at the first win", () => {
+    expect(countConsecutiveLosses([W, L, L])).toBe(0);
+  });
+  it("skips unreconciled closes instead of resetting the streak", () => {
+    // The dangerous case: a null-profit close used to read as 'not a loss'
+    // and reset the breaker, masking a real losing streak.
+    expect(countConsecutiveLosses([U, L, L, L])).toBe(3);
+  });
+  it("does not count an unreconciled close as a loss", () => {
+    expect(countConsecutiveLosses([U, W, L])).toBe(0);
+  });
+  it("is zero with no losses", () => {
+    expect(countConsecutiveLosses([])).toBe(0);
+    expect(countConsecutiveLosses([W, W])).toBe(0);
+  });
+});
+
+describe("equityGuardianBreaches (capital-protection flatten trigger)", () => {
+  const s = { equityProtectionPct: 80 };
+  it("does not trip while equity is above the floor", () => {
+    expect(equityGuardianBreaches({ balance: 10000, equity: 9000 }, s)).toEqual([]);
+    expect(equityGuardianBreaches({ balance: 10000, equity: 10500 }, s)).toEqual([]); // floating profit
+  });
+  it("trips when equity falls through the floor", () => {
+    const b = equityGuardianBreaches({ balance: 10000, equity: 7900 }, s); // 79% < 80%
+    expect(b.length).toBe(1);
+    expect(b[0]).toMatch(/protection floor/);
+  });
+  it("is inert with no balance", () => {
+    expect(equityGuardianBreaches({ balance: 0, equity: 0 }, s)).toEqual([]);
+  });
+});
+
 describe("calculateLots", () => {
   it("sizes position from risk percentage", () => {
     // 1% of 10k = $100 risk; 25 pip SL on EURUSD → 100/(0.0025*100000) = 0.4
-    expect(calculateLots(10000, 1, 1.085, 1.0825, 0.5)).toBeCloseTo(0.4);
+    expect(calculateLots("EURUSD", 10000, 1, 1.085, 1.0825, 0.5)).toBeCloseTo(0.4);
   });
   it("caps at max lot", () => {
-    expect(calculateLots(1000000, 5, 1.085, 1.0825, 0.5)).toBe(0.5);
+    expect(calculateLots("EURUSD", 1000000, 5, 1.085, 1.0825, 0.5)).toBe(0.5);
   });
   it("floors at 0.01", () => {
-    expect(calculateLots(100, 0.1, 1.085, 1.0825, 0.5)).toBe(0.01);
+    expect(calculateLots("EURUSD", 100, 0.1, 1.085, 1.0825, 0.5)).toBe(0.01);
+  });
+
+  // Sizing must be correct per instrument — NOT $10/pip-on-100k for everything.
+  it("sizes gold (XAUUSD) from its 100oz contract, not a 100k FX lot", () => {
+    // 1% of 100k = $1000 risk; $5 stop on gold → 1000/(5*100) = 2.0 lots
+    expect(calculateLots("XAUUSD", 100000, 1, 2350, 2345, 5)).toBeCloseTo(2.0);
+  });
+  it("sizes USDJPY using the JPY→USD conversion (÷ price)", () => {
+    // 1% of 100k = $1000; 0.30 stop → value/lot = 100000/151 ≈ 662.25/pt
+    // 1000/(0.30*662.25) ≈ 5.03 → capped sanity via maxLot 10
+    expect(calculateLots("USDJPY", 100000, 1, 151.0, 150.7, 10)).toBeCloseTo(5.03, 1);
+  });
+  it("sizes an index (US30) at $1 per point per lot", () => {
+    // 1% of 100k = $1000; 50-point stop → 1000/(50*1) = 20 lots
+    expect(calculateLots("US30", 100000, 1, 39000, 38950, 50)).toBeCloseTo(20);
   });
 });

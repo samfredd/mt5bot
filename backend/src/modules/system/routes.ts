@@ -2,7 +2,7 @@ import type { FastifyInstance } from "fastify";
 import { z } from "zod";
 import { prisma } from "../../lib/prisma.js";
 import { mt5 } from "../mt5/client.js";
-import { ollamaHealthy } from "../ai/service.js";
+import { aiHealth } from "../ai/service.js";
 import { getBotState, setBotState } from "../system/state.js";
 import { emergencyStopAll } from "../trading/service.js";
 import { notify } from "../notifications/service.js";
@@ -10,11 +10,24 @@ import { audit } from "../../lib/audit.js";
 
 export async function systemRoutes(app: FastifyInstance) {
   app.get("/health", async () => {
-    const [bridge, ollama] = await Promise.all([
+    const [bridge, ai] = await Promise.all([
       mt5.health().catch(() => ({ ok: false, mock: false, connected: false })),
-      ollamaHealthy(),
+      aiHealth(),
     ]);
-    return { ok: true, mt5Bridge: bridge, ollama, time: new Date().toISOString() };
+    // `ok` must reflect actual dependency health — a bot that can't reach its
+    // AI vetoes every trade, so reporting ok:true there is a false positive.
+    const degraded: string[] = [];
+    if (!bridge.connected) degraded.push("mt5_bridge");
+    if (!ai.reachable) degraded.push("ai_unreachable");
+    else if (!ai.modelPresent) degraded.push("ai_model_missing");
+    return {
+      ok: degraded.length === 0,
+      degraded,
+      mt5Bridge: bridge,
+      ai,
+      ollama: ai.reachable, // back-compat
+      time: new Date().toISOString(),
+    };
   });
 
   app.get("/api/bot/state", { preHandler: [app.authenticate] }, async () => getBotState());

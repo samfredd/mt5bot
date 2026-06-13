@@ -155,6 +155,8 @@ model Trade {
   profit        Float?
   openedAt      DateTime?
   closedAt      DateTime?
+  // Time-based exit: auto-close this many minutes after opening (null = no limit)
+  closeAfterMin Int?
   createdAt     DateTime       @default(now())
   // Full decision trail: strategy signal, AI verdict, risk checks, news risk
   explanation   Json           @default("{}")
@@ -162,6 +164,8 @@ model Trade {
   aiAnalysis    AiAnalysisLog? @relation(fields: [aiAnalysisId], references: [id])
   approval      TradeApproval?
   copiedTrade   CopiedTrade?
+
+  @@index([accountId, createdAt])
 }
 
 model TradeApproval {

@@ -7,16 +7,23 @@ import { validateTrade, type TradeProposal } from "../risk/engine.js";
 import { buildRiskContext, decideTrade, executeTrade, sessionNow } from "./service.js";
 import { requireTwoFactor } from "../auth/service.js";
 import { getBotState } from "../system/state.js";
+import { currentAccountId } from "../mt5/account.js";
 
 export async function tradingRoutes(app: FastifyInstance) {
   // --- Dashboard overview ---
-  app.get("/api/overview", { preHandler: [app.authenticate] }, async () => {
+  app.get("/api/overview", { preHandler: [app.authenticate] }, async (req) => {
     const [account, positions, state] = await Promise.all([mt5.accountInfo(), mt5.positions(), getBotState()]);
     const dayStart = new Date(); dayStart.setHours(0, 0, 0, 0);
-    const dailyAgg = await prisma.trade.aggregate({ _sum: { profit: true }, where: { closedAt: { gte: dayStart } } });
-    const pendingApprovals = await prisma.trade.count({ where: { status: "PENDING_APPROVAL" } });
-    const activeStrategies = await prisma.strategy.findMany({ where: { enabled: true }, select: { id: true, name: true } });
-    const activeCopyTraders = await prisma.copyTrader.count({ where: { active: true } });
+    // Daily P/L is shown next to the connected account's balance — scope it
+    // to that account so switching accounts doesn't mix histories.
+    const accountId = await currentAccountId(req.user.id);
+    const dailyAgg = await prisma.trade.aggregate({
+      _sum: { profit: true },
+      where: { userId: req.user.id, closedAt: { gte: dayStart }, ...(accountId ? { accountId } : {}) },
+    });
+    const pendingApprovals = await prisma.trade.count({ where: { userId: req.user.id, status: "PENDING_APPROVAL" } });
+    const activeStrategies = await prisma.strategy.findMany({ where: { userId: req.user.id, enabled: true }, select: { id: true, name: true } });
+    const activeCopyTraders = await prisma.copyTrader.count({ where: { userId: req.user.id, active: true } });
     return {
       account,
       botState: state,
@@ -29,19 +36,46 @@ export async function tradingRoutes(app: FastifyInstance) {
     };
   });
 
-  app.get("/api/trades", { preHandler: [app.authenticate] }, async (req) => {
-    const { status, limit } = req.query as { status?: string; limit?: string };
+  app.get("/api/trades", { preHandler: [app.authenticate] }, async (req, reply) => {
+    const { status, limit, from, to, account } = req.query as {
+      status?: string; limit?: string; from?: string; to?: string; account?: string;
+    };
+    const fromDate = from ? new Date(from) : undefined;
+    const toDate = to ? new Date(to) : undefined;
+    if ((fromDate && Number.isNaN(fromDate.getTime())) || (toDate && Number.isNaN(toDate.getTime()))) {
+      return reply.code(400).send({ error: "from/to must be valid dates (ISO format)" });
+    }
+    // History is per trading account. Default: the account the terminal is
+    // connected to right now. ?account=all shows everything; a saved account
+    // id shows that account's history (e.g. while disconnected).
+    let accountId: string | null = null;
+    if (account && account !== "all" && account !== "current") {
+      const saved = await prisma.mt5Account.findFirst({ where: { id: account, userId: req.user.id }, select: { id: true } });
+      if (!saved) return reply.code(404).send({ error: "unknown account" });
+      accountId = saved.id;
+    } else if (account !== "all") {
+      accountId = await currentAccountId(req.user.id);
+    }
     return prisma.trade.findMany({
-      where: status ? { status: status as never } : undefined,
+      where: {
+        userId: req.user.id,
+        ...(accountId ? { accountId } : {}),
+        ...(status ? { status: status as never } : {}),
+        ...(fromDate || toDate
+          ? { createdAt: { ...(fromDate ? { gte: fromDate } : {}), ...(toDate ? { lte: toDate } : {}) } }
+          : {}),
+      },
       orderBy: { createdAt: "desc" },
-      take: Math.min(Number(limit ?? 50), 200),
+      take: Math.min(Number(limit ?? 50), 500),
       include: { approval: true, strategy: { select: { name: true } } },
     });
   });
 
   app.get("/api/trades/:id", { preHandler: [app.authenticate] }, async (req, reply) => {
     const { id } = req.params as { id: string };
-    const trade = await prisma.trade.findUnique({ where: { id }, include: { approval: true, aiAnalysis: true } });
+    // Scoped to the owner: a trade id must never expose another user's trade
+    // (and its AI prompt/analysis) to whoever can guess the id.
+    const trade = await prisma.trade.findFirst({ where: { id, userId: req.user.id }, include: { approval: true, aiAnalysis: true } });
     if (!trade) return reply.code(404).send({ error: "not found" });
     return trade;
   });
@@ -49,14 +83,18 @@ export async function tradingRoutes(app: FastifyInstance) {
   // --- Approvals (approver chooses the lot size) ---
   app.post("/api/trades/:id/approve", { preHandler: [app.requireRole("ADMIN", "MANAGER")] }, async (req, reply) => {
     const { id } = req.params as { id: string };
-    const body = z.object({ totp: z.string().optional(), lots: z.number().positive().optional() }).safeParse(req.body ?? {});
+    const body = z.object({
+      totp: z.string().optional(),
+      lots: z.number().positive().optional(),
+      durationMin: z.number().int().positive().max(7 * 24 * 60).optional(),
+    }).safeParse(req.body ?? {});
     if (!body.success) return reply.code(400).send({ error: "invalid approval payload" });
     const state = await getBotState();
     if (!state.demoMode) {
       const ok = await requireTwoFactor(req.user.id, body.data.totp);
       if (!ok) return reply.code(403).send({ error: "2FA token required for live approvals" });
     }
-    return decideTrade(id, true, req.user.email, "DASHBOARD", { lots: body.data.lots });
+    return decideTrade(id, true, req.user.email, "DASHBOARD", { lots: body.data.lots, durationMin: body.data.durationMin });
   });
 
   app.post("/api/trades/:id/reject", { preHandler: [app.requireRole("ADMIN", "MANAGER")] }, async (req) => {
@@ -71,13 +109,14 @@ export async function tradingRoutes(app: FastifyInstance) {
     lots: z.number().positive(),
     stopLoss: z.number().positive().nullable(),
     takeProfit: z.number().positive().nullable(),
+    durationMin: z.number().int().positive().max(7 * 24 * 60).optional(),
     totp: z.string().optional(),
   });
 
   app.post("/api/trades/manual", { preHandler: [app.requireRole("ADMIN", "MANAGER")] }, async (req, reply) => {
     const body = ManualTrade.safeParse(req.body);
     if (!body.success) return reply.code(400).send({ error: body.error.issues[0]?.message ?? "invalid payload" });
-    const { symbol, direction, lots, stopLoss, takeProfit, totp } = body.data;
+    const { symbol, direction, lots, stopLoss, takeProfit, durationMin, totp } = body.data;
 
     const user = await prisma.user.findUnique({ where: { id: req.user.id } });
     const settings = await prisma.riskSettings.findUnique({ where: { userId: req.user.id } });
@@ -104,7 +143,7 @@ export async function tradingRoutes(app: FastifyInstance) {
     proposal.lots = risk.adjustedLots ?? proposal.lots;
     const trade = await executeTrade(user, proposal, {
       explanation: { manual: true, requestedBy: req.user.email, risk: { checks: risk.checks }, news },
-      mode: "MANUAL", actor: req.user.email,
+      mode: "MANUAL", actor: req.user.email, durationMin,
     });
     return trade;
   });
@@ -149,8 +188,30 @@ export async function tradingRoutes(app: FastifyInstance) {
     return setScannerConfig(body.data, req.user.email);
   });
 
-  app.post("/api/scanner/run", { preHandler: [app.requireRole("ADMIN", "MANAGER")] }, async () => {
-    return runScanner("manual");
+  app.post("/api/scanner/run", { preHandler: [app.requireRole("ADMIN", "MANAGER")] }, async (req, reply) => {
+    const body = z.object({ symbol: z.string().min(3).optional() }).safeParse(req.body ?? {});
+    if (!body.success) return reply.code(400).send({ error: "invalid payload" });
+    return runScanner("manual", { symbol: body.data.symbol });
+  });
+
+  // Broker symbol list, cached briefly — used by dropdowns. Brokers can
+  // expose 10k+ instruments (every US stock); filter to the FX/metals/
+  // indices/crypto the bot is designed for, majors first.
+  const CURRENCIES = ["EUR", "USD", "GBP", "JPY", "AUD", "NZD", "CAD", "CHF"];
+  const KNOWN_CFD = /^(XAUUSD|XAGUSD|XPTUSD|XPDUSD|BTCUSD|ETHUSD|LTCUSD|XRPUSD|US30|US500|USTEC|NAS100|SPX500|DE40|GER40|UK100|JP225|WTI|BRENT|UKOIL|USOIL|NATGAS)([._-].*)?$/;
+  let symbolCache: { list: string[]; ts: number } | null = null;
+  app.get("/api/symbols", { preHandler: [app.authenticate] }, async () => {
+    if (!symbolCache || Date.now() - symbolCache.ts > 10 * 60_000) {
+      const all = await mt5.symbols().catch(() => [] as string[]);
+      const isFxPair = (s: string) =>
+        /^[A-Z]{6}$/.test(s) && CURRENCIES.includes(s.slice(0, 3)) && CURRENCIES.includes(s.slice(3));
+      const fx = all.filter(isFxPair).sort();
+      const cfd = all.filter((s) => KNOWN_CFD.test(s.toUpperCase()) && !isFxPair(s)).sort();
+      const majors = fx.filter((s) => s.includes("USD"));
+      const crosses = fx.filter((s) => !s.includes("USD"));
+      symbolCache = { list: [...new Set([...majors, ...cfd, ...crosses])].slice(0, 300), ts: Date.now() };
+    }
+    return { symbols: symbolCache.list };
   });
 
   app.get("/api/market/:symbol", { preHandler: [app.authenticate] }, async (req) => {

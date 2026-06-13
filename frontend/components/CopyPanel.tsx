@@ -48,6 +48,20 @@ export function CopyPanel() {
 
   return (
     <div className="space-y-6">
+      <section className="card border-teal-900/50">
+        <h2 className="section-title text-primary">Copy real human traders</h2>
+        <ol className="list-inside list-decimal space-y-1.5 text-sm text-ink-dim">
+          <li><b className="text-ink">Telegram signals</b> — forward any trader's signal message to your linked bot (or add the bot to a signal group). It reads messages like <span className="tnum font-mono text-xs">BUY EURUSD SL 1.0800 TP 1.0950</span>, creates a profile for that trader automatically, and — once you activate them below — copies their signals through your risk engine.</li>
+          <li><b className="text-ink">Webhooks</b> — point TradingView alerts or any signal API at <span className="tnum font-mono text-xs">POST /api/copy-traders/&lt;id&gt;/signal</span>.</li>
+          <li><b className="text-ink">MQL5 Signals</b> — for fully managed mirroring of an MQL5 provider, subscribe inside the MT5 terminal itself (Toolbox → Signals); the terminal then copies natively and this dashboard tracks the resulting positions.</li>
+        </ol>
+        <p className="mt-3 text-xs text-ink-faint">
+          Every copied signal still passes your copy rules (symbol allow/block lists, loss-streak auto-stop, abnormal-lot
+          rejection) and the full risk engine — no human trader can bypass your limits. Signals without a lot size are
+          sized from your max-risk-per-trade setting.
+        </p>
+      </section>
+
       <section className="card">
         <h2 className="section-title">Copy traders</h2>
         <p className="mb-4 text-xs text-ink-dim">

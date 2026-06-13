@@ -9,7 +9,7 @@ import { SYSTEM_PROMPT } from "./prompts.js";
  * on any failure the safe fallback ("avoid", confidence 0) is returned so a
  * broken or unavailable model can never cause a trade.
  */
-export async function askModel(prompt: string, symbol: string): Promise<{ decision: AiDecision; logId: string }> {
+export async function askModel(prompt: string, symbol: string): Promise<{ decision: AiDecision; logId: string; valid: boolean }> {
   let raw = "";
   let decision: AiDecision = AI_SAFE_FALLBACK;
   let valid = false;
@@ -53,7 +53,9 @@ export async function askModel(prompt: string, symbol: string): Promise<{ decisi
       valid,
     },
   });
-  return { decision, logId: log.id };
+  // `valid` lets callers distinguish a genuine "avoid" verdict from the AI
+  // being unreachable/broken — they look identical in `decision` otherwise.
+  return { decision, logId: log.id, valid };
 }
 
 /**
@@ -110,4 +112,54 @@ export async function ollamaHealthy(): Promise<boolean> {
   } catch {
     return false;
   }
+}
+
+export interface AiHealth {
+  /** Ollama server is reachable. */
+  reachable: boolean;
+  /** The configured model is actually pulled and listed by the server. */
+  modelPresent: boolean;
+  model: string;
+  /** Fraction of recent AI calls that returned valid JSON (null if none yet). */
+  recentValidRate: number | null;
+  recentSamples: number;
+  /** Timestamp of the last valid AI decision, or null if none on record. */
+  lastValidAt: string | null;
+}
+
+/**
+ * Truthful AI status: not just "is the server up" but "is the configured
+ * model present" and "have recent calls actually produced valid output".
+ * A reachable server with a missing model, or a model that keeps returning
+ * garbage, both mean the AI is effectively DOWN — and the bot vetoes every
+ * trade. This surfaces that instead of letting it look healthy.
+ */
+export async function aiHealth(): Promise<AiHealth> {
+  let reachable = false;
+  let modelPresent = false;
+  const base = (s: string) => s.split(":")[0];
+  try {
+    const res = await fetch(`${config.OLLAMA_URL}/api/tags`, { signal: AbortSignal.timeout(3000) });
+    if (res.ok) {
+      reachable = true;
+      const body = (await res.json()) as { models?: { name?: string }[] };
+      const names = (body.models ?? []).map((m) => m.name ?? "");
+      modelPresent = names.includes(config.OLLAMA_MODEL) || names.some((n) => base(n) === base(config.OLLAMA_MODEL));
+    }
+  } catch {
+    /* unreachable — reachable stays false */
+  }
+
+  const recent = await prisma.aiAnalysisLog.findMany({
+    orderBy: { createdAt: "desc" }, take: 20, select: { valid: true, createdAt: true },
+  });
+  const valids = recent.filter((r) => r.valid);
+  return {
+    reachable,
+    modelPresent,
+    model: config.OLLAMA_MODEL,
+    recentValidRate: recent.length ? Number((valids.length / recent.length).toFixed(2)) : null,
+    recentSamples: recent.length,
+    lastValidAt: valids[0]?.createdAt.toISOString() ?? null,
+  };
 }
