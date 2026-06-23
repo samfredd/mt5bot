@@ -1,5 +1,10 @@
 import type { RiskSettings } from "@prisma/client";
-import { valuePerPointPerLot } from "./instruments.js";
+import {
+  fallbackTradingSpec,
+  moneyForPriceMove,
+  valuePerPointPerLot,
+  type TradingInstrumentSpec,
+} from "./instruments.js";
 
 /**
  * The risk engine is the FINAL authority on every trade — manual, AI,
@@ -15,6 +20,7 @@ export interface TradeProposal {
   stopLoss: number | null;
   takeProfit: number | null;
   isCopyTrade?: boolean;
+  instrumentSpec?: TradingInstrumentSpec;
 }
 
 export interface RiskContext {
@@ -37,7 +43,7 @@ export interface RiskContext {
   liveTradingEnabled: boolean;
   userLiveEnabled: boolean;
   twoFactorVerified: boolean;
-  accountVerified: boolean;
+  exposureGate?: { passed: boolean; reasons: string[] };
 }
 
 export interface RiskCheck {
@@ -62,16 +68,18 @@ export function validateTrade(p: TradeProposal, ctx: RiskContext): RiskResult {
   add("bot_running", ctx.botRunning, ctx.botRunning ? "bot is running" : "bot is not running");
 
   if (ctx.isLiveAccount) {
-    add("live_env_enabled", ctx.liveTradingEnabled, ctx.liveTradingEnabled ? "live trading enabled at platform level" : "LIVE_TRADING_ENABLED=false (platform kill switch)");
+    add("live_settings_enabled", ctx.liveTradingEnabled, ctx.liveTradingEnabled ? "live trading enabled in Settings" : "live trading is disabled in Settings");
     add("live_user_enabled", ctx.userLiveEnabled, ctx.userLiveEnabled ? "user enabled live mode" : "user has not enabled live mode");
     add("live_2fa", ctx.twoFactorVerified, ctx.twoFactorVerified ? "2FA verified" : "two-factor confirmation required for live trading");
-    add("account_verified", ctx.accountVerified, ctx.accountVerified ? "account verified" : "MT5 account not verified");
   } else {
     add("demo_account", true, "demo account — live gates skipped");
   }
 
   // --- News gate ---
   add("news", ctx.newsAction !== "pause", ctx.newsAction === "pause" ? "news filter says pause" : `news action: ${ctx.newsAction}`);
+  if (ctx.exposureGate) {
+    add("exposure", ctx.exposureGate.passed, ctx.exposureGate.passed ? "projected exposure within limits" : ctx.exposureGate.reasons.join("; "));
+  }
 
   // --- Stop-loss / take-profit requirements ---
   const hasSl = p.stopLoss !== null && p.stopLoss > 0;
@@ -101,7 +109,9 @@ export function validateTrade(p: TradeProposal, ctx: RiskContext): RiskResult {
     // Money at risk = stop distance × per-lot value-per-point, so this is
     // correct across FX majors, JPY pairs, metals, indices and crypto.
     const stopDist = Math.abs(p.entry - (p.stopLoss as number));
-    const approxRisk = stopDist * p.lots * valuePerPointPerLot(p.symbol, p.entry);
+    const approxRisk = p.instrumentSpec
+      ? Math.abs(moneyForPriceMove(stopDist, p.lots, p.instrumentSpec))
+      : stopDist * p.lots * valuePerPointPerLot(p.symbol, p.entry);
     const riskPct = (approxRisk / ctx.account.balance) * 100;
     add("max_risk_per_trade", riskPct <= s.maxRiskPerTradePct * 1.5, `~${riskPct.toFixed(2)}% of balance (max ${s.maxRiskPerTradePct}%)`);
   }
@@ -215,12 +225,21 @@ export function calculateLots(
   entry: number,
   stopLoss: number,
   maxLot: number,
+  instrumentSpec?: TradingInstrumentSpec,
 ): number {
   const riskAmount = balance * (riskPct / 100);
   const stopDist = Math.abs(entry - stopLoss);
-  if (stopDist <= 0) return 0.01;
-  const perLotRisk = stopDist * valuePerPointPerLot(symbol, entry);
-  if (perLotRisk <= 0) return 0.01;
-  const lots = riskAmount / perLotRisk;
-  return Math.min(Math.max(Math.round(lots * 100) / 100, 0.01), maxLot);
+  const spec = instrumentSpec ?? fallbackTradingSpec(symbol, entry);
+  const minLot = Math.max(spec.volumeMin, 0.00000001);
+  const maxAllowed = Math.max(minLot, Math.min(maxLot, spec.volumeMax));
+  const step = Math.max(spec.volumeStep, 0.00000001);
+  if (stopDist <= 0 || riskAmount <= 0) return minLot;
+  const perLotRisk = Math.abs(moneyForPriceMove(stopDist, 1, spec));
+  if (perLotRisk <= 0) return minLot;
+
+  const rawLots = riskAmount / perLotRisk;
+  if (rawLots <= minLot) return minLot;
+  const floored = Math.floor((rawLots + step * 1e-9) / step) * step;
+  const decimals = Math.max(0, Math.ceil(-Math.log10(step)));
+  return Number(Math.min(Math.max(floored, minLot), maxAllowed).toFixed(decimals));
 }

@@ -1,8 +1,13 @@
 import "./globals.css";
 import type { Metadata, Viewport } from "next";
 import { Inter } from "next/font/google";
+import { AuthExpiryGuard } from "@/components/AuthExpiryGuard";
 
-const inter = Inter({ subsets: ["latin"], variable: "--font-inter", display: "swap" });
+const inter = Inter({
+  subsets: ["latin"],
+  variable: "--font-inter",
+  display: "swap",
+});
 
 export const metadata: Metadata = {
   title: "MT5 AI Trading Bot",
@@ -17,7 +22,10 @@ export const viewport: Viewport = {
 export default function RootLayout({ children }: { children: React.ReactNode }) {
   return (
     <html lang="en" className={inter.variable}>
-      <body className="min-h-dvh font-sans antialiased">{children}</body>
+      <body className="min-h-dvh font-sans antialiased">
+        <AuthExpiryGuard />
+        {children}
+      </body>
     </html>
   );
 }

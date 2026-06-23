@@ -134,7 +134,7 @@ export async function copySourceTrade(
     symbol: source.symbol, direction: source.direction, lots, entry,
     stopLoss: source.sl ?? null, takeProfit: source.tp ?? null, isCopyTrade: true,
   };
-  const ctx = await buildRiskContext(user, settings, account, tick.spread_points, null, sessionNow(), news.action, { isCopy: true });
+  const ctx = await buildRiskContext(user, settings, account, tick.spread_points, null, sessionNow(), news.action, { isCopy: true, proposal });
   const risk = validateTrade(proposal, ctx);
   if (!risk.ok) {
     const failed = risk.checks.filter((c) => !c.passed).map((c) => c.name).join(", ");

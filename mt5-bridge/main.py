@@ -118,6 +118,29 @@ class MockBroker:
             "time": datetime.now(timezone.utc).isoformat(),
         }
 
+    def symbol_info(self, symbol: str) -> dict:
+        if symbol not in self.prices:
+            raise HTTPException(404, f"unknown symbol {symbol}")
+        price = self.prices[symbol]
+        is_jpy = symbol.endswith("JPY")
+        digits = 3 if is_jpy else (5 if price < 100 else 2)
+        point = 10 ** -digits
+        contract = 100_000 if len(symbol) >= 6 and symbol[:6].isalpha() else 1
+        tick_value = point * contract
+        if is_jpy and price > 0:
+            tick_value /= price
+        return {
+            "symbol": symbol,
+            "digits": digits,
+            "point": point,
+            "trade_tick_size": point,
+            "trade_tick_value": tick_value,
+            "volume_min": 0.01,
+            "volume_max": 100.0,
+            "volume_step": 0.01,
+            "trade_stops_level": 0,
+        }
+
     def candles(self, symbol: str, timeframe: str, count: int) -> list[dict]:
         if symbol not in self.prices:
             raise HTTPException(404, f"unknown symbol {symbol}")
@@ -240,6 +263,9 @@ class MockBroker:
         cutoff = datetime.now(timezone.utc) - timedelta(days=days)
         return [d for d in self.deals if datetime.fromisoformat(d["close_time"]) >= cutoff]
 
+    def connected(self) -> bool:
+        return True  # the mock broker is always "connected"
+
 
 # ---------------------------------------------------------------------------
 # Real MT5 adapter (Windows / Wine only)
@@ -288,6 +314,18 @@ class RealBroker:
         self._initialize()
         log.info("reinitialized MetaTrader 5 terminal connection")
 
+    def _ensure_symbol(self, symbol: str):
+        info = self.mt5.symbol_info(symbol)
+        if info is None:
+            raise HTTPException(404, f"symbol {symbol} unavailable")
+        if not getattr(info, "visible", True):
+            if not self.mt5.symbol_select(symbol, True):
+                raise HTTPException(404, f"symbol {symbol} unavailable: {self.mt5.last_error()}")
+            info = self.mt5.symbol_info(symbol)
+            if info is None:
+                raise HTTPException(404, f"symbol {symbol} unavailable after select")
+        return info
+
     def account(self) -> dict:
         info = self.mt5.account_info()
         if info is None:
@@ -301,9 +339,14 @@ class RealBroker:
         }
 
     def tick(self, symbol: str) -> dict:
-        t = self.mt5.symbol_info_tick(symbol)
-        info = self.mt5.symbol_info(symbol)
-        if t is None or info is None:
+        info = self._ensure_symbol(symbol)
+        t = None
+        for attempt in range(3):
+            t = self.mt5.symbol_info_tick(symbol)
+            if t is not None:
+                break
+            time.sleep(0.2 * (attempt + 1))
+        if t is None:
             raise HTTPException(404, f"symbol {symbol} unavailable")
         return {
             "symbol": symbol, "bid": t.bid, "ask": t.ask,
@@ -311,10 +354,31 @@ class RealBroker:
             "time": datetime.fromtimestamp(t.time, tz=timezone.utc).isoformat(),
         }
 
+    def symbol_info(self, symbol: str) -> dict:
+        info = self._ensure_symbol(symbol)
+        tick_value = info.trade_tick_value or info.trade_tick_value_profit or info.trade_tick_value_loss
+        return {
+            "symbol": symbol,
+            "digits": int(info.digits),
+            "point": float(info.point),
+            "trade_tick_size": float(info.trade_tick_size or info.point),
+            "trade_tick_value": float(tick_value),
+            "volume_min": float(info.volume_min),
+            "volume_max": float(info.volume_max),
+            "volume_step": float(info.volume_step),
+            "trade_stops_level": int(info.trade_stops_level),
+        }
+
     def candles(self, symbol: str, timeframe: str, count: int) -> list[dict]:
+        self._ensure_symbol(symbol)
         tf = getattr(self.mt5, self.TF_MAP_NAMES.get(timeframe, "TIMEFRAME_H1"))
-        rates = self.mt5.copy_rates_from_pos(symbol, tf, 0, count)
-        if rates is None:
+        rates = None
+        for attempt in range(3):
+            rates = self.mt5.copy_rates_from_pos(symbol, tf, 0, count)
+            if rates is not None and len(rates) > 0:
+                break
+            time.sleep(0.5 * (attempt + 1))
+        if rates is None or len(rates) == 0:
             raise HTTPException(502, f"copy_rates failed: {self.mt5.last_error()}")
         return [
             {
@@ -342,9 +406,9 @@ class RealBroker:
 
     def place(self, req: OrderRequest) -> dict:
         mt5 = self.mt5
+        info = self._ensure_symbol(req.symbol)
         t = mt5.symbol_info_tick(req.symbol)
-        info = mt5.symbol_info(req.symbol)
-        if t is None or info is None:
+        if t is None:
             return {"ok": False, "error": f"no tick for {req.symbol}"}
         order_type = mt5.ORDER_TYPE_BUY if req.direction == "buy" else mt5.ORDER_TYPE_SELL
         price = t.ask if req.direction == "buy" else t.bid
@@ -401,9 +465,9 @@ class RealBroker:
         if not positions:
             return {"ok": False, "error": "position not found"}
         p = positions[0]
+        info = self._ensure_symbol(p.symbol)
         t = mt5.symbol_info_tick(p.symbol)
-        info = mt5.symbol_info(p.symbol)
-        if t is None or info is None:
+        if t is None:
             return {"ok": False, "error": f"no tick for {p.symbol}"}
         close_type = mt5.ORDER_TYPE_SELL if p.type == 0 else mt5.ORDER_TYPE_BUY
         price = t.bid if p.type == 0 else t.ask
@@ -419,7 +483,16 @@ class RealBroker:
     def history(self, days: int) -> list[dict]:
         mt5 = self.mt5
         frm = datetime.now(timezone.utc) - timedelta(days=days)
-        deals = mt5.history_deals_get(frm, datetime.now(timezone.utc)) or []
+        # Pad the upper bound a day into the future. The broker's trade server
+        # runs ahead of UTC (commonly UTC+2/+3), and history_deals_get compares
+        # the range against server time — so passing `now (UTC)` as the upper
+        # bound silently drops every deal that closed today, which made same-day
+        # scalp exits come back unattributable (profit=null on reconciliation).
+        # (There is no history_select in the Python MT5 package; history_deals_get
+        # selects the range itself.)
+        to = datetime.now(timezone.utc) + timedelta(days=1)
+        deals = mt5.history_deals_get(frm, to) or []
+        log.info("history(%dd): %d deals in %s..%s", days, len(deals), frm.date(), to.date())
         return [
             {"ticket": str(d.ticket), "position_id": str(d.position_id),
              "symbol": d.symbol, "volume": d.volume,
@@ -427,6 +500,13 @@ class RealBroker:
              "time": datetime.fromtimestamp(d.time, tz=timezone.utc).isoformat()}
             for d in deals
         ]
+
+    def connected(self) -> bool:
+        """Real connectivity: the terminal AND an account must both be live."""
+        try:
+            return self.mt5.terminal_info() is not None and self.mt5.account_info() is not None
+        except Exception:  # noqa: BLE001 — any IPC error means not connected
+            return False
 
 
 broker = MockBroker() if MOCK else RealBroker()
@@ -439,7 +519,8 @@ log.info("bridge started in %s mode", "MOCK" if MOCK else "REAL")
 
 @app.get("/health")
 def health() -> dict:
-    return {"ok": True, "mock": MOCK, "connected": True}
+    connected = broker.connected()
+    return {"ok": connected, "mock": MOCK, "connected": connected}
 
 
 @app.get("/account", dependencies=[Depends(require_key)])
@@ -460,6 +541,11 @@ def history(days: int = 30) -> dict:
 @app.get("/tick/{symbol}", dependencies=[Depends(require_key)])
 def tick(symbol: str) -> dict:
     return broker.tick(symbol)
+
+
+@app.get("/symbol/{symbol}", dependencies=[Depends(require_key)])
+def symbol_info(symbol: str) -> dict:
+    return broker.symbol_info(symbol)
 
 
 @app.get("/candles/{symbol}", dependencies=[Depends(require_key)])

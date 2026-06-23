@@ -11,8 +11,8 @@ Rate limit: 200 requests/minute per IP.
 | POST | `/auth/login` | — | Returns `{token, user}`. |
 | POST | `/auth/2fa/setup` | any | Returns TOTP `secret` + `otpauthUrl`. |
 | POST | `/auth/2fa/enable` | any | `{token}` — verifies and enables 2FA. |
-| POST | `/auth/live/enable` | ADMIN | `{token}` (TOTP). Sets user-level live flag. Platform still requires `LIVE_TRADING_ENABLED=true` in env. |
-| POST | `/auth/live/disable` | any | Disables user live flag. |
+| POST | `/auth/live/enable` | ADMIN | `{token}` (TOTP). Enables live trading in persisted bot Settings and sets the user live flag. |
+| POST | `/auth/live/disable` | any | Disables live trading in bot Settings and clears the user live flag. |
 | POST | `/auth/link/telegram` | any | Returns a one-time code; send `/link <code>` to the Telegram bot. |
 | POST | `/auth/link/whatsapp` | any | Returns a one-time code; send `link <code>` via WhatsApp. |
 

@@ -2,6 +2,8 @@ import { config } from "../../config.js";
 import { prisma } from "../../lib/prisma.js";
 import { audit, logError } from "../../lib/audit.js";
 import type { NewsImpact, RiskSettings } from "@prisma/client";
+import { CircuitOpenError, circuitSnapshot, withResilience } from "../../lib/resilience.js";
+import { reportIncident, resolveIncidentByDedupeKey } from "../incidents/service.js";
 
 export interface NewsRiskAssessment {
   level: "low" | "medium" | "high";
@@ -38,9 +40,12 @@ function mapImpact(raw: string): NewsImpact {
 /** Pull the weekly economic calendar and upsert into the database. */
 export async function refreshCalendar(): Promise<number> {
   try {
-    const res = await fetch(config.NEWS_CALENDAR_URL, { signal: AbortSignal.timeout(15000) });
-    if (!res.ok) throw new Error(`calendar fetch failed: ${res.status}`);
-    const events = (await res.json()) as FfEvent[];
+    const events = await withResilience("news", async () => {
+      const res = await fetch(config.NEWS_CALENDAR_URL, { signal: AbortSignal.timeout(15000) });
+      if (!res.ok) throw new Error(`calendar fetch failed: ${res.status}`);
+      return await res.json() as FfEvent[];
+    }, { retries: 2, baseDelayMs: 250, maxDelayMs: 1000, failureThreshold: 3, cooldownMs: 60_000 });
+    await resolveIncidentByDedupeKey("news:circuit-open", "system").catch(() => undefined);
     let stored = 0;
     for (const e of events) {
       if (!e.title || !e.date) continue;
@@ -67,6 +72,18 @@ export async function refreshCalendar(): Promise<number> {
     return stored;
   } catch (err) {
     await logError("news", "calendar refresh failed", { error: String(err) });
+    const state = circuitSnapshot("news");
+    if (err instanceof CircuitOpenError || (!Array.isArray(state) && state?.status === "open")) {
+      await reportIncident({
+        dedupeKey: "news:circuit-open",
+        severity: "WARNING",
+        source: "news",
+        title: "News calendar circuit open",
+        message: "Calendar refresh is temporarily suspended after repeated failures.",
+        context: { error: String(err) },
+        minIntervalMs: 60_000,
+      }).catch(() => undefined);
+    }
     return 0;
   }
 }

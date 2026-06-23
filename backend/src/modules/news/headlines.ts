@@ -3,6 +3,7 @@ import { config } from "../../config.js";
 import { prisma } from "../../lib/prisma.js";
 import { audit, logError } from "../../lib/audit.js";
 import { generateJson } from "../ai/service.js";
+import { withResilience } from "../../lib/resilience.js";
 
 /**
  * Breaking-news headlines: pulled from financial RSS feeds, classified by
@@ -48,12 +49,14 @@ export function parseRssItems(xml: string): { title: string; pubDate: string }[]
 }
 
 async function fetchFeed(url: string): Promise<RawHeadline[]> {
-  const res = await fetch(url, {
-    headers: { "user-agent": "Mozilla/5.0 (mt5bot news module)" },
-    signal: AbortSignal.timeout(15000),
-  });
-  if (!res.ok) throw new Error(`feed ${url} returned ${res.status}`);
-  const xml = await res.text();
+  const xml = await withResilience("news", async () => {
+    const res = await fetch(url, {
+      headers: { "user-agent": "Mozilla/5.0 (mt5bot news module)" },
+      signal: AbortSignal.timeout(15000),
+    });
+    if (!res.ok) throw new Error(`feed ${url} returned ${res.status}`);
+    return res.text();
+  }, { retries: 2, baseDelayMs: 250, maxDelayMs: 1000, failureThreshold: 3, cooldownMs: 60_000 });
   const feed = new URL(url).hostname.replace(/^www\./, "");
   return parseRssItems(xml)
     .map((i) => ({

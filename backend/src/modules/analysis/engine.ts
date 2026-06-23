@@ -1,16 +1,23 @@
 import type { Candle, Tick } from "../mt5/client.js";
-import { atr, bollinger, ema, last, macd, rsi, sma } from "./indicators.js";
+import { adx, atr, bollinger, ema, last, macd, rsi, sma } from "./indicators.js";
 
 export interface TimeframeAnalysis {
   timeframe: string;
   trend: "bullish" | "bearish" | "ranging";
   rsi: number | null;
+  rsiPrevious: number | null;
   macdHistogram: number | null;
+  macdPrevious: number | null;
+  macdCurrent: number | null;
+  signalPrevious: number | null;
+  signalCurrent: number | null;
   emaFast: number | null;
   emaSlow: number | null;
   bollingerPosition: "above_upper" | "below_lower" | "inside" | null;
   atr: number | null;
   atrPct: number | null;
+  /** Trend strength (Wilder ADX); low = ranging, high = strong trend. */
+  adx: number | null;
   support: number | null;
   resistance: number | null;
   lastClose: number | null;
@@ -27,14 +34,48 @@ export interface MarketAnalysis {
   session: string;
   timeframes: TimeframeAnalysis[];
   summary: string;
+  /** High/low of today's completed Asian session (for London breakouts). */
+  referenceRange: { high: number; low: number } | null;
+}
+
+/**
+ * High/low of today's completed Asian session (00:00–07:00 UTC) from the
+ * given candles. Null until that session has closed — so a London-session
+ * breakout has a defined level to trade against.
+ */
+export function asianRange(candles: Candle[], nowMs: number): { high: number; low: number } | null {
+  const now = new Date(nowMs);
+  const dayStart = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate());
+  const asianEnd = dayStart + 7 * 3600_000;
+  if (nowMs < asianEnd) return null; // Asian session not finished yet today
+  let high = -Infinity;
+  let low = Infinity;
+  let count = 0;
+  for (const c of candles) {
+    const t = new Date(c.time).getTime();
+    if (t >= dayStart && t < asianEnd) { high = Math.max(high, c.high); low = Math.min(low, c.low); count++; }
+  }
+  return count >= 2 ? { high, low } : null;
 }
 
 export function detectSession(now = new Date()): string {
+  const localHour = (timeZone: string) => {
+    const hour = new Intl.DateTimeFormat("en-GB", {
+      timeZone,
+      hour: "2-digit",
+      hourCycle: "h23",
+    }).formatToParts(now).find((part) => part.type === "hour")?.value;
+    return Number(hour ?? -1);
+  };
+  const londonHour = localHour("Europe/London");
+  const newYorkHour = localHour("America/New_York");
+  const londonOpen = londonHour >= 8 && londonHour < 17;
+  const newYorkOpen = newYorkHour >= 8 && newYorkHour < 17;
+  if (londonOpen && newYorkOpen) return "london_newyork_overlap";
+  if (londonOpen) return "london";
+  if (newYorkOpen) return "newyork";
   const h = now.getUTCHours();
   if (h >= 0 && h < 7) return "asia";
-  if (h >= 7 && h < 12) return "london";
-  if (h >= 12 && h < 16) return "london_newyork_overlap";
-  if (h >= 16 && h < 21) return "newyork";
   return "sydney";
 }
 
@@ -85,7 +126,7 @@ export function analyzeTimeframe(timeframe: string, candles: Candle[]): Timefram
   const emaFastArr = ema(closes, 20);
   const emaSlowArr = ema(closes, 50);
   const rsiArr = rsi(closes, 14);
-  const { histogram } = macd(closes);
+  const { macdLine, signalLine, histogram } = macd(closes);
   const bb = bollinger(closes, 20, 2);
   const atrArr = atr(highs, lows, closes, 14);
   const { support, resistance } = swingLevels(candles);
@@ -113,12 +154,18 @@ export function analyzeTimeframe(timeframe: string, candles: Candle[]): Timefram
     timeframe,
     trend,
     rsi: last(rsiArr) ?? null,
+    rsiPrevious: rsiArr.at(-2) ?? null,
     macdHistogram: last(histogram) ?? null,
+    macdPrevious: macdLine.at(-2) ?? null,
+    macdCurrent: last(macdLine) ?? null,
+    signalPrevious: signalLine.at(-2) ?? null,
+    signalCurrent: last(signalLine) ?? null,
     emaFast: eFast,
     emaSlow: eSlow,
     bollingerPosition,
     atr: lastAtr,
     atrPct: lastAtr !== null && lastClose ? (lastAtr / lastClose) * 100 : null,
+    adx: last(adx(highs, lows, closes, 14)) ?? null,
     support,
     resistance,
     lastClose,
@@ -136,6 +183,7 @@ export function buildMarketAnalysis(
     analyzeTimeframe(tf, candles),
   );
   const trends = timeframes.map((t) => `${t.timeframe}:${t.trend}`).join(", ");
+  const primaryCandles = Object.values(candlesByTf)[0] ?? [];
   return {
     symbol,
     generatedAt: new Date().toISOString(),
@@ -145,5 +193,6 @@ export function buildMarketAnalysis(
     session: detectSession(),
     timeframes,
     summary: `Trends — ${trends}. Spread ${tick.spread_points} points. Session: ${detectSession()}.`,
+    referenceRange: asianRange(primaryCandles, Date.now()),
   };
 }

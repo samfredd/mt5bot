@@ -20,6 +20,21 @@ export interface InstrumentSpec {
   kind: InstrumentKind;
 }
 
+export interface TradingInstrumentSpec {
+  symbol: string;
+  digits: number;
+  /** Smallest displayed broker point, e.g. 0.00001 for five-digit EURUSD. */
+  point: number;
+  /** Smallest price movement used for tick-value accounting. */
+  tickSize: number;
+  /** Account-currency value of one tick for one lot. */
+  tickValue: number;
+  volumeMin: number;
+  volumeMax: number;
+  volumeStep: number;
+  stopsLevelPoints: number;
+}
+
 const KNOWN_CCY = ["EUR", "USD", "GBP", "JPY", "AUD", "NZD", "CAD", "CHF", "CNY"];
 
 const METAL_CONTRACT: Record<string, number> = { XAU: 100, XAG: 5000, XPT: 100, XPD: 100 };
@@ -98,4 +113,39 @@ export function valuePerPointPerLot(symbol: string, price: number): number {
     quoteToUsd = APPROX_USD_PER_UNIT[spec.quoteCurrency] ?? 1;
   }
   return spec.contractSize * quoteToUsd;
+}
+
+/** Convert broker points to a price distance exactly once. */
+export function priceDistanceFromPoints(points: number, spec: TradingInstrumentSpec): number {
+  return points * spec.point;
+}
+
+/** Account-currency value of a signed price move for the requested volume. */
+export function moneyForPriceMove(
+  priceMove: number,
+  lots: number,
+  spec: TradingInstrumentSpec,
+): number {
+  if (spec.tickSize <= 0 || spec.tickValue <= 0 || lots <= 0) return 0;
+  return (priceMove / spec.tickSize) * spec.tickValue * lots;
+}
+
+/** Static fallback for tests or brokers that do not expose symbol metadata. */
+export function fallbackTradingSpec(symbol: string, price: number): TradingInstrumentSpec {
+  const instrument = classifyInstrument(symbol);
+  const isJpyFx = instrument.kind === "fx" && instrument.quoteCurrency === "JPY";
+  const digits = instrument.kind === "fx" ? (isJpyFx ? 3 : 5) : price < 100 ? 5 : 2;
+  const point = 10 ** -digits;
+  const priceUnitValue = valuePerPointPerLot(symbol, price);
+  return {
+    symbol,
+    digits,
+    point,
+    tickSize: point,
+    tickValue: point * priceUnitValue,
+    volumeMin: 0.01,
+    volumeMax: 100,
+    volumeStep: 0.01,
+    stopsLevelPoints: 0,
+  };
 }

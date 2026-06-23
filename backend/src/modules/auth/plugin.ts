@@ -1,6 +1,7 @@
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import fastifyJwt from "@fastify/jwt";
 import { config } from "../../config.js";
+import { isTokenRevoked } from "./service.js";
 
 export interface JwtUser {
   id: string;
@@ -21,15 +22,31 @@ declare module "fastify" {
   }
 }
 
+// A non-expiring session: when JWT_EXPIRES_IN is one of these, tokens are
+// signed with no `exp` claim so the user is never auto-logged-out by age.
+// Revocation (logout / admin) still works — it keys off `iat`, not `exp`.
+const NEVER = new Set(["never", "none", "off", "0", ""]);
+
 export async function authPlugin(app: FastifyInstance) {
-  await app.register(fastifyJwt, { secret: config.JWT_SECRET, sign: { expiresIn: config.JWT_EXPIRES_IN } });
+  const neverExpires = NEVER.has(config.JWT_EXPIRES_IN.trim().toLowerCase());
+  await app.register(fastifyJwt, {
+    secret: config.JWT_SECRET,
+    // Omit `expiresIn` entirely for a permanent session — passing it (even as
+    // a large value) still stamps an `exp`, which would eventually log you out.
+    sign: neverExpires ? {} : { expiresIn: config.JWT_EXPIRES_IN },
+  });
+
+  // Reject a structurally-valid token that has been revoked (logout).
+  const revoked = (req: FastifyRequest) =>
+    isTokenRevoked(req.user.id, (req.user as { iat?: number }).iat);
 
   app.decorate("authenticate", async (req: FastifyRequest, reply: FastifyReply) => {
     try {
       await req.jwtVerify();
     } catch {
-      await reply.code(401).send({ error: "unauthorized" });
+      return reply.code(401).send({ error: "unauthorized" });
     }
+    if (await revoked(req)) return reply.code(401).send({ error: "session ended — please sign in again" });
   });
 
   app.decorate("requireRole", (...roles: JwtUser["role"][]) => {
@@ -39,6 +56,7 @@ export async function authPlugin(app: FastifyInstance) {
       } catch {
         return reply.code(401).send({ error: "unauthorized" });
       }
+      if (await revoked(req)) return reply.code(401).send({ error: "session ended — please sign in again" });
       if (!roles.includes(req.user.role)) {
         return reply.code(403).send({ error: "forbidden" });
       }

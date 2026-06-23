@@ -1,8 +1,11 @@
 import { prisma } from "../../lib/prisma.js";
 import { audit, logError } from "../../lib/audit.js";
-import { mt5 } from "../mt5/client.js";
+import { mt5, type Position } from "../mt5/client.js";
+import { currentAccountId } from "../mt5/account.js";
 import { atr, last } from "../analysis/indicators.js";
 import { notify } from "../notifications/service.js";
+import { normalizeCandles } from "../backtest/market-data.js";
+import { calculateManagedStop } from "../backtest/execution.js";
 
 /**
  * Professional position management, run on every scheduler tick:
@@ -17,21 +20,30 @@ import { notify } from "../notifications/service.js";
  * same as opening new ones.
  */
 export async function managePositions(): Promise<void> {
-  const openTrades = await prisma.trade.findMany({
-    where: { status: "EXECUTED", mt5Ticket: { not: null } },
-    include: { strategy: true },
-  });
-  if (!openTrades.length) return;
-
   let positions;
   try {
     positions = await mt5.positions();
   } catch {
     return; // bridge unreachable — nothing to manage safely
   }
+  if (!positions.length) return;
+
+  const openTrades = await prisma.trade.findMany({
+    where: { status: "EXECUTED", mt5Ticket: { not: null } },
+    include: { strategy: true },
+  });
+  const tracked = new Set(openTrades.map((t) => t.mt5Ticket));
+
+  // Adopt positions opened OUTSIDE the bot (manually in the terminal, or
+  // already open before the bot saw them) so break-even / trailing / time-exit
+  // apply to them too. Their entry + current stop are captured once as the R
+  // reference, so subsequent ratchets stay stable.
+  const external = positions.filter((p) => !tracked.has(p.ticket));
+  const adoptedTrades = external.length ? await adoptExternalPositions(external) : [];
+
   const byTicket = new Map(positions.map((p) => [p.ticket, p]));
 
-  for (const trade of openTrades) {
+  for (const trade of [...openTrades, ...adoptedTrades]) {
     const pos = byTicket.get(trade.mt5Ticket!);
     if (!pos) continue;
 
@@ -69,43 +81,36 @@ export async function managePositions(): Promise<void> {
       continue;
     }
     const price = isBuy ? tick.bid : tick.ask;
-    const profitDist = isBuy ? price - entry : entry - price;
-    const profitR = profitDist / r;
     const currentSl = pos.sl ?? trade.stopLoss;
-
-    let newSl: number | null = null;
-    let reason = "";
-
-    // 1. Break-even at +1R
-    const beLevel = isBuy ? entry + 0.1 * r : entry - 0.1 * r;
-    const beNeeded = isBuy ? currentSl < entry : currentSl > entry;
-    if (profitR >= 1 && beNeeded) {
-      newSl = beLevel;
-      reason = `break-even at +${profitR.toFixed(1)}R`;
-    }
-
-    // 2. ATR trail beyond +1.5R (when the strategy enables trailing)
     const trailingEnabled = (trade.strategy?.config as { exit?: { trailingStop?: boolean } })?.exit?.trailingStop ?? true;
-    if (trailingEnabled && profitR >= 1.5) {
+    let lastAtr: number | null = null;
+    if (trailingEnabled) {
       try {
-        const candles = await mt5.candles(pos.symbol, "H1", 60);
-        const lastAtr = last(atr(candles.map((c) => c.high), candles.map((c) => c.low), candles.map((c) => c.close), 14));
-        if (lastAtr && lastAtr > 0) {
-          const trailLevel = isBuy ? price - lastAtr : price + lastAtr;
-          const improves = isBuy ? trailLevel > Math.max(currentSl, newSl ?? -Infinity) : trailLevel < Math.min(currentSl, newSl ?? Infinity);
-          if (improves) {
-            newSl = trailLevel;
-            reason = `ATR trail at +${profitR.toFixed(1)}R`;
-          }
-        }
+        const candles = normalizeCandles(await mt5.candles(pos.symbol, "H1", 61), "H1", Date.now()).slice(-60);
+        lastAtr = last(atr(candles.map((c) => c.high), candles.map((c) => c.low), candles.map((c) => c.close), 14)) ?? null;
       } catch {
-        /* candle fetch failed — keep whatever we have */
+        lastAtr = null;
       }
     }
-
-    if (newSl === null) continue;
+    const managed = calculateManagedStop({
+      direction: isBuy ? "buy" : "sell",
+      entryPrice: entry,
+      originalStopLoss: trade.stopLoss,
+      currentStopLoss: currentSl,
+      executablePrice: price,
+      atr: lastAtr,
+      trailingEnabled,
+      breakEvenDone: isBuy ? currentSl >= entry : currentSl <= entry,
+    });
+    let newSl = managed.stopLoss;
+    if (newSl === currentSl) continue;
     // Final ratchet guard: never move a stop against the trade.
     if (isBuy ? newSl <= currentSl : newSl >= currentSl) continue;
+
+    const profitR = (isBuy ? price - entry : entry - price) / r;
+    const reason = managed.trailingActivated
+      ? `ATR trail at +${profitR.toFixed(1)}R`
+      : `break-even at +${profitR.toFixed(1)}R`;
 
     const digits = price < 100 ? 5 : 2;
     newSl = Number(newSl.toFixed(digits));
@@ -123,4 +128,42 @@ export async function managePositions(): Promise<void> {
       await logError("position-manager", "modify failed", { ticket: pos.ticket, error: String(err) });
     }
   }
+}
+
+/**
+ * Adopt positions the bot didn't open so it can manage them like its own.
+ * We record the broker's open price and current stop ONCE as the immutable R
+ * reference (the management loop never rewrites Trade.stopLoss), keeping
+ * break-even / trailing stable. Positions without a stop are still adopted but
+ * can't be break-even/trail-managed until one exists — we flag that.
+ */
+async function adoptExternalPositions(positions: Position[]) {
+  const user = await prisma.user.findFirst({ where: { role: "ADMIN" }, orderBy: { createdAt: "asc" } });
+  if (!user) return [];
+  const accountId = await currentAccountId(user.id);
+
+  const created = [];
+  for (const p of positions) {
+    const trade = await prisma.trade.create({
+      data: {
+        userId: user.id, accountId, symbol: p.symbol,
+        direction: p.type === "buy" ? "BUY" : "SELL",
+        lots: p.volume, entryPrice: p.price_open,
+        stopLoss: p.sl ?? null, takeProfit: p.tp ?? null,
+        status: "EXECUTED", mode: "MANUAL", mt5Ticket: p.ticket,
+        openedAt: p.time ? new Date(p.time) : new Date(),
+        explanation: { adopted: true, source: "external", note: "Opened outside the bot; adopted for management." },
+      },
+      include: { strategy: true },
+    });
+    await audit({
+      actor: "system:position-manager", userId: user.id, category: "trade", action: "position_adopted",
+      detail: { tradeId: trade.id, ticket: p.ticket, symbol: p.symbol, type: p.type, volume: p.volume, hasStop: p.sl != null },
+    });
+    await notify(user.id, "trade_opened", `Now managing ${p.symbol}`,
+      `Adopted an externally-opened ${p.type.toUpperCase()} ${p.symbol} (${p.volume} lots). Break-even & trailing will apply` +
+      `${p.sl == null ? " — but it has NO stop-loss, so set one for break-even/trailing to engage." : "."}`);
+    created.push(trade);
+  }
+  return created;
 }

@@ -8,6 +8,8 @@ import { buildRiskContext, decideTrade, executeTrade, sessionNow } from "./servi
 import { requireTwoFactor } from "../auth/service.js";
 import { getBotState } from "../system/state.js";
 import { currentAccountId } from "../mt5/account.js";
+import { paperPerformance } from "./paper.js";
+import { calculateExposure } from "../risk/exposure.js";
 
 export async function tradingRoutes(app: FastifyInstance) {
   // --- Dashboard overview ---
@@ -34,6 +36,17 @@ export async function tradingRoutes(app: FastifyInstance) {
       activeStrategies,
       activeCopyTraders,
     };
+  });
+
+  app.get("/api/exposure", { preHandler: [app.authenticate] }, async () => {
+    const [positions, account] = await Promise.all([mt5.positions(), mt5.accountInfo()]);
+    const exposure = calculateExposure(positions.map((position) => ({
+      symbol: position.symbol,
+      direction: position.type,
+      lots: position.volume,
+      price: position.price_current ?? position.price_open,
+    })));
+    return { accountEquity: account.equity, ...exposure };
   });
 
   app.get("/api/trades", { preHandler: [app.authenticate] }, async (req, reply) => {
@@ -68,6 +81,35 @@ export async function tradingRoutes(app: FastifyInstance) {
       orderBy: { createdAt: "desc" },
       take: Math.min(Number(limit ?? 50), 500),
       include: { approval: true, strategy: { select: { name: true } } },
+    });
+  });
+
+  app.get("/api/paper-trades/performance", { preHandler: [app.authenticate] }, async (req) => {
+    return paperPerformance(req.user.id);
+  });
+
+  app.get("/api/paper-trades", { preHandler: [app.authenticate] }, async (req, reply) => {
+    const query = z.object({
+      status: z.enum(["OPEN", "CLOSED", "CANCELLED"]).optional(),
+      limit: z.coerce.number().int().min(1).max(500).default(100),
+    }).safeParse(req.query);
+    if (!query.success) return reply.code(400).send({ error: "invalid paper-trade query", issues: query.error.issues });
+    return prisma.paperTrade.findMany({
+      where: { userId: req.user.id, ...(query.data.status ? { status: query.data.status } : {}) },
+      orderBy: { createdAt: "desc" },
+      take: query.data.limit,
+      include: { strategy: { select: { name: true } } },
+    });
+  });
+
+  app.get("/api/execution-comparisons", { preHandler: [app.authenticate] }, async (req, reply) => {
+    const query = z.object({ limit: z.coerce.number().int().min(1).max(500).default(100) }).safeParse(req.query);
+    if (!query.success) return reply.code(400).send({ error: "invalid execution-comparison query" });
+    return prisma.executionComparison.findMany({
+      where: { userId: req.user.id },
+      orderBy: { createdAt: "desc" },
+      take: query.data.limit,
+      include: { trade: { select: { symbol: true, direction: true, status: true, openedAt: true, closedAt: true } } },
     });
   });
 
@@ -135,7 +177,7 @@ export async function tradingRoutes(app: FastifyInstance) {
       entry: direction === "buy" ? tick.ask : tick.bid,
       stopLoss, takeProfit,
     };
-    const ctx = await buildRiskContext(user, settings, account, tick.spread_points, null, sessionNow(), news.action, { twoFactorVerified });
+    const ctx = await buildRiskContext(user, settings, account, tick.spread_points, null, sessionNow(), news.action, { twoFactorVerified, proposal });
     const risk = validateTrade(proposal, ctx);
     if (!risk.ok) {
       return reply.code(422).send({ error: "risk validation failed", checks: risk.checks.filter((c) => !c.passed) });
@@ -143,7 +185,11 @@ export async function tradingRoutes(app: FastifyInstance) {
     proposal.lots = risk.adjustedLots ?? proposal.lots;
     const trade = await executeTrade(user, proposal, {
       explanation: { manual: true, requestedBy: req.user.email, risk: { checks: risk.checks }, news },
-      mode: "MANUAL", actor: req.user.email, durationMin,
+      mode: "MANUAL",
+      actor: req.user.email,
+      durationMin,
+      expectedSpreadPoints: tick.spread_points,
+      actualSpreadPoints: tick.spread_points,
     });
     return trade;
   });
@@ -183,6 +229,8 @@ export async function tradingRoutes(app: FastifyInstance) {
       intervalMin: z.number().int().min(2).max(120).optional(),
       maxPerDay: z.number().int().min(1).max(50).optional(),
       minScore: z.number().int().min(2).max(6).optional(),
+      aiMode: z.enum(["STRICT", "ADVISORY"]).optional(),
+      minAiConfidence: z.number().min(0).max(1).optional(),
     }).safeParse(req.body);
     if (!body.success) return reply.code(400).send({ error: "invalid scanner config", issues: body.error.issues });
     return setScannerConfig(body.data, req.user.email);
@@ -198,15 +246,25 @@ export async function tradingRoutes(app: FastifyInstance) {
   // expose 10k+ instruments (every US stock); filter to the FX/metals/
   // indices/crypto the bot is designed for, majors first.
   const CURRENCIES = ["EUR", "USD", "GBP", "JPY", "AUD", "NZD", "CAD", "CHF"];
-  const KNOWN_CFD = /^(XAUUSD|XAGUSD|XPTUSD|XPDUSD|BTCUSD|ETHUSD|LTCUSD|XRPUSD|US30|US500|USTEC|NAS100|SPX500|DE40|GER40|UK100|JP225|WTI|BRENT|UKOIL|USOIL|NATGAS)([._-].*)?$/;
+  const KNOWN_CFD_CORES = new Set([
+    "XAUUSD", "XAGUSD", "XPTUSD", "XPDUSD",
+    "BTCUSD", "ETHUSD", "LTCUSD", "XRPUSD",
+    "US30", "US500", "USTEC", "NAS100", "SPX500",
+    "DE40", "GER40", "UK100", "JP225",
+    "WTI", "BRENT", "UKOIL", "USOIL", "NATGAS",
+  ]);
+  const brokerCore = (symbol: string) => symbol.replace(/[._-].*$/, "").replace(/[a-z]{1,5}$/, "").toUpperCase();
+  const fxCore = (symbol: string) => symbol.match(/^([A-Z]{6})(?:[a-z]{1,5}|[._-].*)?$/)?.[1] ?? null;
   let symbolCache: { list: string[]; ts: number } | null = null;
   app.get("/api/symbols", { preHandler: [app.authenticate] }, async () => {
     if (!symbolCache || Date.now() - symbolCache.ts > 10 * 60_000) {
       const all = await mt5.symbols().catch(() => [] as string[]);
-      const isFxPair = (s: string) =>
-        /^[A-Z]{6}$/.test(s) && CURRENCIES.includes(s.slice(0, 3)) && CURRENCIES.includes(s.slice(3));
+      const isFxPair = (s: string) => {
+        const core = fxCore(s);
+        return !!core && CURRENCIES.includes(core.slice(0, 3)) && CURRENCIES.includes(core.slice(3));
+      };
       const fx = all.filter(isFxPair).sort();
-      const cfd = all.filter((s) => KNOWN_CFD.test(s.toUpperCase()) && !isFxPair(s)).sort();
+      const cfd = all.filter((s) => KNOWN_CFD_CORES.has(brokerCore(s)) && !isFxPair(s)).sort();
       const majors = fx.filter((s) => s.includes("USD"));
       const crosses = fx.filter((s) => !s.includes("USD"));
       symbolCache = { list: [...new Set([...majors, ...cfd, ...crosses])].slice(0, 300), ts: Date.now() };
@@ -219,5 +277,20 @@ export async function tradingRoutes(app: FastifyInstance) {
     const { timeframe = "H1" } = req.query as { timeframe?: string };
     const [tick, candles] = await Promise.all([mt5.tick(symbol), mt5.candles(symbol, timeframe, 200)]);
     return { tick, candles };
+  });
+
+  // --- Day-trading (intraday-only) mode ---
+  const { getDayTradingConfig, setDayTradingConfig } = await import("./day-trading.js");
+
+  app.get("/api/day-trading", { preHandler: [app.authenticate] }, async () => getDayTradingConfig());
+
+  app.put("/api/day-trading", { preHandler: [app.requireRole("ADMIN", "MANAGER")] }, async (req, reply) => {
+    const body = z.object({
+      enabled: z.boolean().optional(),
+      closeHourUtc: z.number().int().min(0).max(23).optional(),
+      closeMinuteUtc: z.number().int().min(0).max(59).optional(),
+    }).safeParse(req.body);
+    if (!body.success) return reply.code(400).send({ error: "invalid day-trading config" });
+    return setDayTradingConfig(body.data, req.user.email);
   });
 }

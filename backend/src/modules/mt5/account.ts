@@ -1,3 +1,4 @@
+import { Prisma } from "@prisma/client";
 import { prisma } from "../../lib/prisma.js";
 import { audit } from "../../lib/audit.js";
 import { mt5, type AccountInfo } from "./client.js";
@@ -47,24 +48,43 @@ export async function currentAccountId(userId: string): Promise<string | null> {
  * auto-registration must not satisfy the live-account verification gate).
  * If it is the user's FIRST account, adopt their unstamped legacy trades:
  * with only one account known, they can only have been placed on it.
+ *
+ * Race-safe: two concurrent cache-miss calls for the same login both reach
+ * here, but the (userId, login) unique index lets only one INSERT win. The
+ * loser catches the P2002 unique violation and returns the winner's row, so a
+ * single login can never split across two duplicate Mt5Account rows (which
+ * would defeat the accountId-scoped one-position-per-pair guard). Legacy-trade
+ * adoption runs ONLY on the path that actually created the row.
  */
 async function register(userId: string, info: AccountInfo) {
-  const isFirst = (await prisma.mt5Account.count({ where: { userId } })) === 0;
-  const account = await prisma.mt5Account.create({
-    data: {
-      userId, login: String(info.login), label: `Account ${info.login}`,
-      server: info.server ?? "", isDemo: info.is_demo, verified: false,
-    },
-    select: { id: true },
-  });
-  if (isFirst) {
-    await prisma.trade.updateMany({ where: { userId, accountId: null }, data: { accountId: account.id } });
+  const login = String(info.login);
+  try {
+    const isFirst = (await prisma.mt5Account.count({ where: { userId } })) === 0;
+    const account = await prisma.mt5Account.create({
+      data: {
+        userId, login, label: `Account ${login}`,
+        server: info.server ?? "", isDemo: info.is_demo, verified: false,
+      },
+      select: { id: true },
+    });
+    if (isFirst) {
+      await prisma.trade.updateMany({ where: { userId, accountId: null }, data: { accountId: account.id } });
+    }
+    await audit({
+      actor: "system", userId, category: "mt5", action: "account_auto_registered",
+      detail: { login, server: info.server ?? null, isDemo: info.is_demo, adoptedLegacyTrades: isFirst },
+    });
+    return account;
+  } catch (err) {
+    // Lost the create race: a concurrent call already inserted this login.
+    // Return its row instead of leaving a duplicate; no adoption (the winner
+    // already ran it).
+    if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === "P2002") {
+      const existing = await prisma.mt5Account.findFirst({ where: { userId, login }, select: { id: true } });
+      if (existing) return existing;
+    }
+    throw err;
   }
-  await audit({
-    actor: "system", userId, category: "mt5", action: "account_auto_registered",
-    detail: { login: String(info.login), server: info.server ?? null, isDemo: info.is_demo, adoptedLegacyTrades: isFirst },
-  });
-  return account;
 }
 
 /** Call after switching accounts so stale login→id mappings don't linger. */

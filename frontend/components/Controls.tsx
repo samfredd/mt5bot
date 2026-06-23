@@ -2,11 +2,14 @@
 import { useEffect, useState } from "react";
 import { api } from "@/lib/api";
 import { IconBrain, IconPause, IconPlay, IconRefresh, IconScan, IconStop } from "@/components/icons";
+import { DayTradingControl } from "@/components/DayTradingControl";
 
 interface ScanResponse {
   scanned: number;
   candidates: unknown[];
   suggested: { symbol: string; direction: string } | null;
+  executed?: { symbol: string; direction: string; lots: number };
+  paper?: { symbol: string; direction: string; lots: number };
   skippedReason?: string;
   directedAnalysis?: { symbol: string; direction: string | null; score: number; reasons: string[] };
 }
@@ -42,9 +45,13 @@ export function Controls({ onChanged, state }: { onChanged: () => void; state?: 
     setScanning(true);
     try {
       const r = await api<ScanResponse>("/api/scanner/run", { method: "POST", body: {} });
-      setMessage(r.suggested
-        ? `Scan complete — suggested ${r.suggested.direction.toUpperCase()} ${r.suggested.symbol}. Check pending approvals.`
-        : `Scan complete — ${r.scanned} symbols, ${r.candidates.length} candidate(s). ${r.skippedReason ?? ""}`);
+      setMessage(r.executed
+        ? `Scan complete — executed ${r.executed.direction.toUpperCase()} ${r.executed.symbol} (${r.executed.lots} lots).`
+        : r.paper
+          ? `Scan complete — opened paper ${r.paper.direction.toUpperCase()} ${r.paper.symbol} (${r.paper.lots} lots).`
+          : r.suggested
+            ? `Scan complete — suggested ${r.suggested.direction.toUpperCase()} ${r.suggested.symbol}. Check pending approvals.`
+            : `Scan complete — ${r.scanned} symbols, ${r.candidates.length} candidate(s). ${r.skippedReason ?? ""}`);
       onChanged();
     } catch (err) {
       setMessage(err instanceof Error ? err.message : "Scan failed");
@@ -58,7 +65,11 @@ export function Controls({ onChanged, state }: { onChanged: () => void; state?: 
     setResearching(true);
     try {
       const r = await api<ScanResponse>("/api/scanner/run", { method: "POST", body: { symbol: pair } });
-      if (r.suggested) {
+      if (r.executed) {
+        setMessage(`${pair}: executed ${r.executed.direction.toUpperCase()} (${r.executed.lots} lots).`);
+      } else if (r.paper) {
+        setMessage(`${pair}: opened paper ${r.paper.direction.toUpperCase()} (${r.paper.lots} lots).`);
+      } else if (r.suggested) {
         setMessage(`${pair}: suggested ${r.suggested.direction.toUpperCase()} — review it in pending approvals (you set the lot size).`);
       } else {
         const d = r.directedAnalysis;
@@ -132,11 +143,12 @@ export function Controls({ onChanged, state }: { onChanged: () => void; state?: 
           {researching ? "Researching…" : "Research & suggest trade"}
         </button>
         <p className="w-full text-xs text-ink-faint sm:w-auto sm:flex-1">
-          Deep-analyzes the pair (multi-timeframe technicals, news, AI reasoning) and creates an approval
-          request if a setup exists — or use “Scan market now” to let it pick the best pair itself.
+          Deep-analyzes the pair (multi-timeframe technicals, news, AI reasoning) and in Automatic mode
+          executes a passing setup; otherwise it creates an approval request.
         </p>
       </div>
       {message && <p className="mt-3 text-sm text-warn" role="status">{message}</p>}
+      <DayTradingControl />
     </section>
   );
 }

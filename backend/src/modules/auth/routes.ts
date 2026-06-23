@@ -4,14 +4,15 @@ import { randomBytes } from "node:crypto";
 import { authenticator } from "otplib";
 import { prisma } from "../../lib/prisma.js";
 import { audit } from "../../lib/audit.js";
-import { config } from "../../config.js";
-import { setBotState } from "../system/state.js";
-import { registerUser, verifyLogin, verifyTotp } from "./service.js";
+import { getBotState, setBotState } from "../system/state.js";
+import { registerUser, verifyLogin, verifyTotp, revokeUserTokens } from "./service.js";
 
 const Credentials = z.object({ email: z.string().email(), password: z.string().min(8) });
 
 export async function authRoutes(app: FastifyInstance) {
-  app.post("/auth/register", async (req, reply) => {
+  app.post("/auth/register", {
+    config: { rateLimit: { max: 5, timeWindow: "1 minute" } },
+  }, async (req, reply) => {
     const body = Credentials.safeParse(req.body);
     if (!body.success) return reply.code(400).send({ error: "invalid email or password (min 8 chars)" });
     const existing = await prisma.user.findUnique({ where: { email: body.data.email } });
@@ -20,13 +21,24 @@ export async function authRoutes(app: FastifyInstance) {
     return { id: user.id, email: user.email, role: user.role };
   });
 
-  app.post("/auth/login", async (req, reply) => {
+  // Tight per-route limit on login: brute-forcing credentials must not get
+  // the global 200/min budget. Keyed by client IP.
+  app.post("/auth/login", {
+    config: { rateLimit: { max: 10, timeWindow: "1 minute" } },
+  }, async (req, reply) => {
     const body = Credentials.safeParse(req.body);
     if (!body.success) return reply.code(400).send({ error: "invalid credentials" });
     const user = await verifyLogin(body.data.email, body.data.password);
     if (!user) return reply.code(401).send({ error: "invalid credentials" });
     const token = app.jwt.sign({ id: user.id, email: user.email, role: user.role });
     return { token, user: { id: user.id, email: user.email, role: user.role, totpEnabled: user.totpEnabled } };
+  });
+
+  // Logout = revoke every token issued to this user before now (all devices).
+  app.post("/auth/logout", { preHandler: [app.authenticate] }, async (req) => {
+    await revokeUserTokens(req.user.id);
+    await audit({ actor: req.user.email, userId: req.user.id, category: "auth", action: "logout" });
+    return { ok: true };
   });
 
   // --- 2FA setup ---
@@ -47,13 +59,10 @@ export async function authRoutes(app: FastifyInstance) {
     return { ok: true };
   });
 
-  // --- Live trading enable: admin-only; TOTP required only when REQUIRE_2FA=true ---
+  // --- Live trading enable: admin-only; TOTP required only when live 2FA is on ---
   app.post("/auth/live/enable", { preHandler: [app.requireRole("ADMIN")] }, async (req, reply) => {
     const { token } = z.object({ token: z.string().optional() }).parse(req.body ?? {});
-    if (!config.LIVE_TRADING_ENABLED) {
-      return reply.code(409).send({ error: "platform kill switch is off — set LIVE_TRADING_ENABLED=true in the backend .env first" });
-    }
-    if (config.REQUIRE_2FA) {
+    if ((await getBotState()).requireLiveTwoFactor) {
       const user = await prisma.user.findUnique({ where: { id: req.user.id } });
       if (!user?.totpEnabled || !user.totpSecret || !token || !verifyTotp(user.totpSecret, token)) {
         return reply.code(403).send({ error: "valid 2FA token required to enable live trading" });
@@ -67,7 +76,7 @@ export async function authRoutes(app: FastifyInstance) {
 
   app.post("/auth/live/disable", { preHandler: [app.authenticate] }, async (req) => {
     await prisma.user.update({ where: { id: req.user.id }, data: { liveTradingEnabled: false } });
-    await setBotState({ liveTradingEnabled: false }, req.user.email);
+    await setBotState({ liveTradingEnabled: false, demoMode: true }, req.user.email);
     await audit({ actor: req.user.email, userId: req.user.id, category: "auth", action: "live_trading_disabled_by_user" });
     return { ok: true };
   });

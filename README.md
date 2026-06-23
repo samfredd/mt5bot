@@ -3,8 +3,8 @@
 AI-powered trading automation for MetaTrader 5 with a local LLM brain (Gemma via Ollama),
 strict risk management, news intelligence, copy trading, and Telegram / WhatsApp / web control.
 
-> ⚠️ **Safety first.** Demo mode is the default. Live trading is locked behind THREE independent
-> gates (env kill switch + admin opt-in + 2FA) and every trade — manual, AI, automatic, or
+> ⚠️ **Safety first.** Demo mode is the default. Live trading is locked behind dashboard
+> Settings, admin opt-in, 2FA, and risk-engine checks; every trade — manual, AI, automatic, or
 > copied — must pass the risk engine. Test on a demo account before considering live use.
 > Trading involves substantial risk of loss; nothing here is financial advice.
 
@@ -96,11 +96,12 @@ Without Ollama running, the platform still works: AI responses fall back to a ha
 
 1. Run the bridge on a Windows machine/VPS with the MT5 terminal:
    `pip install MetaTrader5`, set `MT5_MOCK=false`, `MT5_LOGIN/MT5_PASSWORD/MT5_SERVER` env vars.
-2. Set `LIVE_TRADING_ENABLED=true` and `DEMO_MODE=false` in the backend `.env` (platform kill switch).
-3. In the dashboard: enable 2FA, then enable live mode (admin + TOTP).
+2. In the dashboard Settings screen: enable 2FA, then enable live trading (admin + TOTP).
+3. Confirm the bot state shows LIVE before starting automatic execution.
 4. Every live approval and manual trade now requires a fresh TOTP code.
 
-All three gates are re-checked inside the risk engine on **every** trade.
+The Settings live switch, user live opt-in, 2FA, account verification, strategy validation, and
+risk limits are re-checked inside the risk engine on **every** trade.
 
 ## Connectors
 
@@ -140,7 +141,7 @@ docs/API.md         Full REST/WS API reference
 
 ## Critical safety rules (enforced in code)
 
-1. Demo mode default; live trading triple-gated (env + admin opt-in + 2FA) — `risk/engine.ts`.
+1. Demo mode default; live trading is gated by Settings, admin opt-in, 2FA, account verification, and strategy validation — `risk/engine.ts`.
 2. No trade without risk validation — single execution path through `validateTrade()`.
 3. Stop-loss required (admin-only to disable) — risk engine + settings route.
 4. The AI never executes trades — it returns JSON that is schema-validated; invalid/missing

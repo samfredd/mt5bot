@@ -22,7 +22,7 @@ function ctx(overrides: Partial<RiskContext> = {}): RiskContext {
     spreadPoints: 10, atrPct: 0.5, session: "london", newsAction: "allow",
     emergencyStop: false, botRunning: true,
     isLiveAccount: false, liveTradingEnabled: false, userLiveEnabled: false,
-    twoFactorVerified: false, accountVerified: true,
+    twoFactorVerified: false,
     ...overrides,
   };
 }
@@ -112,9 +112,9 @@ describe("risk engine", () => {
 
   describe("live trading gates", () => {
     const live = { isLiveAccount: true };
-    it("blocks live trades when the platform kill switch is off", () => {
+    it("blocks live trades when live trading is disabled in Settings", () => {
       const r = validateTrade(goodTrade, ctx({ ...live, userLiveEnabled: true, twoFactorVerified: true }));
-      expect(r.checks.find((c) => c.name === "live_env_enabled")?.passed).toBe(false);
+      expect(r.checks.find((c) => c.name === "live_settings_enabled")?.passed).toBe(false);
     });
     it("blocks live trades without user opt-in", () => {
       const r = validateTrade(goodTrade, ctx({ ...live, liveTradingEnabled: true, twoFactorVerified: true }));
@@ -124,8 +124,8 @@ describe("risk engine", () => {
       const r = validateTrade(goodTrade, ctx({ ...live, liveTradingEnabled: true, userLiveEnabled: true }));
       expect(r.checks.find((c) => c.name === "live_2fa")?.passed).toBe(false);
     });
-    it("allows live trades only with every gate open", () => {
-      const r = validateTrade(goodTrade, ctx({ ...live, liveTradingEnabled: true, userLiveEnabled: true, twoFactorVerified: true, accountVerified: true }));
+    it("allows live trades once the live gates are open", () => {
+      const r = validateTrade(goodTrade, ctx({ ...live, liveTradingEnabled: true, userLiveEnabled: true, twoFactorVerified: true }));
       expect(r.ok).toBe(true);
     });
   });

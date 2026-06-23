@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { aggregateCandles, runBacktest, type BacktestConfig } from "../modules/backtest/engine.js";
+import { aggregateCandles, runBacktest, runWalkForward, type BacktestConfig } from "../modules/backtest/engine.js";
+import { asianRange, detectSession } from "../modules/analysis/engine.js";
 import type { Candle } from "../modules/mt5/client.js";
 
 const cfg: BacktestConfig = {
@@ -55,6 +56,10 @@ describe("backtest engine", () => {
     // P/L reconciles with final balance:
     const sum = r.trades.reduce((a, t) => a + t.profit, 0);
     expect(r.stats.finalBalance).toBeCloseTo(cfg.initialBalance + sum, 1);
+    expect(r.equityCurve.at(-1)?.equity).toBe(r.stats.finalBalance);
+    for (const t of r.trades) {
+      expect(Date.parse(t.signalTime)).toBeLessThan(Date.parse(t.entryTime));
+    }
   });
 
   it("is deterministic for identical input", () => {
@@ -99,5 +104,70 @@ describe("backtest engine", () => {
     const r = runBacktest(strategy, "EURUSD", makeCandles(1200, 0.0001), cfg);
     expect(r.warnings.join(" ")).toMatch(/AI veto/);
     expect(r.warnings.join(" ")).toMatch(/Swap/);
+  });
+});
+
+describe("asianRange (breakout reference level)", () => {
+  // Hourly candles across one UTC day: 00:00–06:00 are the Asian session.
+  const day = Date.UTC(2025, 5, 2); // a Monday
+  const hourly: Candle[] = Array.from({ length: 14 }, (_, h) => ({
+    time: new Date(day + h * 3600_000).toISOString(),
+    open: 1.1, high: 1.1 + (h < 7 ? 0.002 : 0.02), low: 1.1 - (h < 7 ? 0.002 : 0.02),
+    close: 1.1, tick_volume: 100,
+  }));
+
+  it("returns null before the Asian session has closed", () => {
+    expect(asianRange(hourly, day + 3 * 3600_000)).toBeNull(); // 03:00, still in Asia
+  });
+  it("returns the Asian high/low once London has opened", () => {
+    const r = asianRange(hourly, day + 9 * 3600_000); // 09:00 London
+    expect(r).not.toBeNull();
+    expect(r!.high).toBeCloseTo(1.102); // tight Asian range, not the wide London bars
+    expect(r!.low).toBeCloseTo(1.098);
+  });
+});
+
+describe("DST-aware trading sessions", () => {
+  it("does not start the winter London/New York overlap an hour early", () => {
+    expect(detectSession(new Date("2026-01-15T12:30:00Z"))).toBe("london");
+    expect(detectSession(new Date("2026-01-15T13:30:00Z"))).toBe("london_newyork_overlap");
+  });
+
+  it("moves the overlap with daylight-saving time", () => {
+    expect(detectSession(new Date("2026-07-15T11:30:00Z"))).toBe("london");
+    expect(detectSession(new Date("2026-07-15T12:30:00Z"))).toBe("london_newyork_overlap");
+  });
+});
+
+describe("walk-forward", () => {
+  it("splits into the requested number of windows and aggregates consistency", () => {
+    const candles = makeCandles(4000, 0.00012);
+    const full = runBacktest(strategy, "EURUSD", candles, cfg);
+    const r = runWalkForward(strategy, "EURUSD", candles, cfg, 4);
+    expect(r.folds.length).toBeGreaterThan(0);
+    expect(r.folds.length).toBeLessThanOrEqual(4);
+    // Folds are consecutive and non-overlapping in time.
+    for (let i = 1; i < r.folds.length; i++) {
+      expect(new Date(r.folds[i].from).getTime()).toBeGreaterThanOrEqual(new Date(r.folds[i - 1].to).getTime());
+    }
+    expect(r.consistency.foldCount).toBe(r.folds.length);
+    expect(r.consistency.profitableFolds).toBe(r.folds.filter((f) => f.returnPct > 0).length);
+    expect(r.consistency.verdict).toBeTruthy();
+    expect(Math.abs(r.consistency.totalTrades - full.stats.trades)).toBeLessThanOrEqual(4);
+  });
+
+  it("is deterministic", () => {
+    const candles = makeCandles(3000, 0.0001);
+    const a = runWalkForward(strategy, "EURUSD", candles, cfg, 3);
+    const b = runWalkForward(strategy, "EURUSD", candles, cfg, 3);
+    expect(a.consistency).toEqual(b.consistency);
+  });
+
+  it("flags too-few-trades as noise rather than edge", () => {
+    // A tiny series yields almost no trades → must not claim an edge.
+    const r = runWalkForward(strategy, "EURUSD", makeCandles(900, 0.0001), cfg, 3);
+    if (r.consistency.totalTrades < r.consistency.foldCount * 5) {
+      expect(r.consistency.verdict).toMatch(/noise|Not enough/i);
+    }
   });
 });

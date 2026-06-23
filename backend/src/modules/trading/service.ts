@@ -1,18 +1,24 @@
 import { prisma } from "../../lib/prisma.js";
-import { audit } from "../../lib/audit.js";
-import { config } from "../../config.js";
+import { audit, logError } from "../../lib/audit.js";
 import { mt5 } from "../mt5/client.js";
-import { buildMarketAnalysis } from "../analysis/engine.js";
+import { buildMarketAnalysis, detectSession } from "../analysis/engine.js";
 import { assessNewsRisk } from "../news/service.js";
 import { evaluateStrategy, deriveLevels } from "../strategy/service.js";
 import { askModel } from "../ai/service.js";
 import { buildTradePrompt } from "../ai/prompts.js";
 import { calculateLots, countConsecutiveLosses, equityGuardianBreaches, validateTrade, type RiskContext, type TradeProposal } from "../risk/engine.js";
 import { accountIdForLogin, currentAccountId } from "../mt5/account.js";
-import { getBotState, setBotState } from "../system/state.js";
+import { getBotState, operationalTradingAvailable, setBotState } from "../system/state.js";
+import { isNewCompletedBar, normalizeCandles } from "../backtest/market-data.js";
 import { notify } from "../notifications/service.js";
 import { broadcast } from "../ws/hub.js";
 import type { Strategy, User } from "@prisma/client";
+import { fallbackTradingSpec, moneyForPriceMove } from "../risk/instruments.js";
+import { reportIncident } from "../incidents/service.js";
+import { openPaperTrade } from "./paper.js";
+import { recordEntryComparison } from "./execution-comparison.js";
+import { evaluateExposureGate } from "../risk/exposure.js";
+import { symbolHeldByOther } from "./symbol-lock.js";
 
 const APPROVAL_TTL_MIN = 15;
 
@@ -29,10 +35,40 @@ const APPROVAL_TTL_MIN = 15;
 export async function evaluateAndMaybeTrade(user: User, strategy: Strategy, symbol: string) {
   const state = await getBotState();
   if (state.emergencyStop || state.status !== "running") return null;
+  if (!(await operationalTradingAvailable())) {
+    await reportIncident({
+      dedupeKey: "redis:trading-unavailable",
+      severity: "CRITICAL",
+      source: "redis",
+      title: "Trading blocked: Redis unavailable",
+      message: "New-trade evaluation is fail-closed until operational state coordination recovers.",
+      context: { strategyId: strategy.id, symbol },
+      minIntervalMs: 60_000,
+    });
+    return null;
+  }
 
   const settings = await prisma.riskSettings.findUnique({ where: { userId: user.id } });
   if (!settings) {
     await audit({ actor: "system", userId: user.id, category: "risk", action: "missing_risk_settings", detail: { symbol } });
+    return null;
+  }
+
+  // 0. Cross-strategy guard: one position per pair. If another strategy (or a
+  // manual/scanner trade) already holds this market, stand aside before
+  // spending a candle fetch + AI call — prevents stacking/offsetting.
+  //
+  // Scope the guard to the account the terminal is on NOW: a trade left
+  // EXECUTED on a previous account must NOT block this one (reconciliation can
+  // never close it, so it would zombie-block the pair forever). One cheap
+  // bridge call up front; the candle+AI cost is still gated behind the guard.
+  const terminalAccountId = await currentAccountId(user.id);
+  const heldBy = await symbolHeldByOther(user.id, symbol, strategy.id, terminalAccountId);
+  if (heldBy) {
+    await audit({
+      actor: "system", userId: user.id, category: "strategy", action: "symbol_occupied",
+      detail: { symbol, strategy: strategy.name, heldByTradeId: heldBy.id, heldBySymbol: heldBy.symbol, heldByStrategyId: heldBy.strategyId },
+    });
     return null;
   }
 
@@ -41,7 +77,16 @@ export async function evaluateAndMaybeTrade(user: User, strategy: Strategy, symb
   const cfg = strategy.config as { timeframes?: string[] };
   const timeframes = cfg.timeframes?.length ? cfg.timeframes : ["M15", "H1"];
   const candlesByTf: Record<string, Awaited<ReturnType<typeof mt5.candles>>> = {};
-  for (const tf of timeframes) candlesByTf[tf] = await mt5.candles(symbol, tf, 200);
+  const tickTime = Date.parse(tick.time);
+  for (const tf of timeframes) {
+    candlesByTf[tf] = normalizeCandles(await mt5.candles(symbol, tf, 201), tf, tickTime).slice(-200);
+  }
+  const completedPrimary = candlesByTf[timeframes[0]]?.at(-1);
+  if (!completedPrimary) return null;
+  const checkpointKey = `strategy-bar:${strategy.id}:${symbol.toUpperCase()}`;
+  const checkpoint = await prisma.systemSetting.findUnique({ where: { key: checkpointKey } });
+  const lastProcessed = (checkpoint?.value as { time?: string } | null)?.time ?? null;
+  if (!isNewCompletedBar(completedPrimary.time, lastProcessed)) return null;
   const analysis = buildMarketAnalysis(symbol, tick, candlesByTf);
 
   // 2. News gate
@@ -49,6 +94,11 @@ export async function evaluateAndMaybeTrade(user: User, strategy: Strategy, symb
 
   // 3. Strategy signal
   const signal = evaluateStrategy(strategy, analysis);
+  await prisma.systemSetting.upsert({
+    where: { key: checkpointKey },
+    create: { key: checkpointKey, value: { time: completedPrimary.time } },
+    update: { value: { time: completedPrimary.time } },
+  });
   if (!signal.direction) {
     await audit({ actor: "system", userId: user.id, category: "strategy", action: "no_signal", detail: { symbol, reasons: signal.reasons } });
     return null;
@@ -88,10 +138,11 @@ export async function evaluateAndMaybeTrade(user: User, strategy: Strategy, symb
   // 5. Position sizing
   const account = await mt5.accountInfo();
   const accountId = await accountIdForLogin(user.id, account.login, account);
+  const instrumentSpec = await mt5.symbolInfo(symbol).catch(() => fallbackTradingSpec(symbol, levels.entry));
   const lots =
     signal.config.lotSizing.method === "fixed"
       ? signal.config.lotSizing.fixedLots
-      : calculateLots(symbol, account.balance, signal.config.lotSizing.riskPct, levels.entry, levels.stopLoss, settings.maxLotSize);
+      : calculateLots(symbol, account.balance, signal.config.lotSizing.riskPct, levels.entry, levels.stopLoss, settings.maxLotSize, instrumentSpec);
 
   const proposal: TradeProposal = {
     symbol,
@@ -100,10 +151,20 @@ export async function evaluateAndMaybeTrade(user: User, strategy: Strategy, symb
     entry: levels.entry,
     stopLoss: ai.suggested_stop_loss ?? levels.stopLoss,
     takeProfit: ai.suggested_take_profit ?? levels.takeProfit,
+    instrumentSpec,
   };
 
   // 6. Risk engine — final authority
-  const riskCtx = await buildRiskContext(user, settings, account, analysis.spreadPoints, analysis.timeframes[0]?.atrPct ?? null, analysis.session, news.action);
+  const riskCtx = await buildRiskContext(
+    user,
+    settings,
+    account,
+    analysis.spreadPoints,
+    analysis.timeframes[0]?.atrPct ?? null,
+    analysis.session,
+    news.action,
+    { proposal },
+  );
   const risk = validateTrade(proposal, riskCtx);
 
   const explanation = {
@@ -127,6 +188,33 @@ export async function evaluateAndMaybeTrade(user: User, strategy: Strategy, symb
     return trade;
   }
   proposal.lots = risk.adjustedLots ?? proposal.lots;
+
+  if (state.paperForward) {
+    const paperTrade = await openPaperTrade({
+      userId: user.id,
+      strategyId: strategy.id,
+      proposal,
+      tick,
+      expectedSlippagePoints: 2,
+      commissionPerLot: 7,
+      explanation,
+    });
+    await audit({
+      actor: "system:paper-forward",
+      userId: user.id,
+      category: "trade",
+      action: "paper_trade_opened",
+      detail: { paperTradeId: paperTrade.id, symbol, direction: proposal.direction, lots: proposal.lots },
+    });
+    await notify(
+      user.id,
+      "trade_opened",
+      `Paper trade opened: ${proposal.direction.toUpperCase()} ${symbol}`,
+      `${proposal.lots} lots, SL ${proposal.stopLoss}, TP ${proposal.takeProfit}. No broker order was sent.`,
+    );
+    broadcast("paper_trade", { paperTradeId: paperTrade.id, status: paperTrade.status });
+    return paperTrade;
+  }
 
   // 7. Mode gate
   if (state.mode === "MANUAL") {
@@ -159,7 +247,15 @@ export async function evaluateAndMaybeTrade(user: User, strategy: Strategy, symb
   }
 
   // AUTO mode — execute immediately (all gates already passed).
-  return executeTrade(user, proposal, { strategyId: strategy.id, aiLogId: logId, explanation, mode: state.mode, actor: "system:auto" });
+  return executeTrade(user, proposal, {
+    strategyId: strategy.id,
+    aiLogId: logId,
+    explanation,
+    mode: state.mode,
+    actor: "system:auto",
+    expectedSpreadPoints: analysis.spreadPoints,
+    actualSpreadPoints: tick.spread_points,
+  });
 }
 
 export async function executeTrade(
@@ -169,12 +265,28 @@ export async function executeTrade(
     strategyId?: string; aiLogId?: string; explanation: Record<string, unknown>;
     mode: "MANUAL" | "SEMI_AUTO" | "AUTO" | "COPY"; actor: string; existingTradeId?: string;
     durationMin?: number;
+    expectedSpreadPoints?: number;
+    actualSpreadPoints?: number;
   },
 ) {
+  if (!(await operationalTradingAvailable())) {
+    await reportIncident({
+      dedupeKey: "redis:trading-unavailable",
+      severity: "CRITICAL",
+      source: "redis",
+      title: "Trade execution blocked: Redis unavailable",
+      message: "The broker order was not sent because operational coordination is unavailable.",
+      context: { symbol: proposal.symbol, actor: opts.actor },
+      minIntervalMs: 60_000,
+    });
+    throw new Error("operational trading unavailable");
+  }
+  const requestedAt = new Date();
   const result = await mt5.placeOrder(
     { symbol: proposal.symbol, direction: proposal.direction, volume: proposal.lots, sl: proposal.stopLoss ?? undefined, tp: proposal.takeProfit ?? undefined, comment: "mt5bot" },
     opts.actor,
   );
+  const filledAt = new Date();
 
   const data = {
     // The order went to whatever account the terminal is on NOW — stamp it
@@ -201,6 +313,34 @@ export async function executeTrade(
           stopLoss: proposal.stopLoss, takeProfit: proposal.takeProfit, mode: opts.mode, aiAnalysisId: opts.aiLogId, ...data,
         },
       });
+
+  if (result.ok && result.price !== undefined) {
+    const instrument = proposal.instrumentSpec ?? fallbackTradingSpec(proposal.symbol, proposal.entry);
+    const expectedExit = proposal.takeProfit ?? null;
+    const expectedMove = expectedExit === null
+      ? null
+      : proposal.direction === "buy" ? expectedExit - proposal.entry : proposal.entry - expectedExit;
+    const expectedPnl = expectedMove === null
+      ? null
+      : Number((moneyForPriceMove(expectedMove, proposal.lots, instrument) - 7 * proposal.lots).toFixed(2));
+    await recordEntryComparison({
+      tradeId: trade.id,
+      userId: user.id,
+      direction: proposal.direction === "buy" ? "BUY" : "SELL",
+      expectedEntry: proposal.entry,
+      actualEntry: result.price,
+      expectedExit,
+      expectedPnl,
+      expectedSpreadPoints: opts.expectedSpreadPoints,
+      actualSpreadPoints: opts.actualSpreadPoints,
+      expectedSlippagePoints: 2,
+      requestedAt,
+      filledAt,
+    }).catch((error) => logError("execution-comparison", "failed to record broker entry comparison", {
+      tradeId: trade.id,
+      error: String(error),
+    }));
+  }
 
   await audit({ actor: opts.actor, userId: user.id, category: "trade", action: result.ok ? "trade_executed" : "trade_failed", detail: { tradeId: trade.id, result } });
   await notify(user.id, "trade_opened",
@@ -264,7 +404,7 @@ export async function decideTrade(
     stopLoss: trade.stopLoss,
     takeProfit: trade.takeProfit,
   };
-  const riskCtx = await buildRiskContext(trade.user, settings, account, tick.spread_points, null, sessionNow(), news.action);
+  const riskCtx = await buildRiskContext(trade.user, settings, account, tick.spread_points, null, sessionNow(), news.action, { proposal });
   const risk = validateTrade(proposal, riskCtx);
   if (!risk.ok) {
     const failed = risk.checks.filter((c) => !c.passed).map((c) => c.name).join(", ");
@@ -277,7 +417,12 @@ export async function decideTrade(
   await executeTrade(trade.user, proposal, {
     strategyId: trade.strategyId ?? undefined, aiLogId: trade.aiAnalysisId ?? undefined,
     explanation: { ...explanation, approval: { decidedBy, channel, chosenLots: proposal.lots, durationMin: opts.durationMin } },
-    mode: trade.mode, actor: decidedBy, existingTradeId: trade.id, durationMin: opts.durationMin,
+    mode: trade.mode,
+    actor: decidedBy,
+    existingTradeId: trade.id,
+    durationMin: opts.durationMin,
+    expectedSpreadPoints: tick.spread_points,
+    actualSpreadPoints: tick.spread_points,
   });
   return { ok: true, message: `Trade approved and executed (${proposal.lots} lots${opts.durationMin ? `, auto-closes after ${opts.durationMin} min` : ""}).` };
 }
@@ -290,7 +435,7 @@ export async function buildRiskContext(
   atrPct: number | null,
   session: string,
   newsAction: "allow" | "reduce" | "pause",
-  opts: { twoFactorVerified?: boolean; isCopy?: boolean } = {},
+  opts: { twoFactorVerified?: boolean; isCopy?: boolean; proposal?: TradeProposal } = {},
 ): Promise<RiskContext> {
   const state = await getBotState();
   const positions = await mt5.positions();
@@ -327,7 +472,23 @@ export async function buildRiskContext(
     update: { value: { value: peakEquity } },
   });
 
-  const verifiedAccount = await prisma.mt5Account.findFirst({ where: { userId: user.id, verified: true } });
+  const exposureGate = opts.proposal ? evaluateExposureGate({
+    positions: positions.map((position) => ({
+      symbol: position.symbol,
+      direction: position.type,
+      lots: position.volume,
+      price: position.price_current ?? position.price_open,
+    })),
+    proposal: {
+      symbol: opts.proposal.symbol,
+      direction: opts.proposal.direction,
+      lots: opts.proposal.lots,
+      price: opts.proposal.entry,
+    },
+    accountEquity: account.equity,
+    maxCurrencyExposurePct: settings.maxCurrencyExposurePct,
+    maxCorrelatedExposurePct: settings.maxCorrelatedExposurePct,
+  }) : undefined;
 
   return {
     settings,
@@ -348,19 +509,16 @@ export async function buildRiskContext(
     isLiveAccount: !account.is_demo,
     liveTradingEnabled: state.liveTradingEnabled,
     userLiveEnabled: user.liveTradingEnabled,
-    // When the 2FA requirement is switched off, the gate counts as satisfied.
-    twoFactorVerified: opts.twoFactorVerified ?? !config.REQUIRE_2FA,
-    accountVerified: !!verifiedAccount || account.is_demo,
+    // The 2FA gate is satisfied when: the caller verified a TOTP (manual path),
+    // OR live 2FA is switched off, OR — for the automated path that can't enter
+    // a code — the operator granted standing auto-live authorization.
+    twoFactorVerified: opts.twoFactorVerified ?? (!state.requireLiveTwoFactor || state.autoLiveAuthorized),
+    exposureGate,
   };
 }
 
 export function sessionNow(): string {
-  const h = new Date().getUTCHours();
-  if (h >= 0 && h < 7) return "asia";
-  if (h >= 7 && h < 12) return "london";
-  if (h >= 12 && h < 16) return "london_newyork_overlap";
-  if (h >= 16 && h < 21) return "newyork";
-  return "sydney";
+  return detectSession();
 }
 
 /** Emergency stop: halt the bot AND flatten all open positions. */
@@ -413,6 +571,14 @@ export async function enforceEquityGuardian(): Promise<void> {
   await audit({
     actor: "system:equity-guardian", userId: user.id, category: "risk", action: "equity_guardian_flatten",
     detail: { breaches, balance: account.balance, equity: account.equity, closed },
+  });
+  await reportIncident({
+    dedupeKey: "risk:equity-guardian",
+    severity: "CRITICAL",
+    source: "risk",
+    title: "Equity guardian activated",
+    message: `${breaches.join("; ")}. Positions were flattened and the bot was paused.`,
+    context: { balance: account.balance, equity: account.equity, closed },
   });
   await notify(user.id, "emergency_stop", "Equity guardian: positions flattened",
     `${breaches.join("; ")}. Closed ${closed.length} position(s) and paused the bot. Review before resuming.`);

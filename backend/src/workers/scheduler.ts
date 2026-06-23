@@ -1,20 +1,32 @@
 import { prisma } from "../lib/prisma.js";
 import { logger } from "../lib/logger.js";
-import { logError } from "../lib/audit.js";
+import { audit, logError } from "../lib/audit.js";
 import { config } from "../config.js";
 import { getBotState } from "../modules/system/state.js";
 import { refreshCalendar } from "../modules/news/service.js";
 import { refreshHeadlines } from "../modules/news/headlines.js";
 import { evaluateAndMaybeTrade, enforceEquityGuardian } from "../modules/trading/service.js";
 import { managePositions } from "../modules/trading/manager.js";
+import { syncClosedTrades } from "../modules/trading/reconciliation.js";
 import { getScannerConfig, runScanner } from "../modules/trading/scanner.js";
+import { broadcast } from "../modules/ws/hub.js";
+import { withSchedulerLease } from "./scheduler-lease.js";
+import { reconcilePaperTrades } from "../modules/trading/paper.js";
+import { positionsForNewsFlatten } from "../modules/news/flatten.js";
 import { mt5 } from "../modules/mt5/client.js";
 import { notify } from "../modules/notifications/service.js";
-import { broadcast } from "../modules/ws/hub.js";
+import { publishFloatingPnl } from "../modules/trading/floating-pnl.js";
+import { runCoordinatedAnalysisCycle } from "./scheduler-cycle.js";
+import { enforceDayTradingExit, dayTradingBlocksEntry } from "../modules/trading/day-trading.js";
+import { expandStrategySymbols } from "../modules/strategy/symbols.js";
+import { startScalpingWorker, stopScalpingWorker } from "../modules/scalping/scalping.worker.js";
 
 const ANALYSIS_INTERVAL_MS = 60_000;
+const LAB_INTERVAL_MS = 7 * 24 * 60 * 60_000; // weekly
 let analysisTimer: NodeJS.Timeout | null = null;
 let newsTimer: NodeJS.Timeout | null = null;
+let labTimer: NodeJS.Timeout | null = null;
+let pnlTimer: NodeJS.Timeout | null = null;
 let running = false;
 let lastScanAt = 0;
 
@@ -23,16 +35,51 @@ let lastScanAt = 0;
  * strategy against every one of its symbols. The pipeline inside
  * evaluateAndMaybeTrade enforces all gates; this loop just schedules work.
  */
-async function analysisTick() {
-  if (running) return; // never overlap ticks
-  running = true;
-  try {
-    const state = await getBotState();
-    broadcast("bot_state", state);
+async function protectiveTick() {
+  const state = await getBotState();
+  broadcast("bot_state", state);
+  await reconcilePaperTrades().catch((err) =>
+    logError("scheduler", "paper-trade reconciliation failed", { error: String(err) }),
+  );
 
-    // Protect open positions (break-even / trailing) even while paused —
-    // only a true emergency stop skips this (positions get closed there).
-    if (!state.emergencyStop) {
+  // Protection must not depend on Redis lease acquisition. When Redis is
+  // unavailable, new trades fail closed while direct MT5 protection continues.
+  if (!state.emergencyStop) {
+      const admin = await prisma.user.findFirst({ where: { role: "ADMIN" }, orderBy: { createdAt: "asc" } });
+      const settings = admin ? await prisma.riskSettings.findUnique({ where: { userId: admin.id } }) : null;
+      if (admin && settings?.autoFlattenNewsEnabled) {
+        const now = new Date();
+        const [positions, events] = await Promise.all([
+          mt5.positions(),
+          prisma.newsEvent.findMany({
+            where: { eventTime: { gte: now, lte: new Date(now.getTime() + settings.autoFlattenLeadMin * 60_000) } },
+          }),
+        ]);
+        const selected = positionsForNewsFlatten({
+          enabled: settings.autoFlattenNewsEnabled,
+          leadMinutes: settings.autoFlattenLeadMin,
+          minimumImpact: settings.autoFlattenMinimumImpact,
+          symbols: settings.autoFlattenSymbols as string[],
+          events,
+          positions,
+          now,
+        });
+        const closed: string[] = [];
+        for (const position of selected) {
+          const result = await mt5.closePosition(position.ticket, "system:news-flatten");
+          if (result.ok) closed.push(position.ticket);
+        }
+        if (closed.length) {
+          await audit({
+            actor: "system:news-flatten",
+            userId: admin.id,
+            category: "news",
+            action: "positions_flattened_before_news",
+            detail: { tickets: closed, leadMinutes: settings.autoFlattenLeadMin },
+          });
+          await notify(admin.id, "trade_closed", "Positions flattened before high-impact news", `${closed.length} scoped position(s) closed.`);
+        }
+      }
       await managePositions().catch((err) =>
         logError("scheduler", "position management failed", { error: String(err) }),
       );
@@ -42,33 +89,52 @@ async function analysisTick() {
       await enforceEquityGuardian().catch((err) =>
         logError("scheduler", "equity guardian failed", { error: String(err) }),
       );
-    }
-
-    // Re-read: the guardian may have just paused the bot.
-    if ((await getBotState()).status !== "running" || state.emergencyStop) return;
-
-    // Autonomous scanner on its own cadence (independent of strategies).
-    const scannerCfg = await getScannerConfig();
-    if (scannerCfg.enabled && Date.now() - lastScanAt >= scannerCfg.intervalMin * 60_000) {
-      lastScanAt = Date.now();
-      await runScanner("schedule").catch((err) =>
-        logError("scheduler", "scanner run failed", { error: String(err) }),
+      // Day-trading (intraday-only): flatten everything past the daily cutoff.
+      await enforceDayTradingExit().catch((err) =>
+        logError("scheduler", "day-trading flatten failed", { error: String(err) }),
       );
-    }
+  }
+  await syncClosedTrades().catch((err) =>
+    logError("scheduler", "broker reconciliation failed", { error: String(err) }),
+  );
+}
 
-    const strategies = await prisma.strategy.findMany({ where: { enabled: true }, include: { user: true } });
-    for (const strategy of strategies) {
-      const cfg = strategy.config as { symbols?: string[] };
-      for (const symbol of cfg.symbols ?? []) {
-        try {
-          await evaluateAndMaybeTrade(strategy.user, strategy, symbol);
-        } catch (err) {
-          await logError("scheduler", `evaluation failed for ${symbol}`, { strategy: strategy.name, error: String(err) });
-        }
+async function newTradeTick() {
+  const state = await getBotState();
+  if (state.status !== "running" || state.emergencyStop) return;
+  // Day-trading: stop opening new positions past the daily cutoff.
+  if (await dayTradingBlocksEntry()) return;
+  const scannerCfg = await getScannerConfig();
+  if (scannerCfg.enabled && Date.now() - lastScanAt >= scannerCfg.intervalMin * 60_000) {
+    lastScanAt = Date.now();
+    await runScanner("schedule").catch((err) =>
+      logError("scheduler", "scanner run failed", { error: String(err) }),
+    );
+  }
+  const strategies = await prisma.strategy.findMany({ where: { enabled: true }, include: { user: true } });
+  // Resolve the broker FX universe once so ALL_FX strategies don't refetch per strategy.
+  const available = await mt5.symbols().catch(() => [] as string[]);
+  for (const strategy of strategies) {
+    const cfg = strategy.config as { symbols?: string[] };
+    for (const symbol of expandStrategySymbols(cfg.symbols ?? [], available)) {
+      try {
+        await evaluateAndMaybeTrade(strategy.user, strategy, symbol);
+      } catch (err) {
+        await logError("scheduler", `evaluation failed for ${symbol}`, { strategy: strategy.name, error: String(err) });
       }
     }
+  }
+}
 
-    await syncClosedTrades();
+async function analysisTick() {
+  if (running) return;
+  running = true;
+  try {
+    await runCoordinatedAnalysisCycle({
+      protect: protectiveTick,
+      newTradeWork: newTradeTick,
+      withLease: (work) => withSchedulerLease("analysis-new-trades", ANALYSIS_INTERVAL_MS * 2, work),
+    });
   } catch (err) {
     await logError("scheduler", "analysis tick failed", { error: String(err) });
   } finally {
@@ -76,81 +142,47 @@ async function analysisTick() {
   }
 }
 
-/**
- * Reconcile DB trades against the broker: detect SL/TP closures AND pull the
- * realized profit from deal history. Analytics and the loss-streak circuit
- * breaker both depend on accurate per-trade profit.
- */
-async function syncClosedTrades() {
-  // Only reconcile trades belonging to the account the terminal is connected
-  // to — another account's open trades are simply not visible right now, NOT
-  // closed. Legacy trades without an account stamp keep the old behavior.
-  const info = await mt5.accountInfo().catch(() => null);
-  if (!info) return; // bridge down — nothing can be reconciled safely
-  const accountScope = { OR: [{ accountId: null }, { account: { login: String(info.login) } }] };
-
-  const open = await prisma.trade.findMany({ where: { status: "EXECUTED", mt5Ticket: { not: null }, ...accountScope } });
-  const needBackfill = await prisma.trade.findMany({
-    where: { status: "CLOSED", profit: null, mt5Ticket: { not: null }, closedAt: { gte: new Date(Date.now() - 7 * 86400_000) }, ...accountScope },
-  });
-  if (!open.length && !needBackfill.length) return;
-
-  const positions = await mt5.positions();
-  const liveTickets = new Set(positions.map((p) => p.ticket));
-  const justClosed = open.filter((t) => !liveTickets.has(t.mt5Ticket!));
-  if (!justClosed.length && !needBackfill.length) return;
-
-  // Deal history: real MT5 deals carry position_id; the mock uses the
-  // position ticket directly. Net profit = sum of the position's deals.
-  let deals: { ticket?: string; position_id?: string; profit?: number }[] = [];
+/** Weekly AI Strategy Lab sweep — runs under the admin user; survivors stay disabled. */
+async function labTick() {
   try {
-    deals = (await mt5.history(7)) as typeof deals;
-  } catch {
-    /* history unavailable — close without profit; backfill will retry */
-  }
-  const profitFor = (ticket: string): number | null => {
-    const matched = deals.filter((d) => (d.position_id ?? d.ticket) === ticket);
-    return matched.length ? Number(matched.reduce((a, d) => a + (d.profit ?? 0), 0).toFixed(2)) : null;
-  };
-
-  for (const trade of justClosed) {
-    const profit = profitFor(trade.mt5Ticket!);
-    if (profit === null) {
-      // Closed but no matching deal yet — the loss-streak breaker and loss
-      // limits will under-read until backfill resolves it. Surface it.
-      await logError("scheduler", "trade closed without attributable profit", {
-        tradeId: trade.id, symbol: trade.symbol, positionId: trade.mt5Ticket,
-      });
-    }
-    const closed = await prisma.trade.update({
-      where: { id: trade.id },
-      data: { status: "CLOSED", closedAt: new Date(), profit },
-    });
-    await notify(trade.userId, "trade_closed", `Trade closed: ${trade.symbol}`,
-      `Ticket ${trade.mt5Ticket} closed (SL/TP hit or closed at broker).${profit !== null ? ` Realized P/L: ${profit.toFixed(2)}` : ""}`);
-    broadcast("trade", { tradeId: closed.id, status: "CLOSED" });
-  }
-
-  for (const trade of needBackfill) {
-    const profit = profitFor(trade.mt5Ticket!);
-    if (profit !== null) {
-      await prisma.trade.update({ where: { id: trade.id }, data: { profit } });
-    }
+    const { runStrategyLab } = await import("../modules/strategy/lab.js");
+    const admin = await prisma.user.findFirst({ where: { role: "ADMIN" }, orderBy: { createdAt: "asc" } });
+    if (!admin) return;
+    await runStrategyLab("schedule", admin.id);
+  } catch (err) {
+    await logError("scheduler", "strategy lab run failed", { error: String(err) });
   }
 }
 
 export function startWorkers() {
-  analysisTimer = setInterval(analysisTick, ANALYSIS_INTERVAL_MS);
+  pnlTimer = setInterval(() => {
+    void publishFloatingPnl().catch((err) => logError("scheduler", "floating P/L broadcast failed", { error: String(err) }));
+  }, 2_000);
+  analysisTimer = setInterval(() => {
+    void analysisTick();
+  }, ANALYSIS_INTERVAL_MS);
   newsTimer = setInterval(() => {
-    void refreshCalendar();
-    void refreshHeadlines();
+    void withSchedulerLease("news", config.NEWS_REFRESH_MINUTES * 120_000, async () => {
+      await Promise.all([refreshCalendar(), refreshHeadlines()]);
+    });
   }, config.NEWS_REFRESH_MINUTES * 60_000);
-  void refreshCalendar();
-  void refreshHeadlines();
-  logger.info("background workers started (analysis + position mgmt + calendar + headlines)");
+  labTimer = setInterval(() => {
+    void withSchedulerLease("strategy-lab", LAB_INTERVAL_MS / 2, labTick);
+  }, LAB_INTERVAL_MS);
+  void withSchedulerLease("news", config.NEWS_REFRESH_MINUTES * 120_000, async () => {
+    await Promise.all([refreshCalendar(), refreshHeadlines()]);
+  });
+  void publishFloatingPnl().catch((err) => logError("scheduler", "initial floating P/L broadcast failed", { error: String(err) }));
+  // Scalping runs on its own 1-second cadence, fully independent of the
+  // 60-second strategy/scanner loop above.
+  startScalpingWorker();
+  logger.info("background workers started (analysis + position mgmt + calendar + headlines + weekly strategy lab + scalping)");
 }
 
 export function stopWorkers() {
   if (analysisTimer) clearInterval(analysisTimer);
   if (newsTimer) clearInterval(newsTimer);
+  if (labTimer) clearInterval(labTimer);
+  if (pnlTimer) clearInterval(pnlTimer);
+  stopScalpingWorker();
 }

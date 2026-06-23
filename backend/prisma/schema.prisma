@@ -56,6 +56,31 @@ enum NotificationChannel {
   EMAIL
 }
 
+enum IncidentSeverity {
+  INFO
+  WARNING
+  CRITICAL
+}
+
+enum IncidentStatus {
+  OPEN
+  ACKNOWLEDGED
+  RESOLVED
+}
+
+enum ValidationStatus {
+  PASSED
+  FAILED
+  INVALID
+  ERROR
+}
+
+enum PaperTradeStatus {
+  OPEN
+  CLOSED
+  CANCELLED
+}
+
 model User {
   id                 String         @id @default(cuid())
   email              String         @unique
@@ -74,6 +99,10 @@ model User {
   notifications      Notification[]
   copyTraders        CopyTrader[]
   notificationPrefs  Json           @default("{}")
+  validationRuns     ValidationRun[]
+  paperTrades        PaperTrade[]
+  executionComparisons ExecutionComparison[]
+  journalEntries     TradeJournalEntry[]
 }
 
 model Mt5Account {
@@ -89,6 +118,11 @@ model Mt5Account {
   passwordEnc       String?
   createdAt         DateTime @default(now())
   trades            Trade[]
+
+  // One saved row per login per user: lets register()/connect() upsert by login
+  // and slams the door on the duplicate-row race (two concurrent cache-miss
+  // auto-registrations both inserting the same login).
+  @@unique([userId, login])
 }
 
 model Strategy {
@@ -104,6 +138,115 @@ model Strategy {
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
   trades    Trade[]
+  validationRuns ValidationRun[]
+  paperTrades PaperTrade[]
+}
+
+model ValidationRun {
+  id               String           @id @default(cuid())
+  userId           String
+  user             User             @relation(fields: [userId], references: [id])
+  strategyId       String?
+  strategy         Strategy?        @relation(fields: [strategyId], references: [id], onDelete: SetNull)
+  candidateName    String
+  symbol           String
+  status           ValidationStatus
+  trigger          String
+  trainStart       DateTime?
+  trainEnd         DateTime?
+  oosStart         DateTime?
+  oosEnd           DateTime?
+  instruments      Json             @default("[]")
+  metrics          Json             @default("{}")
+  gates            Json             @default("{}")
+  rejectionReasons Json             @default("[]")
+  createdAt        DateTime         @default(now())
+
+  @@index([userId, createdAt])
+  @@index([strategyId, createdAt])
+}
+
+model PaperTrade {
+  id                     String           @id @default(cuid())
+  userId                 String
+  user                   User             @relation(fields: [userId], references: [id])
+  strategyId             String?
+  strategy               Strategy?        @relation(fields: [strategyId], references: [id], onDelete: SetNull)
+  symbol                 String
+  direction              TradeDirection
+  lots                   Float
+  proposedEntry          Float
+  entryPrice             Float
+  stopLoss               Float?
+  takeProfit             Float?
+  expectedSpreadPoints   Float
+  expectedSlippagePoints Float
+  expectedCommission     Float
+  instrumentSpec         Json
+  marketSnapshot         Json             @default("{}")
+  explanation            Json             @default("{}")
+  status                 PaperTradeStatus @default(OPEN)
+  openedAt               DateTime
+  lastMarkedAt           DateTime?
+  closedAt               DateTime?
+  exitPrice              Float?
+  exitReason             String?
+  profit                 Float?
+  createdAt              DateTime         @default(now())
+  updatedAt              DateTime         @updatedAt
+
+  @@index([userId, status, createdAt])
+  @@index([strategyId, createdAt])
+}
+
+model ExecutionComparison {
+  id                     String         @id @default(cuid())
+  tradeId                String         @unique
+  trade                  Trade          @relation(fields: [tradeId], references: [id], onDelete: Cascade)
+  userId                 String
+  user                   User           @relation(fields: [userId], references: [id])
+  direction              TradeDirection
+  expectedEntry          Float
+  actualEntry            Float
+  expectedExit           Float?
+  actualExit             Float?
+  expectedSpreadPoints   Float?
+  actualSpreadPoints     Float?
+  expectedSlippagePoints Float?
+  entrySlippage          Float
+  exitSlippage           Float?
+  entryVariancePct       Float
+  exitVariancePct        Float?
+  requestedAt            DateTime
+  filledAt               DateTime?
+  latencyMs              Int?
+  expectedPnl            Float?
+  actualPnl              Float?
+  pnlVariance            Float?
+  pnlVariancePct         Float?
+  attributionConfidence  Float?
+  attributionReason      String?
+  createdAt              DateTime       @default(now())
+  updatedAt              DateTime       @updatedAt
+
+  @@index([userId, createdAt])
+}
+
+model TradeJournalEntry {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id])
+  tradeId   String   @unique
+  trade     Trade    @relation(fields: [tradeId], references: [id], onDelete: Cascade)
+  notes     String
+  tags      Json     @default("[]")
+  lessons   String
+  rating    Int?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([userId, tradeId])
+  @@index([userId, updatedAt])
 }
 
 model RiskSettings {
@@ -133,6 +276,12 @@ model RiskSettings {
   maxDailyCopiedTrades   Int     @default(10)
   // Circuit breaker: stop opening trades after N consecutive losses today
   maxConsecutiveLosses   Int     @default(3)
+  maxCurrencyExposurePct Float  @default(600)
+  maxCorrelatedExposurePct Float @default(600)
+  autoFlattenNewsEnabled Boolean @default(false)
+  autoFlattenLeadMin Int @default(15)
+  autoFlattenMinimumImpact NewsImpact @default(HIGH)
+  autoFlattenSymbols Json @default("[]")
 }
 
 model Trade {
@@ -164,6 +313,11 @@ model Trade {
   aiAnalysis    AiAnalysisLog? @relation(fields: [aiAnalysisId], references: [id])
   approval      TradeApproval?
   copiedTrade   CopiedTrade?
+  executionComparison ExecutionComparison?
+  attributionConfidence Float?
+  attributionReason String?
+  brokerExitPrice Float?
+  journalEntry TradeJournalEntry?
 
   @@index([accountId, createdAt])
 }
@@ -288,6 +442,27 @@ model ErrorLog {
   message   String
   detail    Json     @default("{}")
   createdAt DateTime @default(now())
+}
+
+model Incident {
+  id               String           @id @default(cuid())
+  dedupeKey        String
+  severity         IncidentSeverity
+  status           IncidentStatus   @default(OPEN)
+  source           String
+  title            String
+  message          String
+  context          Json             @default("{}")
+  occurrenceCount  Int              @default(1)
+  firstSeenAt      DateTime         @default(now())
+  lastSeenAt       DateTime         @default(now())
+  acknowledgedAt   DateTime?
+  acknowledgedBy   String?
+  resolvedAt       DateTime?
+  resolvedBy       String?
+
+  @@index([status, lastSeenAt])
+  @@index([dedupeKey, status])
 }
 
 model SystemSetting {

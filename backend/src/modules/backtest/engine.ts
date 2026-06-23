@@ -1,46 +1,49 @@
-import type { Candle } from "../mt5/client.js";
-import { analyzeTimeframe, detectSession, type MarketAnalysis } from "../analysis/engine.js";
-import { evaluateStrategy, deriveLevels } from "../strategy/service.js";
-import { calculateLots } from "../risk/engine.js";
-import { valuePerPointPerLot } from "../risk/instruments.js";
 import type { Strategy } from "@prisma/client";
+import type { Candle } from "../mt5/client.js";
+import { analyzeTimeframe, asianRange, detectSession, type MarketAnalysis } from "../analysis/engine.js";
+import { atr, last } from "../analysis/indicators.js";
+import { deriveLevels, evaluateStrategy } from "../strategy/service.js";
+import { calculateLots } from "../risk/engine.js";
+import {
+  fallbackTradingSpec,
+  moneyForPriceMove,
+  priceDistanceFromPoints,
+} from "../risk/instruments.js";
+import {
+  closeAtMarket,
+  enterPosition,
+  ratchetStop,
+  resolveBar,
+  type ExecutionConfig,
+  type OpenBacktestPosition,
+} from "./execution.js";
+import {
+  aggregateCandles,
+  candlesVisibleAt,
+  distinctValidCount,
+  normalizeCandles,
+  timeframeMinutes,
+} from "./market-data.js";
+import { calculateBacktestStats } from "./metrics.js";
+import type {
+  BacktestConfig,
+  BacktestEquityPoint,
+  BacktestStats,
+  BacktestTrade,
+} from "./types.js";
 
-/**
- * Event-driven backtester. Honesty-by-construction rules:
- *
- *  - Drives the SAME pure functions as live trading (analyzeTimeframe,
- *    evaluateStrategy, deriveLevels, calculateLots) — no parallel logic.
- *  - Signals are computed on a bar CLOSE and executed at the NEXT bar's
- *    open, plus spread and slippage. No look-ahead.
- *  - Same 200-bar context window the live loop uses.
- *  - If a bar's range covers both SL and TP, the STOP fills first
- *    (conservative assumption).
- *  - The AI layer is not simulated: live, it can only veto trades, so
- *    backtest results are an upper bound on trade count.
- *  - Costs modeled: spread, slippage, commission per lot. Swaps are NOT
- *    modeled — multi-day strategies look slightly better here than reality.
- */
+export { aggregateCandles } from "./market-data.js";
+export type { BacktestConfig, BacktestTrade } from "./types.js";
 
-export interface BacktestConfig {
-  initialBalance: number;
-  spreadPoints: number;       // in points (price units = points * pointSize)
-  slippagePoints: number;
-  commissionPerLot: number;   // round-trip, account currency
-  maxLotSize: number;
-}
+const WINDOW = 200;
 
-export interface BacktestTrade {
-  openTime: string;
-  closeTime: string;
-  direction: "buy" | "sell";
-  lots: number;
-  entry: number;
-  exit: number;
-  sl: number;
-  tp: number;
-  profit: number;
-  exitReason: "sl" | "tp" | "trail" | "end";
-  reasons: string[];
+export interface BacktestOptions {
+  timeframeCandles?: Record<string, Candle[]>;
+  asOfMs?: number;
+  tradeStartMs?: number;
+  tradeEndMs?: number;
+  brokerAlignmentOffsetMinutes?: number;
+  reverseSignals?: boolean;
 }
 
 export interface BacktestResult {
@@ -51,56 +54,80 @@ export interface BacktestResult {
   to: string;
   config: BacktestConfig;
   trades: BacktestTrade[];
-  stats: {
-    trades: number;
-    wins: number;
-    losses: number;
-    winRate: number | null;
-    profitFactor: number | null;
-    expectancy: number | null;
-    totalPnl: number;
-    returnPct: number;
-    maxDrawdownPct: number;
-    maxLossStreak: number;
-    avgWin: number | null;
-    avgLoss: number | null;
-    sharpe: number | null;
-    finalBalance: number;
-  };
-  equityCurve: { time: string; equity: number }[];
+  stats: BacktestStats;
+  equityCurve: BacktestEquityPoint[];
   warnings: string[];
+  dataQuality: {
+    inputBars: number;
+    normalizedBars: number;
+    duplicatesRemoved: number;
+    outOfOrderBars: number;
+  };
 }
 
-const TF_MINUTES: Record<string, number> = { M1: 1, M5: 5, M15: 15, M30: 30, H1: 60, H4: 240, D1: 1440 };
-const WINDOW = 200;
+interface SignalSnapshot {
+  direction: "buy" | "sell";
+  signalTime: string;
+  atr: number;
+  stopDistance: number;
+  targetDistance: number;
+  reasons: string[];
+  confidence: number;
+  h4Trend: string;
+  rsiPrevious: number | null;
+  rsiCurrent: number | null;
+  macdPrevious: number | null;
+  macdCurrent: number | null;
+  signalPrevious: number | null;
+  signalCurrent: number | null;
+  candlePattern: string | null;
+  session: string;
+  trailingEnabled: boolean;
+  lotSizing: { method: "fixed" | "risk_pct"; fixedLots: number; riskPct: number };
+  stopLossAtrMult: number;
+  takeProfitAtrMult: number;
+}
 
-/** Aggregate primary-timeframe candles up to a higher timeframe. */
-export function aggregateCandles(candles: Candle[], fromMin: number, toMin: number): Candle[] {
-  if (toMin <= fromMin || toMin % fromMin !== 0) return candles;
-  const bucketMs = toMin * 60_000;
-  const out: Candle[] = [];
-  let bucket: Candle | null = null;
-  let bucketKey = -1;
-  for (const c of candles) {
-    const t = new Date(c.time).getTime();
-    const key = Math.floor(t / bucketMs);
-    if (key !== bucketKey) {
-      if (bucket) out.push(bucket);
-      bucket = { ...c, time: new Date(key * bucketMs).toISOString() };
-      bucketKey = key;
-    } else if (bucket) {
-      bucket.high = Math.max(bucket.high, c.high);
-      bucket.low = Math.min(bucket.low, c.low);
-      bucket.close = c.close;
-      bucket.tick_volume += c.tick_volume;
-    }
+interface PendingEntry {
+  entryTime: string;
+  snapshot: SignalSnapshot;
+}
+
+const money = (value: number) => Number(value.toFixed(2));
+
+function countOutOfOrder(candles: Candle[]): number {
+  let count = 0;
+  for (let i = 1; i < candles.length; i++) {
+    if (Date.parse(candles[i].time) <= Date.parse(candles[i - 1].time)) count++;
   }
-  if (bucket) out.push(bucket);
-  return out;
+  return count;
 }
 
-function pointSize(price: number): number {
-  return price < 100 ? 0.0001 : 0.01;
+function downsampleCurve(curve: BacktestEquityPoint[]): BacktestEquityPoint[] {
+  if (curve.length <= 500) return curve;
+  const step = Math.max(1, Math.floor(curve.length / 499));
+  const sampled = curve.filter((_, index) => index % step === 0);
+  const last = curve.at(-1);
+  if (last && sampled.at(-1)?.time !== last.time) sampled.push(last);
+  return sampled;
+}
+
+function updateExcursions(
+  position: OpenBacktestPosition,
+  bar: Candle,
+  spread: number,
+): OpenBacktestPosition {
+  const favorable = position.direction === "buy"
+    ? Math.max(0, bar.high - position.entryPrice)
+    : Math.max(0, position.entryPrice - (bar.low + spread));
+  const adverse = position.direction === "buy"
+    ? Math.max(0, position.entryPrice - bar.low)
+    : Math.max(0, bar.high + spread - position.entryPrice);
+  return {
+    ...position,
+    maximumFavorableExcursion: Math.max(position.maximumFavorableExcursion, favorable),
+    maximumAdverseExcursion: Math.max(position.maximumAdverseExcursion, adverse),
+  };
 }
 
 export function runBacktest(
@@ -108,228 +135,451 @@ export function runBacktest(
   symbol: string,
   primaryCandles: Candle[],
   cfg: BacktestConfig,
+  options: BacktestOptions = {},
 ): BacktestResult {
-  const warnings: string[] = [
-    "AI veto layer not simulated — live trade count will be lower.",
-    "Swap/overnight costs not modeled.",
+  const warnings = [
+    "AI veto and confidence are not simulated; minConfidence remains a live AI gate, so this is the deterministic pre-AI strategy.",
+    "Historical news pauses and news-driven lot reductions are not simulated.",
+    "Live account-wide risk gates are not simulated beyond strategy maxTradesPerDay and maxLotSize.",
+    "Swap/overnight financing is not modeled.",
+    "ATR trailing is evaluated on completed candle closes; live management can ratchet intrabar on scheduler ticks.",
   ];
-  const strategyConfig = strategy.config as { timeframes?: string[]; maxTradesPerDay?: number };
+  const strategyConfig = strategy.config as {
+    timeframes?: string[];
+    maxTradesPerDay?: number;
+  };
   const timeframes = strategyConfig.timeframes?.length ? strategyConfig.timeframes : ["M15", "H1"];
   const primaryTf = timeframes[0];
-  const primaryMin = TF_MINUTES[primaryTf] ?? 60;
+  const primaryMinutes = timeframeMinutes(primaryTf);
+  const asOfMs = options.asOfMs ?? Number.POSITIVE_INFINITY;
+  const rawPrimary = options.timeframeCandles?.[primaryTf] ?? primaryCandles;
+  const candles = normalizeCandles(rawPrimary, primaryTf, asOfMs);
+  const instrument = cfg.instrument ?? fallbackTradingSpec(symbol, candles[0]?.close ?? 1);
+  const executionConfig: ExecutionConfig = {
+    instrument,
+    spreadPoints: cfg.spreadPoints,
+    slippagePoints: cfg.slippagePoints,
+    commissionPerLot: cfg.commissionPerLot,
+    sameBarPolicy: cfg.sameBarPolicy ?? "stop_first",
+  };
+  const spread = priceDistanceFromPoints(cfg.spreadPoints, instrument);
+  const series: Record<string, Candle[]> = { [primaryTf]: candles };
 
-  // Pre-aggregate every higher timeframe once.
-  const series: Record<string, Candle[]> = { [primaryTf]: primaryCandles };
-  for (const tf of timeframes.slice(1)) {
-    const min = TF_MINUTES[tf] ?? primaryMin;
-    series[tf] = min > primaryMin ? aggregateCandles(primaryCandles, primaryMin, min) : primaryCandles;
-    if (min < primaryMin) warnings.push(`Timeframe ${tf} is below primary ${primaryTf}; using primary data.`);
+  for (const timeframe of timeframes.slice(1)) {
+    const supplied = options.timeframeCandles?.[timeframe];
+    if (supplied?.length) {
+      series[timeframe] = normalizeCandles(supplied, timeframe, asOfMs);
+    } else {
+      const minutes = timeframeMinutes(timeframe);
+      series[timeframe] = minutes > primaryMinutes
+        ? aggregateCandles(candles, primaryMinutes, minutes, options.brokerAlignmentOffsetMinutes ?? 0)
+        : candles;
+      warnings.push(`No broker ${timeframe} series supplied; aggregated ${primaryTf} using offset ${options.brokerAlignmentOffsetMinutes ?? 0} minutes.`);
+    }
   }
-  // Index into higher-TF series advances as primary time passes (no look-ahead).
-  const higherIdx: Record<string, number> = {};
-  for (const tf of timeframes.slice(1)) higherIdx[tf] = 0;
 
-  let balance = cfg.initialBalance;
-  let peak = balance;
-  let maxDrawdownPct = 0;
+  const strategyRow = {
+    ...strategy,
+    userId: "",
+    type: "",
+    enabled: true,
+    createdAt: new Date(),
+    updatedAt: new Date(),
+  } as Strategy;
+  const tradeStartMs = options.tradeStartMs ?? Number.NEGATIVE_INFINITY;
+  const tradeEndMs = options.tradeEndMs ?? Number.POSITIVE_INFINITY;
+  const maxTradesPerDay = strategyConfig.maxTradesPerDay ?? 5;
+  const tradesPerDay = new Map<string, number>();
   const trades: BacktestTrade[] = [];
-  const equityCurve: { time: string; equity: number }[] = [];
-  let open: {
-    direction: "buy" | "sell"; lots: number; entry: number; sl: number; tp: number;
-    originalSl: number; openTime: string; reasons: string[]; beDone: boolean;
-  } | null = null;
-  let tradesToday = 0;
-  let currentDay = "";
-  let lossStreak = 0;
-  let maxLossStreak = 0;
-  const dailyEquity: number[] = [];
-  let lastDayMark = "";
+  const equityCurve: BacktestEquityPoint[] = [];
+  let balance = cfg.initialBalance;
+  let open: (OpenBacktestPosition & { snapshot: SignalSnapshot }) | null = null;
+  let pending: PendingEntry | null = null;
 
-  const point = pointSize(primaryCandles[0]?.close ?? 1);
-  const spread = cfg.spreadPoints * point;
-  const slip = cfg.slippagePoints * point;
+  const appendClosedTrade = (
+    position: OpenBacktestPosition & { snapshot: SignalSnapshot },
+    exit: ReturnType<typeof closeAtMarket>,
+  ) => {
+    const grossPnl = money(exit.grossPnl);
+    const commission = money(exit.commission);
+    const netPnl = money(grossPnl - commission);
+    const balanceBefore = balance;
+    balance = money(balance + netPnl);
+    const trade: BacktestTrade = {
+      signalTime: position.signalTime,
+      entryTime: position.entryTime,
+      exitTime: exit.exitTime,
+      symbol,
+      timeframe: primaryTf,
+      direction: position.direction,
+      entryPrice: position.entryPrice,
+      exitPrice: exit.exitPrice,
+      bidAtEntry: position.bidAtEntry,
+      askAtEntry: position.askAtEntry,
+      bidAtExit: exit.bidAtExit,
+      askAtExit: exit.askAtExit,
+      spreadPoints: cfg.spreadPoints,
+      slippagePoints: cfg.slippagePoints,
+      commission,
+      atr: position.atr,
+      stopLoss: position.originalStopLoss,
+      takeProfit: position.takeProfit,
+      initialRiskAmount: money(position.initialRiskAmount),
+      lotSize: position.lots,
+      h4Trend: position.snapshot.h4Trend,
+      rsiPrevious: position.snapshot.rsiPrevious,
+      rsiCurrent: position.snapshot.rsiCurrent,
+      macdPrevious: position.snapshot.macdPrevious,
+      macdCurrent: position.snapshot.macdCurrent,
+      signalPrevious: position.snapshot.signalPrevious,
+      signalCurrent: position.snapshot.signalCurrent,
+      candlePattern: position.snapshot.candlePattern,
+      confidence: position.snapshot.confidence,
+      trailingActivatedAt: position.trailingActivatedAt,
+      maximumFavorableExcursion: position.maximumFavorableExcursion,
+      maximumAdverseExcursion: position.maximumAdverseExcursion,
+      exitReason: exit.exitReason,
+      sameBarAmbiguous: exit.sameBarAmbiguous,
+      grossPnl,
+      netPnl,
+      rMultiple: position.initialRiskAmount > 0 ? Number((netPnl / position.initialRiskAmount).toFixed(4)) : 0,
+      grossRMultiple: position.initialRiskAmount > 0 ? Number((grossPnl / position.initialRiskAmount).toFixed(4)) : 0,
+      spreadCost: money(exit.spreadCost),
+      slippageCost: money(exit.slippageCost),
+      balanceBefore,
+      balanceAfter: balance,
+      session: position.snapshot.session,
+      reasons: position.snapshot.reasons,
+      openTime: position.entryTime,
+      closeTime: exit.exitTime,
+      lots: position.lots,
+      entry: position.entryPrice,
+      exit: exit.exitPrice,
+      sl: position.originalStopLoss,
+      tp: position.takeProfit,
+      profit: netPnl,
+    };
+    trades.push(trade);
+  };
 
-  const strategyRow = { ...strategy, userId: "", type: "", enabled: true, createdAt: new Date(), updatedAt: new Date() } as Strategy;
+  for (let i = WINDOW - 1; i < candles.length; i++) {
+    const bar = candles[i];
+    const barTimeMs = Date.parse(bar.time);
+    const barCloseMs = barTimeMs + primaryMinutes * 60_000;
 
-  for (let i = WINDOW; i < primaryCandles.length - 1; i++) {
-    const bar = primaryCandles[i];
-    const nextBar = primaryCandles[i + 1];
-    const barTime = new Date(bar.time);
-    const day = bar.time.slice(0, 10);
-    if (day !== currentDay) { currentDay = day; tradesToday = 0; }
-
-    // ---- manage open position on the CURRENT bar ----
-    if (open) {
-      const contract = valuePerPointPerLot(symbol, open.entry);
-      const closePosition = (exitPrice: number, reason: BacktestTrade["exitReason"]) => {
-        const diff = open!.direction === "buy" ? exitPrice - open!.entry : open!.entry - exitPrice;
-        // Round like a broker ledger so trade P/L sums exactly to balance.
-        const profit = Number((diff * open!.lots * contract - cfg.commissionPerLot * open!.lots).toFixed(2));
-        balance += profit;
-        trades.push({
-          openTime: open!.openTime, closeTime: bar.time, direction: open!.direction,
-          lots: open!.lots, entry: open!.entry, exit: exitPrice, sl: open!.originalSl, tp: open!.tp,
-          profit, exitReason: reason, reasons: open!.reasons,
-        });
-        lossStreak = profit < 0 ? lossStreak + 1 : 0;
-        maxLossStreak = Math.max(maxLossStreak, lossStreak);
-        open = null;
-      };
-
-      const hitSl = open.direction === "buy" ? bar.low <= open.sl : bar.high >= open.sl;
-      const hitTp = open.direction === "buy" ? bar.high >= open.tp : bar.low <= open.tp;
-      if (hitSl) {
-        // Conservative: stop fills first even if TP was also touched.
-        closePosition(open.sl, open.sl === open.originalSl ? "sl" : "trail");
-      } else if (hitTp) {
-        closePosition(open.tp, "tp");
-      } else {
-        // Break-even at +1R, ATR trail at +1.5R — mirrors the live manager.
-        const r = Math.abs(open.entry - open.originalSl);
-        const profitDist = open.direction === "buy" ? bar.close - open.entry : open.entry - bar.close;
-        if (r > 0) {
-          const profitR = profitDist / r;
-          if (!open.beDone && profitR >= 1) {
-            const be = open.direction === "buy" ? open.entry + 0.1 * r : open.entry - 0.1 * r;
-            if (open.direction === "buy" ? be > open.sl : be < open.sl) open.sl = be;
-            open.beDone = true;
-          }
-          if (profitR >= 1.5) {
-            const window = primaryCandles.slice(i - WINDOW + 1, i + 1);
-            const tfA = analyzeTimeframe(primaryTf, window);
-            if (tfA.atr) {
-              const trail = open.direction === "buy" ? bar.close - tfA.atr : bar.close + tfA.atr;
-              if (open.direction === "buy" ? trail > open.sl : trail < open.sl) open.sl = trail;
-            }
-          }
-        }
-      }
-    }
-
-    // ---- evaluate for a new signal on bar close ----
-    const maxPerDay = strategyConfig.maxTradesPerDay ?? 5;
-    if (!open && tradesToday < maxPerDay) {
-      const window = primaryCandles.slice(i - WINDOW + 1, i + 1);
-      const tfAnalyses = [analyzeTimeframe(primaryTf, window)];
-      for (const tf of timeframes.slice(1)) {
-        const s = series[tf];
-        // advance pointer to the last higher-TF bar that CLOSED before barTime
-        const tfMs = (TF_MINUTES[tf] ?? primaryMin) * 60_000;
-        while (higherIdx[tf] + 1 < s.length && new Date(s[higherIdx[tf] + 1].time).getTime() + tfMs <= barTime.getTime() + primaryMin * 60_000) {
-          higherIdx[tf]++;
-        }
-        const upto = s.slice(Math.max(0, higherIdx[tf] - WINDOW + 1), higherIdx[tf] + 1);
-        if (upto.length >= 60) tfAnalyses.push(analyzeTimeframe(tf, upto));
-      }
-
-      const mid = bar.close;
-      const analysis: MarketAnalysis = {
+    if (pending && pending.entryTime === bar.time && !open) {
+      const snapshot = pending.snapshot;
+      const provisional = enterPosition({
         symbol,
-        generatedAt: bar.time,
-        spreadPoints: cfg.spreadPoints,
-        bid: mid - spread / 2,
-        ask: mid + spread / 2,
-        session: detectSession(barTime),
-        timeframes: tfAnalyses,
-        summary: "",
-      };
+        timeframe: primaryTf,
+        signalTime: snapshot.signalTime,
+        entryBar: bar,
+        direction: snapshot.direction,
+        atr: snapshot.atr,
+        stopLossAtrMult: snapshot.stopLossAtrMult,
+        takeProfitAtrMult: snapshot.takeProfitAtrMult,
+        stopDistance: snapshot.stopDistance,
+        targetDistance: snapshot.targetDistance,
+        lots: 1,
+        trailingEnabled: snapshot.trailingEnabled,
+        balanceBefore: balance,
+        config: executionConfig,
+      });
+      const lots = snapshot.lotSizing.method === "fixed"
+        ? Math.min(snapshot.lotSizing.fixedLots, cfg.maxLotSize, instrument.volumeMax)
+        : calculateLots(symbol, balance, snapshot.lotSizing.riskPct, provisional.entryPrice, provisional.stopLoss, cfg.maxLotSize, instrument);
+      if (lots > 0) {
+        // The provisional was sized at 1 lot; entry/stop prices are lot-
+        // independent and only risk/slippage scale linearly with volume —
+        // so scale instead of re-running enterPosition (bit-identical result).
+        open = {
+          ...provisional,
+          lots,
+          initialRiskAmount: provisional.initialRiskAmount * lots,
+          entrySlippageCost: provisional.entrySlippageCost * lots,
+          snapshot,
+        };
+        const day = bar.time.slice(0, 10);
+        tradesPerDay.set(day, (tradesPerDay.get(day) ?? 0) + 1);
+      }
+      pending = null;
+    }
 
-      const signal = evaluateStrategy(strategyRow, analysis);
-      if (signal.direction) {
-        const levels = deriveLevels(signal, analysis);
-        if (levels) {
-          // Execute at NEXT bar open with spread + slippage.
-          const rawOpen = nextBar.open;
-          const entry = signal.direction === "buy" ? rawOpen + spread / 2 + slip : rawOpen - spread / 2 - slip;
-          const slDist = Math.abs(levels.entry - levels.stopLoss);
-          const tpDist = Math.abs(levels.takeProfit - levels.entry);
-          const sl = signal.direction === "buy" ? entry - slDist : entry + slDist;
-          const tp = signal.direction === "buy" ? entry + tpDist : entry - tpDist;
-          const lots = signal.config.lotSizing.method === "fixed"
-            ? signal.config.lotSizing.fixedLots
-            : calculateLots(symbol, balance, signal.config.lotSizing.riskPct, entry, sl, cfg.maxLotSize);
-          if (lots > 0) {
-            open = {
-              direction: signal.direction, lots, entry, sl, tp, originalSl: sl,
-              openTime: nextBar.time, reasons: signal.reasons, beDone: false,
+    if (open) {
+      open = { ...updateExcursions(open, bar, spread), snapshot: open.snapshot };
+      const exit = resolveBar(open, bar, executionConfig);
+      if (exit) {
+        appendClosedTrade(open, exit);
+        open = null;
+      } else {
+        // Management only needs ATR — compute it directly instead of running
+        // the full indicator suite (RSI/MACD/BB/ADX/patterns) every bar. Same
+        // window and math as analyzeTimeframe(...).atr, so results are identical.
+        const w = candles.slice(Math.max(0, i - WINDOW + 1), i + 1);
+        const managementAtr = last(atr(w.map((c) => c.high), w.map((c) => c.low), w.map((c) => c.close), 14)) ?? null;
+        const executableClose = open.direction === "buy" ? bar.close : bar.close + spread;
+        const ratcheted = ratchetStop(open, executableClose, managementAtr, bar.time);
+        open = { ...ratcheted.position, snapshot: open.snapshot };
+      }
+    }
+
+    const nextBar = candles[i + 1];
+    if (!open && !pending && nextBar) {
+      const nextEntryMs = Date.parse(nextBar.time);
+      const nextDay = nextBar.time.slice(0, 10);
+      const allowedByWindow = nextEntryMs >= tradeStartMs && nextEntryMs < tradeEndMs;
+      const allowedByCount = (tradesPerDay.get(nextDay) ?? 0) < maxTradesPerDay;
+      if (allowedByWindow && allowedByCount) {
+        const primaryWindow = candles.slice(i - WINDOW + 1, i + 1);
+        const primaryAnalysis = analyzeTimeframe(primaryTf, primaryWindow);
+        const timeframeAnalyses = [primaryAnalysis];
+        for (const timeframe of timeframes.slice(1)) {
+          const visible = candlesVisibleAt(series[timeframe], timeframe, barCloseMs, WINDOW);
+          if (visible.length >= 60) timeframeAnalyses.push(analyzeTimeframe(timeframe, visible));
+        }
+        const analysis: MarketAnalysis = {
+          symbol,
+          generatedAt: new Date(barCloseMs).toISOString(),
+          spreadPoints: cfg.spreadPoints,
+          bid: bar.close,
+          ask: bar.close + spread,
+          session: detectSession(new Date(nextEntryMs)),
+          timeframes: timeframeAnalyses,
+          summary: "",
+          referenceRange: asianRange(primaryWindow, barCloseMs),
+        };
+        const signal = evaluateStrategy(strategyRow, analysis);
+        let direction = signal.direction;
+        if (direction && options.reverseSignals) direction = direction === "buy" ? "sell" : "buy";
+        if (direction) {
+          const effectiveSignal = { ...signal, direction };
+          const levels = deriveLevels(effectiveSignal, analysis);
+          if (levels && primaryAnalysis.atr) {
+            const higher = timeframeAnalyses.at(-1);
+            pending = {
+              entryTime: nextBar.time,
+              snapshot: {
+                direction,
+                signalTime: bar.time,
+                atr: primaryAnalysis.atr,
+                stopDistance: Math.abs(levels.entry - levels.stopLoss),
+                targetDistance: Math.abs(levels.takeProfit - levels.entry),
+                reasons: signal.reasons,
+                confidence: signal.confidence,
+                h4Trend: higher && higher !== primaryAnalysis ? higher.trend : "unavailable",
+                rsiPrevious: primaryAnalysis.rsiPrevious,
+                rsiCurrent: primaryAnalysis.rsi,
+                macdPrevious: primaryAnalysis.macdPrevious,
+                macdCurrent: primaryAnalysis.macdCurrent,
+                signalPrevious: primaryAnalysis.signalPrevious,
+                signalCurrent: primaryAnalysis.signalCurrent,
+                candlePattern: primaryAnalysis.candlePattern,
+                session: analysis.session,
+                trailingEnabled: signal.config.exit.trailingStop,
+                lotSizing: signal.config.lotSizing,
+                stopLossAtrMult: signal.config.exit.stopLossAtrMult,
+                takeProfitAtrMult: signal.config.exit.takeProfitAtrMult,
+              },
             };
-            tradesToday++;
           }
         }
       }
     }
 
-    // ---- equity tracking ----
-    let equity = balance;
-    if (open) {
-      const diff = open.direction === "buy" ? bar.close - open.entry : open.entry - bar.close;
-      equity += diff * open.lots * valuePerPointPerLot(symbol, open.entry);
+    if (barTimeMs >= tradeStartMs && barTimeMs < tradeEndMs) {
+      let unrealizedPnl = 0;
+      if (open) {
+        const executableClose = open.direction === "buy" ? bar.close : bar.close + spread;
+        const move = open.direction === "buy"
+          ? executableClose - open.entryPrice
+          : open.entryPrice - executableClose;
+        unrealizedPnl = moneyForPriceMove(move, open.lots, instrument) - cfg.commissionPerLot * open.lots;
+      }
+      equityCurve.push({
+        time: bar.time,
+        balance,
+        equity: money(balance + unrealizedPnl),
+        realizedPnl: money(balance - cfg.initialBalance),
+        unrealizedPnl: money(unrealizedPnl),
+      });
     }
-    peak = Math.max(peak, equity);
-    if (peak > 0) maxDrawdownPct = Math.max(maxDrawdownPct, ((peak - equity) / peak) * 100);
-    equityCurve.push({ time: bar.time, equity: Number(equity.toFixed(2)) });
-    if (day !== lastDayMark) { dailyEquity.push(equity); lastDayMark = day; }
   }
 
-  // Close any position left open at the end of data.
   if (open) {
-    const last = primaryCandles[primaryCandles.length - 1];
-    const o = open as NonNullable<typeof open>;
-    const diff = o.direction === "buy" ? last.close - o.entry : o.entry - last.close;
-    const profit = Number((diff * o.lots * valuePerPointPerLot(symbol, o.entry) - cfg.commissionPerLot * o.lots).toFixed(2));
-    balance += profit;
-    trades.push({
-      openTime: o.openTime, closeTime: last.time, direction: o.direction, lots: o.lots,
-      entry: o.entry, exit: last.close, sl: o.originalSl, tp: o.tp,
-      profit, exitReason: "end", reasons: o.reasons,
-    });
+    const last = [...candles].reverse().find((candle) => Date.parse(candle.time) < tradeEndMs) ?? candles.at(-1);
+    if (last) {
+      appendClosedTrade(open, closeAtMarket(open, last, executionConfig, "end"));
+      const finalPoint: BacktestEquityPoint = {
+        time: last.time,
+        balance,
+        equity: balance,
+        realizedPnl: money(balance - cfg.initialBalance),
+        unrealizedPnl: 0,
+      };
+      if (equityCurve.at(-1)?.time === last.time) equityCurve[equityCurve.length - 1] = finalPoint;
+      else equityCurve.push(finalPoint);
+    }
   }
 
-  // ---- stats ----
-  const profits = trades.map((t) => t.profit);
-  const wins = profits.filter((p) => p > 0);
-  const losses = profits.filter((p) => p < 0);
-  const grossProfit = wins.reduce((a, b) => a + b, 0);
-  const grossLoss = Math.abs(losses.reduce((a, b) => a + b, 0));
-  const totalPnl = profits.reduce((a, b) => a + b, 0);
-  const dailyReturns: number[] = [];
-  for (let d = 1; d < dailyEquity.length; d++) {
-    if (dailyEquity[d - 1] > 0) dailyReturns.push(dailyEquity[d] / dailyEquity[d - 1] - 1);
+  if (!equityCurve.length && candles.length) {
+    const last = candles.at(-1)!;
+    equityCurve.push({ time: last.time, balance, equity: balance, realizedPnl: 0, unrealizedPnl: 0 });
   }
-  const meanR = dailyReturns.length ? dailyReturns.reduce((a, b) => a + b, 0) / dailyReturns.length : 0;
-  const sdR = dailyReturns.length > 1
-    ? Math.sqrt(dailyReturns.reduce((a, r) => a + (r - meanR) ** 2, 0) / (dailyReturns.length - 1))
-    : 0;
+  const finalPoint = equityCurve.at(-1);
+  if (finalPoint && finalPoint.equity !== balance) {
+    equityCurve[equityCurve.length - 1] = {
+      ...finalPoint,
+      balance,
+      equity: balance,
+      realizedPnl: money(balance - cfg.initialBalance),
+      unrealizedPnl: 0,
+    };
+  }
 
-  // Downsample equity curve for transport.
-  const step = Math.max(1, Math.floor(equityCurve.length / 500));
-  const sampledCurve = equityCurve.filter((_, idx) => idx % step === 0);
+  const reportCandles = candles.filter((candle) => {
+    const time = Date.parse(candle.time);
+    return time >= tradeStartMs && time < tradeEndMs;
+  });
+  const stats = calculateBacktestStats(trades, cfg.initialBalance, equityCurve);
 
   return {
     symbol,
     timeframe: primaryTf,
-    bars: primaryCandles.length,
-    from: primaryCandles[0]?.time ?? "",
-    to: primaryCandles[primaryCandles.length - 1]?.time ?? "",
+    bars: reportCandles.length || candles.length,
+    from: reportCandles[0]?.time ?? candles[0]?.time ?? "",
+    to: reportCandles.at(-1)?.time ?? candles.at(-1)?.time ?? "",
     config: cfg,
     trades,
-    stats: {
-      trades: trades.length,
-      wins: wins.length,
-      losses: losses.length,
-      winRate: trades.length ? Number(((wins.length / trades.length) * 100).toFixed(1)) : null,
-      profitFactor: grossLoss > 0 ? Number((grossProfit / grossLoss).toFixed(2)) : wins.length ? null : 0,
-      expectancy: trades.length ? Number((totalPnl / trades.length).toFixed(2)) : null,
-      totalPnl: Number(totalPnl.toFixed(2)),
-      returnPct: Number((((balance - cfg.initialBalance) / cfg.initialBalance) * 100).toFixed(2)),
-      maxDrawdownPct: Number(maxDrawdownPct.toFixed(2)),
-      maxLossStreak,
-      avgWin: wins.length ? Number((grossProfit / wins.length).toFixed(2)) : null,
-      avgLoss: losses.length ? Number((grossLoss / losses.length).toFixed(2)) : null,
-      sharpe: sdR > 0 ? Number(((meanR / sdR) * Math.sqrt(252)).toFixed(2)) : null,
-      finalBalance: Number(balance.toFixed(2)),
-    },
-    equityCurve: sampledCurve,
+    stats,
+    equityCurve: downsampleCurve(equityCurve),
     warnings,
+    dataQuality: {
+      inputBars: rawPrimary.length,
+      normalizedBars: candles.length,
+      duplicatesRemoved: Math.max(0, rawPrimary.length - distinctValidCount(rawPrimary)),
+      outOfOrderBars: countOutOfOrder(rawPrimary),
+    },
+  };
+}
+
+export interface WalkForwardFold {
+  fold: number;
+  from: string;
+  to: string;
+  bars: number;
+  trades: number;
+  returnPct: number;
+  profitFactor: number | null;
+  winRate: number | null;
+  maxDrawdownPct: number;
+  expectancy: number | null;
+}
+
+export interface WalkForwardResult {
+  symbol: string;
+  timeframe: string;
+  folds: WalkForwardFold[];
+  consistency: {
+    foldCount: number;
+    profitableFolds: number;
+    profitableFraction: number;
+    meanReturnPct: number;
+    stdevReturnPct: number;
+    worstReturnPct: number;
+    bestReturnPct: number;
+    totalTrades: number;
+    avgProfitFactor: number | null;
+    verdict: string;
+  };
+  warnings: string[];
+}
+
+export function runWalkForward(
+  strategy: Pick<Strategy, "id" | "name" | "config">,
+  symbol: string,
+  inputCandles: Candle[],
+  cfg: BacktestConfig,
+  folds = 4,
+  options: Omit<BacktestOptions, "tradeStartMs" | "tradeEndMs"> = {},
+): WalkForwardResult {
+  const strategyConfig = strategy.config as { timeframes?: string[] };
+  const primaryTf = strategyConfig.timeframes?.[0] ?? "H1";
+  const candles = normalizeCandles(inputCandles, primaryTf, options.asOfMs ?? Number.POSITIVE_INFINITY);
+  const n = Math.max(2, Math.min(Math.floor(folds), 12));
+  const sliceSize = Math.floor(candles.length / n);
+  const out: WalkForwardFold[] = [];
+  const returns: number[] = [];
+  const profitFactors: number[] = [];
+  let totalTrades = 0;
+
+  for (let fold = 0; fold < n; fold++) {
+    const start = fold * sliceSize;
+    const end = fold === n - 1 ? candles.length : start + sliceSize;
+    if (end - start < 30) continue;
+    const warmupStart = Math.max(0, start - WINDOW);
+    const slice = candles.slice(warmupStart, end);
+    if (slice.length < WINDOW + 1) continue;
+    const tradeStartMs = Date.parse(candles[start].time);
+    const tradeEndMs = Date.parse(candles[end - 1].time) + timeframeMinutes(primaryTf) * 60_000;
+    const result = runBacktest(strategy, symbol, slice, cfg, {
+      ...options,
+      tradeStartMs,
+      tradeEndMs,
+    });
+    out.push({
+      fold: out.length + 1,
+      from: candles[start].time,
+      to: candles[end - 1].time,
+      bars: end - start,
+      trades: result.stats.trades,
+      returnPct: result.stats.returnPct,
+      profitFactor: result.stats.profitFactor,
+      winRate: result.stats.winRate,
+      maxDrawdownPct: result.stats.maxDrawdownPct,
+      expectancy: result.stats.expectancy,
+    });
+    returns.push(result.stats.returnPct);
+    if (result.stats.profitFactor !== null) profitFactors.push(result.stats.profitFactor);
+    totalTrades += result.stats.trades;
+  }
+
+  const count = returns.length;
+  const profitableFolds = returns.filter((value) => value > 0).length;
+  const mean = count ? returns.reduce((sum, value) => sum + value, 0) / count : 0;
+  const stdev = count > 1
+    ? Math.sqrt(returns.reduce((sum, value) => sum + (value - mean) ** 2, 0) / (count - 1))
+    : 0;
+  const profitableFraction = count ? profitableFolds / count : 0;
+  const avgProfitFactor = profitFactors.length
+    ? Number((profitFactors.reduce((sum, value) => sum + value, 0) / profitFactors.length).toFixed(2))
+    : null;
+  let verdict: string;
+  if (!count) verdict = "Not enough data to split into walk-forward windows.";
+  else if (totalTrades < count * 5) verdict = `Too few trades (${totalTrades} across ${count} windows) — the result is noise, not signal.`;
+  else if (profitableFraction >= 0.75 && mean > 0) verdict = `Edge looks consistent — profitable in ${profitableFolds}/${count} windows.`;
+  else if (profitableFraction >= 0.5 && mean > 0) verdict = `Fragile — profitable in ${profitableFolds}/${count} windows but regime-dependent.`;
+  else verdict = `No consistent edge — profitable in only ${profitableFolds}/${count} windows. Do not trade this live.`;
+
+  return {
+    symbol,
+    timeframe: primaryTf,
+    folds: out,
+    consistency: {
+      foldCount: count,
+      profitableFolds,
+      profitableFraction: Number(profitableFraction.toFixed(2)),
+      meanReturnPct: Number(mean.toFixed(2)),
+      stdevReturnPct: Number(stdev.toFixed(2)),
+      worstReturnPct: count ? Number(Math.min(...returns).toFixed(2)) : 0,
+      bestReturnPct: count ? Number(Math.max(...returns).toFixed(2)) : 0,
+      totalTrades,
+      avgProfitFactor,
+      verdict,
+    },
+    warnings: [
+      "Each fold includes pre-window warm-up candles but cannot enter before the fold starts.",
+      "Positions are liquidated at each fold boundary; boundary trades can make fold totals differ slightly from one continuous run.",
+      "AI confidence/veto and swap costs are not simulated.",
+    ],
   };
 }

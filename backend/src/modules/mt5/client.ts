@@ -1,6 +1,9 @@
 import { config } from "../../config.js";
 import { logger } from "../../lib/logger.js";
 import { audit, logError } from "../../lib/audit.js";
+import { CircuitOpenError, circuitSnapshot, withResilience } from "../../lib/resilience.js";
+import type { TradingInstrumentSpec } from "../risk/instruments.js";
+import { reportIncident, resolveIncidentByDedupeKey } from "../incidents/service.js";
 
 /**
  * HTTP client for the Python MT5 bridge. This is the ONLY place in the
@@ -50,6 +53,32 @@ export interface Candle {
   tick_volume: number;
 }
 
+export interface BrokerSymbolInfo {
+  symbol: string;
+  digits: number;
+  point: number;
+  trade_tick_size: number;
+  trade_tick_value: number;
+  volume_min: number;
+  volume_max: number;
+  volume_step: number;
+  trade_stops_level: number;
+}
+
+export function mapBrokerSymbolInfo(info: BrokerSymbolInfo): TradingInstrumentSpec {
+  return {
+    symbol: info.symbol,
+    digits: info.digits,
+    point: info.point,
+    tickSize: info.trade_tick_size,
+    tickValue: info.trade_tick_value,
+    volumeMin: info.volume_min,
+    volumeMax: info.volume_max,
+    volumeStep: info.volume_step,
+    stopsLevelPoints: info.trade_stops_level,
+  };
+}
+
 export interface OrderRequest {
   symbol: string;
   direction: "buy" | "sell";
@@ -71,29 +100,66 @@ export interface OrderResult {
 }
 
 /**
- * Map a requested symbol to the broker's actual tradeable name. Many brokers
- * append a tag (Exness: `EURUSD` → `EURUSDm`; others use `.r`, `-ECN`, `c`).
- * Conservative on purpose: only a separator-prefixed tag or a short LOWERCASE
- * tag counts, so `BTCUSD` never silently resolves to `BTCUSDT` (a different
- * instrument). Returns the original when nothing matches — let the bridge 404.
+ * Equivalent names for the same instrument across brokers. Used when a plain
+ * suffix match fails — e.g. a strategy configured for `XAUUSD` on a broker
+ * that lists gold as `GOLD`. Matching is bidirectional (any name in a group
+ * resolves to whichever the broker actually offers) and suffix-tolerant.
  */
-export function matchBrokerSymbol(requested: string, available: string[]): string {
-  if (!available.length) return requested;
+const SYMBOL_ALIASES: string[][] = [
+  ["XAUUSD", "GOLD"],
+  ["XAGUSD", "SILVER"],
+  ["US30", "DJ30", "DOW", "WS30", "DJI30"],
+  ["NAS100", "USTEC", "USNAS100", "USTECH", "NDX100"],
+  ["US500", "SPX500", "SP500", "SPX"],
+  ["DE40", "GER40", "DE30", "GER30", "DAX40", "DAX"],
+  ["UK100", "FTSE100", "FTSE"],
+  ["JP225", "JPN225", "NIKKEI225", "NIKKEI"],
+  ["USOIL", "WTI", "XTIUSD", "CRUDE", "OILUSD"],
+  ["UKOIL", "BRENT", "XBRUSD"],
+];
+
+/** Best broker symbol for a request via exact/suffix match, or null. */
+function findBrokerSymbol(requested: string, available: string[]): string | null {
+  if (!available.length) return null;
   const want = requested.toUpperCase();
   const exact = available.find((s) => s === requested) ?? available.find((s) => s.toUpperCase() === want);
   if (exact) return exact;
+  // Only a separator-prefixed tag or a short LOWERCASE tag counts as a broker
+  // suffix, so `BTCUSD` never silently resolves to `BTCUSDT` (a different pair).
   const isBrokerTag = (tag: string) => /^[._-][A-Za-z0-9]{1,5}$/.test(tag) || /^[a-z]{1,5}$/.test(tag);
   const matches = available
     .filter((s) => s.toUpperCase().startsWith(want) && isBrokerTag(s.slice(requested.length)))
     .sort((a, b) => a.length - b.length); // prefer the shortest tag
-  return matches[0] ?? requested;
+  return matches[0] ?? null;
+}
+
+/**
+ * Map a requested symbol to the broker's actual tradeable name. Handles both
+ * broker suffixes (`EURUSD` → `EURUSDm`) and cross-broker name differences
+ * (`XAUUSD` ↔ `GOLD`, `NAS100` ↔ `USTEC`). Returns the original when nothing
+ * matches — let the bridge 404 rather than guess wrong.
+ */
+export function matchBrokerSymbol(requested: string, available: string[]): string {
+  const direct = findBrokerSymbol(requested, available);
+  if (direct) return direct;
+
+  const core = requested.toUpperCase().replace(/[._-].*$/, "");
+  const group = SYMBOL_ALIASES.find((g) => g.some((a) => core === a || core.startsWith(a)));
+  if (group) {
+    for (const alias of group) {
+      if (core === alias) continue; // already tried as the request
+      const hit = findBrokerSymbol(alias, available);
+      if (hit) return hit;
+    }
+  }
+  return requested;
 }
 
 let brokerSymbolCache: { list: string[]; ts: number } | null = null;
 async function brokerSymbols(): Promise<string[]> {
   if (brokerSymbolCache && Date.now() - brokerSymbolCache.ts < 10 * 60_000) return brokerSymbolCache.list;
   try {
-    const list = await bridge<{ symbols: string[] }>("/symbols").then((r) => r.symbols);
+    const list = await readBridge<{ symbols: string[] }>("/symbols").then((r) => r.symbols);
     brokerSymbolCache = { list, ts: Date.now() };
     return list;
   } catch {
@@ -106,7 +172,9 @@ async function resolveSymbol(symbol: string): Promise<string> {
   return matchBrokerSymbol(symbol, await brokerSymbols());
 }
 
-async function bridge<T>(path: string, init?: RequestInit & { body?: string; timeoutMs?: number }): Promise<T> {
+type BridgeInit = Omit<RequestInit, "body"> & { body?: string; timeoutMs?: number };
+
+async function bridge<T>(path: string, init?: BridgeInit): Promise<T> {
   const url = `${config.MT5_BRIDGE_URL}${path}`;
   const started = Date.now();
   try {
@@ -129,24 +197,56 @@ async function bridge<T>(path: string, init?: RequestInit & { body?: string; tim
   }
 }
 
+async function readBridge<T>(path: string, init?: Omit<BridgeInit, "body" | "method">): Promise<T> {
+  try {
+    const result = await withResilience("mt5", () => bridge<T>(path, init), {
+      retries: 2,
+      baseDelayMs: 250,
+      maxDelayMs: 1000,
+      failureThreshold: 3,
+      cooldownMs: 30_000,
+    });
+    await resolveIncidentByDedupeKey("mt5:circuit-open", "system").catch(() => undefined);
+    return result;
+  } catch (error) {
+    const state = circuitSnapshot("mt5");
+    if (error instanceof CircuitOpenError || (!Array.isArray(state) && state?.status === "open")) {
+      await reportIncident({
+        dedupeKey: "mt5:circuit-open",
+        severity: "CRITICAL",
+        source: "mt5",
+        title: "MT5 bridge circuit open",
+        message: "New broker reads are temporarily blocked after repeated bridge failures.",
+        context: { path, error: String(error) },
+        minIntervalMs: 60_000,
+      }).catch(() => undefined);
+    }
+    throw error;
+  }
+}
+
 export const mt5 = {
-  health: () => bridge<{ ok: boolean; mock: boolean; connected: boolean }>("/health"),
-  accountInfo: () => bridge<AccountInfo>("/account"),
-  positions: () => bridge<{ positions: Position[] }>("/positions").then((r) => r.positions),
+  health: () => readBridge<{ ok: boolean; mock: boolean; connected: boolean }>("/health"),
+  accountInfo: () => readBridge<AccountInfo>("/account"),
+  positions: () => readBridge<{ positions: Position[] }>("/positions").then((r) => r.positions),
   history: (days = 30) =>
-    bridge<{ deals: unknown[] }>(`/history?days=${days}`).then((r) => r.deals),
+    readBridge<{ deals: unknown[] }>(`/history?days=${days}`).then((r) => r.deals),
   async tick(symbol: string) {
-    return bridge<Tick>(`/tick/${encodeURIComponent(await resolveSymbol(symbol))}`);
+    return readBridge<Tick>(`/tick/${encodeURIComponent(await resolveSymbol(symbol))}`);
   },
   async candles(symbol: string, timeframe: string, count = 200) {
     const sym = await resolveSymbol(symbol);
-    return bridge<{ candles: Candle[] }>(
+    return readBridge<{ candles: Candle[] }>(
       `/candles/${encodeURIComponent(sym)}?timeframe=${timeframe}&count=${count}`,
       // Large history requests trigger an MT5 server download on first use.
       { timeoutMs: count > 1000 ? 120_000 : 15_000 },
     ).then((r) => r.candles);
   },
-  symbols: () => bridge<{ symbols: string[] }>("/symbols").then((r) => r.symbols),
+  async symbolInfo(symbol: string) {
+    const sym = await resolveSymbol(symbol);
+    return readBridge<BrokerSymbolInfo>(`/symbol/${encodeURIComponent(sym)}`).then(mapBrokerSymbolInfo);
+  },
+  symbols: () => readBridge<{ symbols: string[] }>("/symbols").then((r) => r.symbols),
   /** Expose the resolver so callers can normalize a symbol once if needed. */
   resolveSymbol,
 

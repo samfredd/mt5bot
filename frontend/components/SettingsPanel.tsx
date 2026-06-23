@@ -1,7 +1,9 @@
 "use client";
 import { useCallback, useEffect, useState } from "react";
 import { api, setToken } from "@/lib/api";
+import { buildLiveTradingRequestBody } from "@/lib/live-settings";
 import { IconLogout, IconShield } from "@/components/icons";
+import { AiProviderSwitch } from "@/components/AiProviderSwitch";
 
 type Risk = Record<string, unknown> & { id?: string; userId?: string };
 
@@ -52,6 +54,10 @@ export function SettingsPanel() {
   return (
     <div className="space-y-6">
       <AccountSection onMsg={setMessage} />
+
+      <LiveTradingSettings onMsg={setMessage} />
+
+      <AiProviderSwitch />
 
       <section className="card">
         <h2 className="section-title"><IconShield size={15} className="text-primary" /> Risk settings</h2>
@@ -162,8 +168,10 @@ function AccountSection({ onMsg }: { onMsg: (m: string) => void }) {
   async function toggleLive(enable: boolean) {
     onMsg("");
     if (enable && !confirm("Enable LIVE trading? The bot will be allowed to place real-money trades on a real account (demo accounts are unaffected). The risk engine and approval flow still apply.")) return;
+    const token = enable ? window.prompt("Enter your 2FA code to enable live trading") : null;
+    if (enable && token === null) return;
     try {
-      await api(enable ? "/auth/live/enable" : "/auth/live/disable", { method: "POST", body: {} });
+      await api(enable ? "/auth/live/enable" : "/auth/live/disable", { method: "POST", body: buildLiveTradingRequestBody(enable, token) });
       onMsg(enable ? "Live trading ENABLED." : "Live trading disabled.");
       await load();
     } catch (err) { onMsg(err instanceof Error ? err.message : "failed"); }
@@ -236,8 +244,92 @@ function AccountSection({ onMsg }: { onMsg: (m: string) => void }) {
   );
 }
 
+interface LiveState {
+  liveTradingEnabled: boolean;
+  requireLiveTwoFactor: boolean;
+  autoLiveAuthorized: boolean;
+}
+
+function Toggle({ label, hint, checked, onChange, danger }: {
+  label: string; hint: string; checked: boolean; onChange: (v: boolean) => void; danger?: boolean;
+}) {
+  return (
+    <label className="flex cursor-pointer items-start gap-3 rounded-xl bg-surface-2 px-4 py-3">
+      <input type="checkbox" className={`mt-0.5 ${danger ? "accent-red-500" : "accent-teal-500"}`}
+        checked={checked} onChange={(e) => onChange(e.target.checked)} />
+      <span className="text-sm">
+        <span className="font-medium">{label}</span>
+        <span className="block text-xs leading-relaxed text-ink-faint">{hint}</span>
+      </span>
+    </label>
+  );
+}
+
+function LiveTradingSettings({ onMsg }: { onMsg: (m: string) => void }) {
+  const [state, setState] = useState<LiveState | null>(null);
+
+  const load = useCallback(async () => {
+    try { setState(await api<LiveState>("/api/bot/state")); } catch { /* noop */ }
+  }, []);
+  useEffect(() => { void load(); }, [load]);
+
+  if (!state) return null;
+  const set = (patch: Partial<LiveState>) => setState({ ...state, ...patch });
+
+  async function save() {
+    if (!state) return;
+    if (state.liveTradingEnabled && !confirm(
+      "Save live-trading settings?\n\nWith the system switch ON — plus the per-account live toggle and a real account connected — the bot will be allowed to place REAL-MONEY orders. The risk engine still applies. Continue?",
+    )) return;
+    onMsg("");
+    try {
+      const next = await api<LiveState>("/api/bot/live-settings", {
+        method: "PUT",
+        body: {
+          liveTradingEnabled: state.liveTradingEnabled,
+          requireLiveTwoFactor: state.requireLiveTwoFactor,
+          autoLiveAuthorized: state.autoLiveAuthorized,
+        },
+      });
+      setState(next);
+      onMsg("Live-trading settings saved.");
+    } catch (err) { onMsg(err instanceof Error ? err.message : "failed"); }
+  }
+
+  return (
+    <section className="card">
+      <h2 className="section-title"><IconShield size={15} className="text-down" /> Live trading gates</h2>
+      <p className="mb-4 text-xs leading-relaxed text-ink-dim">
+        These switches decide whether the bot may place <span className="font-medium text-down">REAL-MONEY</span> trades.
+        They apply only when the terminal is on a real (non-demo) account — demo trading is never gated. Every gate
+        here, plus the per-account live toggle above, must be open for a live order to go through.
+      </p>
+      <div className="space-y-3">
+        <Toggle danger
+          label="System live trading enabled"
+          hint="Master switch. Off = no live orders, ever (demo unaffected)."
+          checked={state.liveTradingEnabled} onChange={(v) => set({ liveTradingEnabled: v })} />
+        <Toggle
+          label="Require 2FA for live trades"
+          hint="On: manual & approval live trades need a TOTP code. Off: live trades skip 2FA entirely."
+          checked={state.requireLiveTwoFactor} onChange={(v) => set({ requireLiveTwoFactor: v })} />
+        <Toggle danger
+          label="Authorize automated live trading"
+          hint="Standing consent so the autonomous bot can place live trades (it can't type a per-trade code). Only consulted while 2FA is required."
+          checked={state.autoLiveAuthorized} onChange={(v) => set({ autoLiveAuthorized: v })} />
+      </div>
+      {state.requireLiveTwoFactor && !state.autoLiveAuthorized && (
+        <p className="mt-3 text-xs text-warn">
+          Heads up: with 2FA required and auto-authorization off, the autonomous bot cannot place live trades — only the manual button can.
+        </p>
+      )}
+      <button onClick={save} className="btn-primary mt-4">Save live-trading settings</button>
+    </section>
+  );
+}
+
 function ScannerSettings({ onMsg }: { onMsg: (m: string) => void }) {
-  const [cfg, setCfg] = useState<{ enabled: boolean; symbols: string[]; intervalMin: number; maxPerDay: number; minScore: number } | null>(null);
+  const [cfg, setCfg] = useState<{ enabled: boolean; symbols: string[]; intervalMin: number; maxPerDay: number; minScore: number; aiMode: "STRICT" | "ADVISORY"; minAiConfidence: number } | null>(null);
   const [symbolsText, setSymbolsText] = useState("");
 
   useEffect(() => {
@@ -268,8 +360,8 @@ function ScannerSettings({ onMsg }: { onMsg: (m: string) => void }) {
     <section className="card">
       <h2 className="section-title">Autonomous scanner</h2>
       <p className="mb-4 text-xs leading-relaxed text-ink-dim">
-        Sweeps the watchlist on its own, suggests the best setup with AI reasoning, and asks your approval —
-        you choose the lot size on every trade. It never executes by itself.
+        Sweeps the watchlist on its own. In Automatic mode it executes passing setups after AI and risk checks;
+        in other modes it creates approval requests so you choose the lot size.
       </p>
       <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
         <div className="col-span-2 md:col-span-4">
@@ -290,6 +382,19 @@ function ScannerSettings({ onMsg }: { onMsg: (m: string) => void }) {
           <label htmlFor="scanner-score" className="label">Min confluence (2–6)</label>
           <input id="scanner-score" className="input tnum" type="number" min={2} max={6} value={cfg.minScore}
             onChange={(e) => setCfg({ ...cfg, minScore: Number(e.target.value) })} />
+        </div>
+        <div>
+          <label htmlFor="scanner-ai-mode" className="label">AI gate</label>
+          <select id="scanner-ai-mode" className="input cursor-pointer" value={cfg.aiMode}
+            onChange={(e) => setCfg({ ...cfg, aiMode: e.target.value as "STRICT" | "ADVISORY" })}>
+            <option value="STRICT">Strict</option>
+            <option value="ADVISORY">Advisory</option>
+          </select>
+        </div>
+        <div>
+          <label htmlFor="scanner-ai-confidence" className="label">Min AI confidence</label>
+          <input id="scanner-ai-confidence" className="input tnum" type="number" min={0} max={1} step={0.05} value={cfg.minAiConfidence}
+            onChange={(e) => setCfg({ ...cfg, minAiConfidence: Number(e.target.value) })} />
         </div>
         <label className="flex cursor-pointer items-end gap-2 pb-2.5 text-xs text-ink-dim">
           <input type="checkbox" className="accent-teal-500" checked={cfg.enabled} onChange={(e) => setCfg({ ...cfg, enabled: e.target.checked })} />

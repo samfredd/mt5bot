@@ -88,6 +88,51 @@ export function atr(
   return sma(trs, period);
 }
 
+/**
+ * Average Directional Index — trend STRENGTH (not direction), 0..100 (Wilder).
+ * Low ADX (≲20–25) = range/chop, where mean-reversion works; high ADX = a
+ * strong trend, where fading extremes gets run over. Used as a regime filter.
+ */
+export function adx(highs: number[], lows: number[], closes: number[], period = 14): number[] {
+  const n = highs.length;
+  if (n < period * 2 + 1) return [];
+
+  const tr: number[] = [];
+  const plusDM: number[] = [];
+  const minusDM: number[] = [];
+  for (let i = 1; i < n; i++) {
+    const up = highs[i] - highs[i - 1];
+    const down = lows[i - 1] - lows[i];
+    plusDM.push(up > down && up > 0 ? up : 0);
+    minusDM.push(down > up && down > 0 ? down : 0);
+    tr.push(Math.max(highs[i] - lows[i], Math.abs(highs[i] - closes[i - 1]), Math.abs(lows[i] - closes[i - 1])));
+  }
+
+  // Wilder's running smoothing (seed = first `period` sum, then accumulate).
+  const wilder = (vals: number[]) => {
+    if (vals.length < period) return [];
+    const out: number[] = [vals.slice(0, period).reduce((a, b) => a + b, 0)];
+    for (let i = period; i < vals.length; i++) out.push(out[out.length - 1] - out[out.length - 1] / period + vals[i]);
+    return out;
+  };
+  const trS = wilder(tr);
+  const plusS = wilder(plusDM);
+  const minusS = wilder(minusDM);
+
+  const dx: number[] = [];
+  for (let i = 0; i < trS.length; i++) {
+    const plusDI = trS[i] === 0 ? 0 : (100 * plusS[i]) / trS[i];
+    const minusDI = trS[i] === 0 ? 0 : (100 * minusS[i]) / trS[i];
+    const sum = plusDI + minusDI;
+    dx.push(sum === 0 ? 0 : (100 * Math.abs(plusDI - minusDI)) / sum);
+  }
+  if (dx.length < period) return [];
+
+  const out: number[] = [dx.slice(0, period).reduce((a, b) => a + b, 0) / period];
+  for (let i = period; i < dx.length; i++) out.push((out[out.length - 1] * (period - 1) + dx[i]) / period);
+  return out;
+}
+
 export function last<T>(arr: T[]): T | undefined {
   return arr[arr.length - 1];
 }

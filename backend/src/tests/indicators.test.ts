@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { atr, bollinger, ema, macd, rsi, sma } from "../modules/analysis/indicators.js";
+import { adx, atr, bollinger, ema, macd, rsi, sma } from "../modules/analysis/indicators.js";
 import { AiDecisionSchema, AI_SAFE_FALLBACK } from "../modules/ai/schema.js";
 
 describe("indicators", () => {
@@ -40,6 +40,23 @@ describe("indicators", () => {
     const closes = highs.map((h) => h - 0.5);
     const out = atr(highs, lows, closes, 14);
     expect(out[out.length - 1]).toBeGreaterThan(0);
+  });
+
+  it("adx reads high in a strong trend and low in chop", () => {
+    // Strong, steady uptrend → high ADX.
+    const n = 80;
+    const upH = Array.from({ length: n }, (_, i) => 100 + i);
+    const upL = upH.map((h) => h - 0.5);
+    const upC = upH.map((h) => h - 0.2);
+    const trendAdx = adx(upH, upL, upC, 14);
+    expect(trendAdx[trendAdx.length - 1]).toBeGreaterThan(40);
+
+    // Flat oscillation around a level → low ADX (no directional move).
+    const chopC = Array.from({ length: n }, (_, i) => 100 + (i % 2 === 0 ? 0.3 : -0.3));
+    const chopH = chopC.map((c) => c + 0.4);
+    const chopL = chopC.map((c) => c - 0.4);
+    const chopAdx = adx(chopH, chopL, chopC, 14);
+    expect(chopAdx[chopAdx.length - 1]).toBeLessThan(25);
   });
 });
 

@@ -4,10 +4,39 @@ import { prisma } from "../../lib/prisma.js";
 import { audit } from "../../lib/audit.js";
 import { StrategyConfigSchema } from "./types.js";
 import { PRESET_STRATEGIES } from "./presets.js";
+import { runStrategyLab, lastLabRun } from "./lab.js";
+import { listValidationRuns } from "./validation-runs.js";
 
 export async function strategyRoutes(app: FastifyInstance) {
+  // --- AI Strategy Lab: generate → auto-validate → DISABLED candidates ---
+  app.get("/api/strategy-lab/last", { preHandler: [app.authenticate] }, async () => {
+    const { webSearchConfigured } = await import("../web/search.js");
+    const last = (await lastLabRun()) ?? { proposals: [], survivors: 0, ranAt: null };
+    // Always reflect CURRENT web-search config (a stored run may predate it).
+    return { ...last, webSearchEnabled: webSearchConfigured() };
+  });
+
+  app.post("/api/strategy-lab/run", { preHandler: [app.requireRole("ADMIN", "MANAGER")] }, async (req) => {
+    return runStrategyLab("manual", req.user.id);
+  });
+
   app.get("/api/strategies", { preHandler: [app.authenticate] }, async (req) => {
     return prisma.strategy.findMany({ where: { userId: req.user.id }, orderBy: { createdAt: "asc" } });
+  });
+
+  app.get("/api/strategies/validation-runs", { preHandler: [app.authenticate] }, async (req, reply) => {
+    const query = z.object({
+      strategyId: z.string().min(1).optional(),
+      limit: z.coerce.number().int().min(1).max(200).default(50),
+      includeInfrastructureErrors: z.enum(["true", "false"]).optional(),
+    }).safeParse(req.query);
+    if (!query.success) return reply.code(400).send({ error: "invalid validation-run query", issues: query.error.issues });
+    return listValidationRuns({
+      userId: req.user.id,
+      strategyId: query.data.strategyId,
+      limit: query.data.limit,
+      includeInfrastructureErrors: query.data.includeInfrastructureErrors === "true",
+    });
   });
 
   app.get("/api/strategies/presets", { preHandler: [app.authenticate] }, async () => PRESET_STRATEGIES);
@@ -72,6 +101,7 @@ export async function strategyRoutes(app: FastifyInstance) {
     maxTradesPerDay: z.number().int().positive().max(100).optional(),
     maxLotSize: z.number().positive().max(100).optional(),
     minRiskReward: z.number().positive().max(10).optional(),
+    maxConsecutiveLosses: z.number().int().positive().max(20).optional(),
     requireStopLoss: z.boolean().optional(),
     requireTakeProfit: z.boolean().optional(),
     maxSpreadPoints: z.number().positive().optional(),
@@ -84,6 +114,12 @@ export async function strategyRoutes(app: FastifyInstance) {
     equityProtectionPct: z.number().min(0).max(100).optional(),
     copyExposureLimitPct: z.number().positive().max(100).optional(),
     maxDailyCopiedTrades: z.number().int().positive().optional(),
+    maxCurrencyExposurePct: z.number().positive().max(5000).optional(),
+    maxCorrelatedExposurePct: z.number().positive().max(5000).optional(),
+    autoFlattenNewsEnabled: z.boolean().optional(),
+    autoFlattenLeadMin: z.number().int().min(0).max(240).optional(),
+    autoFlattenMinimumImpact: z.enum(["LOW", "MEDIUM", "HIGH"]).optional(),
+    autoFlattenSymbols: z.array(z.string().min(3)).max(50).optional(),
   });
 
   app.get("/api/risk-settings", { preHandler: [app.authenticate] }, async (req) => {
@@ -103,8 +139,17 @@ export async function strategyRoutes(app: FastifyInstance) {
     }
     const settings = await prisma.riskSettings.upsert({
       where: { userId: req.user.id },
-      create: { userId: req.user.id, ...body.data, allowedSessions: body.data.allowedSessions as object | undefined },
-      update: { ...body.data, allowedSessions: body.data.allowedSessions as object | undefined },
+      create: {
+        userId: req.user.id,
+        ...body.data,
+        allowedSessions: body.data.allowedSessions as object | undefined,
+        autoFlattenSymbols: body.data.autoFlattenSymbols as object | undefined,
+      },
+      update: {
+        ...body.data,
+        allowedSessions: body.data.allowedSessions as object | undefined,
+        autoFlattenSymbols: body.data.autoFlattenSymbols as object | undefined,
+      },
     });
     await audit({ actor: req.user.email, userId: req.user.id, category: "risk", action: "risk_settings_updated", detail: body.data });
     return settings;

@@ -43,10 +43,11 @@ export async function mt5Routes(app: FastifyInstance) {
     }
 
     invalidateAccountCache();
-    // Match by login alone: the row may have been auto-registered (with an
+    // Match by (userId, login): the row may have been auto-registered (with an
     // unknown server) when the terminal was already logged into this account.
+    // Keying on the unique makes this a single atomic upsert (no findFirst race).
     const account = await prisma.mt5Account.upsert({
-      where: { id: (await prisma.mt5Account.findFirst({ where: { userId: req.user.id, login } }))?.id ?? "new" },
+      where: { userId_login: { userId: req.user.id, login } },
       create: {
         userId: req.user.id, label, login, server,
         isDemo: result.is_demo ?? true, verified: true, passwordEnc: encryptSecret(password),

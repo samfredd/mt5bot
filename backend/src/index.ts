@@ -16,10 +16,27 @@ import { analyticsRoutes } from "./modules/analytics/routes.js";
 import { mt5Routes } from "./modules/mt5/routes.js";
 import { backtestRoutes } from "./modules/backtest/routes.js";
 import { whatsappRoutes } from "./modules/whatsapp/routes.js";
+import { incidentRoutes } from "./modules/incidents/routes.js";
+import { sentimentRoutes } from "./modules/sentiment/routes.js";
+import { journalRoutes } from "./modules/journal/routes.js";
+import { scalpingRoutes } from "./modules/scalping/scalping.routes.js";
 import { addClient } from "./modules/ws/hub.js";
 import { createTelegramBot } from "./modules/telegram/bot.js";
 import { startWorkers, stopWorkers } from "./workers/scheduler.js";
 import { logError } from "./lib/audit.js";
+import { disconnectRedis, redisAvailable } from "./lib/redis.js";
+import { reportIncident, resolveIncidentByDedupeKey } from "./modules/incidents/service.js";
+
+const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+async function redisAvailableWithin(timeoutMs: number): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() <= deadline) {
+    if (await redisAvailable()) return true;
+    await sleep(500);
+  }
+  return false;
+}
 
 async function main() {
   const app = Fastify({ loggerInstance: logger });
@@ -69,6 +86,10 @@ async function main() {
   await app.register(mt5Routes);
   await app.register(backtestRoutes);
   await app.register(whatsappRoutes);
+  await app.register(incidentRoutes);
+  await app.register(sentimentRoutes);
+  await app.register(journalRoutes);
+  await app.register(scalpingRoutes);
 
   app.setErrorHandler(async (err: Error & { statusCode?: number }, _req, reply) => {
     await logError("api", err.message, { stack: err.stack?.slice(0, 1000) });
@@ -81,12 +102,25 @@ async function main() {
     bot.start().catch((err) => logger.error({ err: String(err) }, "telegram bot failed to start"));
   }
 
+  if (await redisAvailableWithin(5_000)) {
+    await resolveIncidentByDedupeKey("redis:startup-unavailable", "system").catch(() => undefined);
+  } else {
+    await reportIncident({
+      dedupeKey: "redis:startup-unavailable",
+      severity: "CRITICAL",
+      source: "redis",
+      title: "Redis unavailable at startup",
+      message: "New trading and leased background jobs remain fail-closed until Redis recovers.",
+      minIntervalMs: 5 * 60_000,
+    }).catch((error) => logger.error({ error: String(error) }, "failed to persist Redis startup incident"));
+  }
   startWorkers();
 
   const shutdown = async () => {
     stopWorkers();
     if (bot) await bot.stop();
     await app.close();
+    await disconnectRedis();
     await prisma.$disconnect();
     process.exit(0);
   };
@@ -95,7 +129,7 @@ async function main() {
 
   await app.listen({ port: config.PORT, host: "0.0.0.0" });
   logger.info(
-    { port: config.PORT, demoMode: config.DEMO_MODE, liveTrading: config.LIVE_TRADING_ENABLED, mock: config.MT5_MOCK },
+    { port: config.PORT, mock: config.MT5_MOCK },
     "backend started",
   );
 }
