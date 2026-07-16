@@ -1,4 +1,4 @@
-import { askModelWithSystem } from "../ai/service.js";
+import { askModelWithSystem, getActiveProvider, PURE_LOGIC_PROVIDER } from "../ai/service.js";
 import type { AiDecision } from "../ai/schema.js";
 import { mt5 } from "../mt5/client.js";
 import { buildMarketAnalysis, type MarketAnalysis } from "../analysis/engine.js";
@@ -8,6 +8,7 @@ import { audit, logError } from "../../lib/audit.js";
 import type { ScalpingConfig } from "./scalping.schema.js";
 import { aiFireControlActive } from "./scalping.types.js";
 import type { ScalpingAiDecision } from "./scalping.types.js";
+import { prisma } from "../../lib/prisma.js";
 
 /**
  * Scalping AI "fire control".
@@ -134,9 +135,15 @@ export async function refreshPlan(symbol: string, config: ScalpingConfig): Promi
   const direction = scored.direction;
 
   let ai: ScalpingAiDecision | null = null;
-  if (aiFireControlActive(config) && direction) {
+  if ((await getActiveProvider()) !== PURE_LOGIC_PROVIDER && aiFireControlActive(config) && direction) {
     const prompt = buildScalpingPrompt(analysis, direction);
-    const { decision, logId, valid } = await askModelWithSystem(SCALPING_SYSTEM_PROMPT, prompt, symbol);
+    const admin = await prisma.user.findFirst({ where: { role: "ADMIN" }, orderBy: { createdAt: "asc" }, select: { id: true } });
+    const { decision, logId, valid } = await askModelWithSystem(
+      SCALPING_SYSTEM_PROMPT,
+      prompt,
+      symbol,
+      admin ? { userId: admin.id, direction, source: "scalping" } : undefined,
+    );
     ai = toScalpingDecision(symbol, decision, logId, valid, config.aiDecisionTtlSeconds);
     decisionHistory.unshift(ai);
     decisionHistory.length = Math.min(decisionHistory.length, MAX_HISTORY);

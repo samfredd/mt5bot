@@ -29,7 +29,21 @@ function usdNotional(position: ExposurePosition): number {
   const instrument = classifyInstrument(position.symbol);
   const units = position.lots * instrument.contractSize;
   if (instrument.kind === "fx" && instrument.baseCurrency === "USD") return units;
+  if (instrument.kind === "fx" && instrument.quoteCurrency === "USD") return units * position.price;
+  // A cross such as EURJPY is quoted in JPY, so `units * price` is a JPY
+  // notional, not a USD notional. Without a live conversion pair in this pure
+  // risk helper, use contract units as a conservative USD approximation. This
+  // avoids inflating JPY crosses by roughly 100-200x while still subjecting
+  // them to the configured exposure ceiling.
+  if (instrument.kind === "fx") return units;
   return units * position.price;
+}
+
+export interface ExposureGateResult {
+  passed: boolean;
+  reasons: string[];
+  projected: ExposureSnapshot;
+  adjustedLots?: number;
 }
 
 export function calculateExposure(positions: ExposurePosition[]): ExposureSnapshot {
@@ -64,7 +78,7 @@ export function evaluateExposureGate(input: {
   accountEquity: number;
   maxCurrencyExposurePct: number;
   maxCorrelatedExposurePct: number;
-}) {
+}): ExposureGateResult {
   const projected = calculateExposure([...input.positions, input.proposal]);
   const reasons: string[] = [];
   if (input.accountEquity <= 0) return { passed: false, reasons: ["Account equity must be positive"], projected };
@@ -81,4 +95,45 @@ export function evaluateExposureGate(input: {
     }
   }
   return { passed: reasons.length === 0, reasons, projected };
+}
+
+/**
+ * Reduce a proposal to the largest broker-valid size that fits the configured
+ * exposure limits. Exposure remains a hard gate: if even the minimum lot does
+ * not fit, the proposal is rejected rather than forced through.
+ */
+export function fitLotsToExposure(input: {
+  positions: ExposurePosition[];
+  proposal: ExposurePosition;
+  accountEquity: number;
+  maxCurrencyExposurePct: number;
+  maxCorrelatedExposurePct: number;
+  volumeMin: number;
+  volumeStep: number;
+}): ExposureGateResult {
+  const initial = evaluateExposureGate(input);
+  if (initial.passed) return initial;
+
+  const step = Math.max(input.volumeStep, 0.00000001);
+  const min = Math.max(input.volumeMin, step);
+  const decimals = Math.max(0, Math.ceil(-Math.log10(step)));
+  let lots = Math.floor((input.proposal.lots - step + step * 1e-9) / step) * step;
+
+  while (lots >= min - step * 1e-9) {
+    const candidateLots = Number(Math.max(lots, min).toFixed(decimals));
+    const candidate = evaluateExposureGate({
+      ...input,
+      proposal: { ...input.proposal, lots: candidateLots },
+    });
+    if (candidate.passed) {
+      return {
+        ...candidate,
+        adjustedLots: candidateLots,
+        reasons: [`lot size reduced from ${input.proposal.lots} to ${candidateLots} to remain within exposure limits`],
+      };
+    }
+    lots = Number((lots - step).toFixed(decimals));
+  }
+
+  return initial;
 }

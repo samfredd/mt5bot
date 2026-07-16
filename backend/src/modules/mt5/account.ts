@@ -24,8 +24,18 @@ export async function accountIdForLogin(userId: string, login: string | number, 
 
   let account = await prisma.mt5Account.findFirst({
     where: { userId, login: String(login) },
-    select: { id: true },
+    select: { id: true, archivedAt: true },
   });
+  // An account removed from the saved list can still be selected directly in
+  // MT5. If the terminal reports it as current again, restore it to the list
+  // automatically so the UI and trade attribution match the terminal.
+  if (account?.archivedAt) {
+    account = await prisma.mt5Account.update({
+      where: { id: account.id },
+      data: { archivedAt: null },
+      select: { id: true, archivedAt: true },
+    });
+  }
   if (!account && info) account = await register(userId, info);
 
   cache.set(key, { id: account?.id ?? null, ts: Date.now() });
@@ -65,7 +75,7 @@ async function register(userId: string, info: AccountInfo) {
         userId, login, label: `Account ${login}`,
         server: info.server ?? "", isDemo: info.is_demo, verified: false,
       },
-      select: { id: true },
+      select: { id: true, archivedAt: true },
     });
     if (isFirst) {
       await prisma.trade.updateMany({ where: { userId, accountId: null }, data: { accountId: account.id } });
@@ -80,7 +90,7 @@ async function register(userId: string, info: AccountInfo) {
     // Return its row instead of leaving a duplicate; no adoption (the winner
     // already ran it).
     if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === "P2002") {
-      const existing = await prisma.mt5Account.findFirst({ where: { userId, login }, select: { id: true } });
+      const existing = await prisma.mt5Account.findFirst({ where: { userId, login }, select: { id: true, archivedAt: true } });
       if (existing) return existing;
     }
     throw err;

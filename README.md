@@ -39,14 +39,21 @@ market data → analysis engine → news gate → strategy signal → **AI reaso
 veto, never force)** → **risk engine (final authority)** → mode gate (manual / approval / auto)
 → execution → audit + notify. Every step is stored in the trade's `explanation` JSON.
 
+**Persistent trading memory:** after realized P/L is reconciled, an idempotent learner stores the
+trade context, outcome, strengths, and mistakes in PostgreSQL. Matching lessons are added to future
+AI reviews only after a configurable minimum sample size. Memory may make the AI more selective or
+reduce sizing; it cannot increase risk, replace current market evidence, or override the risk engine.
+
+**Market intelligence:** structured official/news/community/video/developer sources feed a
+provenance-preserving research store with verification, contradiction handling, retention,
+full-text/vector retrieval, source health, and human-approved knowledge. See
+[`docs/INTELLIGENCE.md`](./docs/INTELLIGENCE.md).
+
 ## Quick start (demo mode, no MT5 terminal needed)
 
 Prereqs: Node 22+, Python 3.12+, Docker (for Postgres/Redis), optionally Ollama.
 
 ```bash
-cp .env.example .env
-# Edit .env: set JWT_SECRET and CREDENTIALS_ENC_KEY (openssl rand -hex 32)
-
 # 1. Infrastructure
 docker compose up -d postgres redis
 
@@ -54,7 +61,7 @@ docker compose up -d postgres redis
 cd mt5-bridge
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-MT5_MOCK=true BRIDGE_API_KEY=change-me-bridge-key python main.py &
+python main.py &
 
 # 3. Backend
 cd ../backend
@@ -69,7 +76,7 @@ npm install
 npm run dev             # http://localhost:3000
 
 # 5. (optional) AI brain
-ollama pull gemma3:12b  # set OLLAMA_MODEL in .env to the model you pulled
+ollama pull gemma3:12b  # select the model in Settings → AI provider
 ollama serve
 ```
 
@@ -94,8 +101,9 @@ Without Ollama running, the platform still works: AI responses fall back to a ha
 
 ## Going live (deliberately hard)
 
-1. Run the bridge on a Windows machine/VPS with the MT5 terminal:
-   `pip install MetaTrader5`, set `MT5_MOCK=false`, `MT5_LOGIN/MT5_PASSWORD/MT5_SERVER` env vars.
+1. Deploy the Windows MT5 bridge container on a private Windows Server node;
+   see [`docs/DEPLOYMENT.md`](./docs/DEPLOYMENT.md). Configure its URL/key and
+   connect the broker account from the dashboard Settings screen.
 2. In the dashboard Settings screen: enable 2FA, then enable live trading (admin + TOTP).
 3. Confirm the bot state shows LIVE before starting automatic execution.
 4. Every live approval and manual trade now requires a fresh TOTP code.
@@ -105,11 +113,15 @@ risk limits are re-checked inside the risk engine on **every** trade.
 
 ## Connectors
 
-- **Telegram**: set `TELEGRAM_BOT_TOKEN` (via @BotFather). In the dashboard, Settings →
+- **MCP agents**: connect Codex, Claude Code, Hermes, or another compatible AI client through
+  the authenticated Streamable HTTP endpoint configured entirely in dashboard Settings. MCP
+  starts read-only; mutation and trading permissions are separate opt-ins. See
+  [`docs/MCP.md`](./docs/MCP.md) for connection examples and the permission model.
+- **Telegram**: configure the BotFather token in dashboard Settings → Operational configuration. In the dashboard, Settings →
   *Link Telegram* → send `/link <code>` to your bot. Commands: `/status /open_trades /profit
   /news /pause_bot /resume_bot /emergency_stop /approve_trade /reject_trade /copy_trader /settings`.
   Dangerous commands require `/confirm`; live approvals require a TOTP code.
-- **WhatsApp**: configure Twilio sandbox/sender, point the inbound webhook to
+- **WhatsApp**: configure Twilio credentials/sender in dashboard Settings, point the inbound webhook to
   `POST /webhooks/whatsapp`. Link with `link <code>`. Plain-text commands: `status`,
   `open trades`, `today's profit`, `latest news`, `pause bot`, `resume bot`, `emergency stop`
   (reply `CONFIRM`), `approve trade <id> [2fa]`, `reject trade <id>`, `copy trading status`.

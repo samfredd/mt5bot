@@ -3,6 +3,7 @@ import { useEffect, useState } from "react";
 import { api } from "@/lib/api";
 import { IconBrain, IconPause, IconPlay, IconRefresh, IconScan, IconStop } from "@/components/icons";
 import { DayTradingControl } from "@/components/DayTradingControl";
+import { useToast } from "@/components/ToastProvider";
 
 interface ScanResponse {
   scanned: number;
@@ -15,7 +16,7 @@ interface ScanResponse {
 }
 
 export function Controls({ onChanged, state }: { onChanged: () => void; state?: { status: string; mode: string; emergencyStop: boolean } }) {
-  const [message, setMessage] = useState("");
+  const toast = useToast();
   const [scanning, setScanning] = useState(false);
   const [researching, setResearching] = useState(false);
   const [symbols, setSymbols] = useState<string[]>(["EURUSD"]);
@@ -31,54 +32,55 @@ export function Controls({ onChanged, state }: { onChanged: () => void; state?: 
   }, []);
 
   async function call(path: string, body?: unknown) {
-    setMessage("");
     try {
       await api(path, { method: "POST", body });
+      const description = controlMessage(path, body);
+      if (path.includes("emergency-stop")) toast.warning("Emergency stop executed", description);
+      else toast.success("Trading controls updated", description);
       onChanged();
     } catch (err) {
-      setMessage(err instanceof Error ? err.message : "Request failed");
+      toast.error("Control request failed", err instanceof Error ? err.message : "The trading control could not be updated.");
     }
   }
 
   async function scanNow() {
-    setMessage("");
     setScanning(true);
     try {
       const r = await api<ScanResponse>("/api/scanner/run", { method: "POST", body: {} });
-      setMessage(r.executed
+      const result = r.executed
         ? `Scan complete — executed ${r.executed.direction.toUpperCase()} ${r.executed.symbol} (${r.executed.lots} lots).`
         : r.paper
           ? `Scan complete — opened paper ${r.paper.direction.toUpperCase()} ${r.paper.symbol} (${r.paper.lots} lots).`
           : r.suggested
             ? `Scan complete — suggested ${r.suggested.direction.toUpperCase()} ${r.suggested.symbol}. Check pending approvals.`
-            : `Scan complete — ${r.scanned} symbols, ${r.candidates.length} candidate(s). ${r.skippedReason ?? ""}`);
+            : `Scan complete — ${r.scanned} symbols, ${r.candidates.length} candidate(s). ${r.skippedReason ?? ""}`;
+      (r.executed || r.paper ? toast.success : toast.info)("Market scan completed", result);
       onChanged();
     } catch (err) {
-      setMessage(err instanceof Error ? err.message : "Scan failed");
+      toast.error("Market scan failed", err instanceof Error ? err.message : "The scan could not be completed.");
     } finally {
       setScanning(false);
     }
   }
 
   async function researchPair() {
-    setMessage("");
     setResearching(true);
     try {
       const r = await api<ScanResponse>("/api/scanner/run", { method: "POST", body: { symbol: pair } });
       if (r.executed) {
-        setMessage(`${pair}: executed ${r.executed.direction.toUpperCase()} (${r.executed.lots} lots).`);
+        toast.success("Trade executed", `${pair}: ${r.executed.direction.toUpperCase()} (${r.executed.lots} lots).`);
       } else if (r.paper) {
-        setMessage(`${pair}: opened paper ${r.paper.direction.toUpperCase()} (${r.paper.lots} lots).`);
+        toast.success("Paper trade opened", `${pair}: ${r.paper.direction.toUpperCase()} (${r.paper.lots} lots).`);
       } else if (r.suggested) {
-        setMessage(`${pair}: suggested ${r.suggested.direction.toUpperCase()} — review it in pending approvals (you set the lot size).`);
+        toast.info("Trade suggestion ready", `${pair}: ${r.suggested.direction.toUpperCase()} — review it in pending approvals and choose the lot size.`);
       } else {
         const d = r.directedAnalysis;
         const detail = d ? ` Analysis: ${d.direction ? `${d.direction.toUpperCase()} bias, confluence ${d.score}/6` : "no clear direction"} — ${d.reasons[d.reasons.length - 1] ?? ""}` : "";
-        setMessage(`${pair}: no trade suggested. ${r.skippedReason ?? ""}${detail}`);
+        toast.info("Research completed", `${pair}: no trade suggested. ${r.skippedReason ?? ""}${detail}`);
       }
       onChanged();
     } catch (err) {
-      setMessage(err instanceof Error ? err.message : "Research failed");
+      toast.error("Research failed", err instanceof Error ? err.message : "The pair could not be analyzed.");
     } finally {
       setResearching(false);
     }
@@ -147,10 +149,18 @@ export function Controls({ onChanged, state }: { onChanged: () => void; state?: 
           executes a passing setup; otherwise it creates an approval request.
         </p>
       </div>
-      {message && <p className="mt-3 text-sm text-warn" role="status">{message}</p>}
       <DayTradingControl />
     </section>
   );
+}
+
+function controlMessage(path: string, body?: unknown): string {
+  if (path.endsWith("/start")) return "The bot is running.";
+  if (path.endsWith("/pause")) return "The bot is paused.";
+  if (path.endsWith("/emergency-stop")) return "The bot was halted and the close-position workflow was requested.";
+  if (path.endsWith("/emergency-reset")) return "Emergency state was reset.";
+  if (path.endsWith("/mode")) return `Trading mode changed to ${String((body as { mode?: string } | undefined)?.mode ?? "the selected mode").replace(/_/g, " ").toLowerCase()}.`;
+  return "The requested change was applied.";
 }
 
 function ControlsStatus({ status, emergencyStop }: { status: string; emergencyStop: boolean }) {

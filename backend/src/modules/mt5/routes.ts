@@ -4,22 +4,32 @@ import { prisma } from "../../lib/prisma.js";
 import { audit } from "../../lib/audit.js";
 import { encryptSecret } from "../../lib/crypto.js";
 import { mt5 } from "./client.js";
-import { invalidateAccountCache } from "./account.js";
+import { accountIdForLogin, invalidateAccountCache } from "./account.js";
 import { notify } from "../notifications/service.js";
 
 export async function mt5Routes(app: FastifyInstance) {
   /** Saved accounts (passwords never returned) + what the terminal is connected to right now. */
   app.get("/api/mt5/accounts", { preHandler: [app.authenticate] }, async (req) => {
-    const [saved, user, current] = await Promise.all([
-      prisma.mt5Account.findMany({
-        where: { userId: req.user.id },
-        select: { id: true, label: true, login: true, server: true, isDemo: true, verified: true, createdAt: true },
-        orderBy: { createdAt: "asc" },
-      }),
+    const [user, current] = await Promise.all([
       prisma.user.findUnique({ where: { id: req.user.id }, select: { liveTradingEnabled: true } }),
       mt5.accountInfo().catch(() => null),
     ]);
-    return { saved, current, userLiveEnabled: user?.liveTradingEnabled ?? false };
+    // Immediately surface an account already logged into the MT5 terminal.
+    // No password is requested or stored by this automatic registration.
+    if (current) await accountIdForLogin(req.user.id, current.login, current);
+    const saved = await prisma.mt5Account.findMany({
+      where: { userId: req.user.id, archivedAt: null },
+      // The encrypted value is used only to expose a boolean capability to
+      // the UI. It is never included in the response.
+      select: { id: true, label: true, login: true, server: true, isDemo: true, verified: true, passwordEnc: true, createdAt: true },
+      orderBy: { createdAt: "asc" },
+    });
+    return {
+      saved: saved.map(({ passwordEnc, ...account }) => ({ ...account, hasCredentials: Boolean(passwordEnc) })),
+      current,
+      activeAccountId: current ? saved.find((account) => account.login === String(current.login))?.id ?? null : null,
+      userLiveEnabled: user?.liveTradingEnabled ?? false,
+    };
   });
 
   /**
@@ -52,7 +62,7 @@ export async function mt5Routes(app: FastifyInstance) {
         userId: req.user.id, label, login, server,
         isDemo: result.is_demo ?? true, verified: true, passwordEnc: encryptSecret(password),
       },
-      update: { label, server, isDemo: result.is_demo ?? true, verified: true, passwordEnc: encryptSecret(password) },
+      update: { label, server, isDemo: result.is_demo ?? true, verified: true, passwordEnc: encryptSecret(password), archivedAt: null },
     });
 
     await audit({
@@ -67,12 +77,45 @@ export async function mt5Routes(app: FastifyInstance) {
   /** Reconnect to a previously saved account using its stored credentials. */
   app.post("/api/mt5/accounts/:id/reconnect", { preHandler: [app.requireRole("ADMIN")] }, async (req, reply) => {
     const { id } = req.params as { id: string };
-    const account = await prisma.mt5Account.findFirst({ where: { id, userId: req.user.id } });
+    const account = await prisma.mt5Account.findFirst({ where: { id, userId: req.user.id, archivedAt: null } });
     if (!account?.passwordEnc) return reply.code(404).send({ error: "account not found or has no stored credentials" });
     const { decryptSecret } = await import("../../lib/crypto.js");
     const result = await mt5.connect({ login: account.login, password: decryptSecret(account.passwordEnc), server: account.server }, req.user.email);
     if (!result.ok) return reply.code(502).send({ error: `MT5 login failed: ${result.error}` });
     invalidateAccountCache();
     return { ok: true, login: account.login, isDemo: result.is_demo, balance: result.balance };
+  });
+
+  /**
+   * Remove a past account from account management without destroying its
+   * trade history. Stored credentials are erased immediately. The account
+   * currently selected in the terminal must be switched away from first.
+   */
+  app.delete("/api/mt5/accounts/:id", { preHandler: [app.requireRole("ADMIN")] }, async (req, reply) => {
+    const { id } = req.params as { id: string };
+    const account = await prisma.mt5Account.findFirst({
+      where: { id, userId: req.user.id, archivedAt: null },
+      select: { id: true, label: true, login: true, server: true },
+    });
+    if (!account) return reply.code(404).send({ error: "account not found" });
+
+    const current = await mt5.accountInfo().catch(() => null);
+    if (current && String(current.login) === account.login) {
+      return reply.code(409).send({ error: "Switch the MT5 terminal to another account before removing the active account." });
+    }
+
+    await prisma.mt5Account.update({
+      where: { id: account.id },
+      data: { archivedAt: new Date(), passwordEnc: null, verified: false },
+    });
+    invalidateAccountCache();
+    await audit({
+      actor: req.user.email,
+      userId: req.user.id,
+      category: "mt5",
+      action: "account_removed",
+      detail: { accountId: account.id, label: account.label, login: account.login, server: account.server },
+    });
+    return { ok: true };
   });
 }

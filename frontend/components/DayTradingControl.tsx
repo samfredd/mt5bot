@@ -1,6 +1,7 @@
 "use client";
 import { useCallback, useEffect, useState } from "react";
 import { api } from "@/lib/api";
+import { useToast } from "@/components/ToastProvider";
 
 interface DayTradingConfig {
   enabled: boolean;
@@ -14,9 +15,9 @@ interface DayTradingConfig {
  * overnight holds. Configuration is backend-enforced in the scheduler.
  */
 export function DayTradingControl() {
+  const toast = useToast();
   const [cfg, setCfg] = useState<DayTradingConfig | null>(null);
   const [busy, setBusy] = useState(false);
-  const [message, setMessage] = useState("");
 
   const load = useCallback(async () => {
     try { setCfg(await api<DayTradingConfig>("/api/day-trading")); } catch { /* noop */ }
@@ -27,9 +28,13 @@ export function DayTradingControl() {
   const pad = (n: number) => String(n).padStart(2, "0");
 
   async function save(patch: Partial<DayTradingConfig>) {
-    setMessage(""); setBusy(true);
-    try { setCfg(await api<DayTradingConfig>("/api/day-trading", { method: "PUT", body: patch })); }
-    catch (err) { setMessage(err instanceof Error ? err.message : "update failed"); }
+    setBusy(true);
+    try {
+      const next = await api<DayTradingConfig>("/api/day-trading", { method: "PUT", body: patch });
+      setCfg(next);
+      toast.success("Day-trading settings updated", next.enabled ? `Positions will be flattened daily at ${String(next.closeHourUtc).padStart(2, "0")}:${String(next.closeMinuteUtc).padStart(2, "0")} UTC.` : "Intraday-only mode is disabled.");
+    }
+    catch (err) { toast.error("Day-trading update failed", err instanceof Error ? err.message : "The setting could not be updated."); }
     finally { setBusy(false); }
   }
 
@@ -64,7 +69,6 @@ export function DayTradingControl() {
         Intraday-only: after {pad(cfg.closeHourUtc)}:{pad(cfg.closeMinuteUtc)} UTC the bot stops opening trades and
         flattens all open positions — nothing is held overnight.
       </p>
-      {message && <p className="mt-2 text-sm text-warn" role="status">{message}</p>}
     </div>
   );
 }

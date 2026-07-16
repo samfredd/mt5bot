@@ -54,7 +54,7 @@ A self-hosted trading bot that:
               │ (Prisma)      │   │ state mirror,   │  │ (FastAPI, :5001) │
               │ :5433         │   │ leases, circuit │  │ mock OR real     │
               └───────────────┘   └─────────────────┘  └───┬──────────────┘
-                                                           │ MetaTrader5 pkg (Wine)
+                                                           │ MetaTrader5 pkg (Windows)
                                                            ▼
                                                    MT5 terminal / broker
 ```
@@ -65,7 +65,7 @@ A self-hosted trading bot that:
 |---|---|---|
 | PostgreSQL | Docker Compose | 5433 (host) |
 | Redis | Docker Compose | 6379 |
-| MT5 bridge | `python main.py` under Wine, attached to the MT5 terminal | 5001 |
+| MT5 bridge | mock locally, or Windows Server MT5 container in production | 5001 |
 | Backend | `npm run dev` (tsx watch) | 4000 |
 | Frontend | `npm run dev` (next) | 3000 |
 | Ollama (default AI) | local daemon | 11434 |
@@ -86,8 +86,8 @@ pino (logging), vitest (tests).
 **Frontend** — Next.js (App Router) + React 19, Tailwind v4 (`@theme` tokens, OLED dark
 fintech theme), native WebSocket, vitest.
 
-**Infra** — Docker Compose (Postgres, Redis), `Dockerfile.real` for a Wine + Windows
-Python + MT5-terminal container.
+**Infra** — Docker Compose (Postgres, Redis) plus a dedicated Windows Server 2022
+MT5 bridge deployment (`Dockerfile.windows`).
 
 ---
 
@@ -490,38 +490,24 @@ continues.
 
 ---
 
-## 19. Configuration (environment)
+## 19. Configuration
 
-Validated in [`config.ts`](../backend/src/config.ts) (zod). Highlights:
+Operational configuration is stored in `SystemSetting` and edited only by an
+administrator from **Settings → Operational configuration**. This includes the
+MT5 bridge endpoint/key, strategy-validation approval, AI timeout/fallback,
+calendar and RSS endpoints, Telegram, Twilio, and web-search credentials.
+Secrets are AES-256-GCM encrypted at rest and the API returns presence flags,
+never secret values. See [`DEPLOYMENT.md`](./DEPLOYMENT.md) for the separate
+bootstrap-secret and Windows-bridge deployment boundary.
 
-| Var | Default | Purpose |
-|---|---|---|
-| `PORT` | 4000 | backend port |
-| `DATABASE_URL` | — | Postgres (host port 5433 in dev) |
-| `REDIS_URL` | redis://localhost:6379 | leases, state mirror, circuits |
-| `JWT_SECRET` | — | ≥16 chars; rejected if placeholder in prod |
-| `CREDENTIALS_ENC_KEY` | — | 32-byte hex for AES-256-GCM |
-| `MT5_BRIDGE_URL` / `MT5_BRIDGE_API_KEY` | localhost:5001 | bridge endpoint + key |
-| `MT5_MOCK` | true | mock vs real broker |
-| `AI_PROVIDER` | ollama | ollama / anthropic / openai / openrouter |
-| `OLLAMA_URL` / `OLLAMA_MODEL` / `OLLAMA_TIMEOUT_MS` | localhost:11434 / gemma3:12b / 60000 | local model |
-| `ANTHROPIC_*` / `OPENAI_*` / `OPENROUTER_*` | — | cloud providers (key + model) |
-| `NEWS_CALENDAR_URL` / `NEWS_RSS_FEEDS` / `NEWS_REFRESH_MINUTES` | ForexFactory + ForexLive/FXStreet / 15 | news sources |
-| `WEB_SEARCH_PROVIDER` / `WEB_SEARCH_API_KEY` | tavily / "" | Strategy Lab web research (empty = off) |
-| `TELEGRAM_BOT_TOKEN` / `TELEGRAM_ALLOWED_IDS` | — | Telegram connector |
-| `TWILIO_*` | — | WhatsApp connector |
-| `SMTP_*` / `EMAIL_FROM` | — | email notifications |
-
-`STRATEGY_VALIDATION_APPROVED` and `REQUIRE_2FA` exist for legacy/config tests; the live
-posture is now driven by `bot_state` toggles (see runtime state below).
-
-**Runtime state** lives in `SystemSetting`, not env:
+**Runtime state** also lives in `SystemSetting`:
 
 - `bot_state`: `status` (stopped/running/paused/emergency_stop), `mode`, `emergencyStop`,
   `demoMode`, `liveTradingEnabled`, `paperForward`, `requireLiveTwoFactor`, `autoLiveAuthorized`.
   Cached in-process **with no TTL** — mutate it through the bot API/`setBotState`, not raw SQL,
   or the running process won't see the change until restart.
 - `scanner`: scanner config. `ai_provider`: active LLM. `day_trading`: intraday cutoff.
+- `operational_config`: global Settings-managed integration/runtime values.
 
 ---
 
@@ -532,8 +518,8 @@ posture is now driven by `bot_state` toggles (see runtime state below).
 docker compose up -d postgres redis
 
 # 2. MT5 bridge (mock — no terminal needed)
-cd mt5-bridge && MT5_MOCK=true python main.py        # :5001
-#   …or real mode under Wine, attached to the MT5 terminal, MT5_MOCK=false
+cd mt5-bridge && python main.py                       # mock bridge :5001
+# Real trading: deploy Dockerfile.windows on a private Windows Server node.
 
 # 3. backend
 cd backend && npm install && npm run prisma:generate

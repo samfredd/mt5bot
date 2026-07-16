@@ -1,7 +1,9 @@
 FROM node:22-alpine
 WORKDIR /app
+RUN apk add --no-cache openssl
 COPY package.json package-lock.json ./
-RUN npm ci
+RUN --mount=type=cache,target=/root/.npm \
+  npm ci --fetch-retries=5 --fetch-retry-mintimeout=20000 --fetch-retry-maxtimeout=120000
 COPY prisma ./prisma
 RUN npx prisma generate
 COPY tsconfig.json ./

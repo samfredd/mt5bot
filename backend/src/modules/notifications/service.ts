@@ -1,8 +1,8 @@
 import { prisma } from "../../lib/prisma.js";
-import { config } from "../../config.js";
 import { logError } from "../../lib/audit.js";
 import { broadcast } from "../ws/hub.js";
 import { sendTelegramMessage } from "../telegram/send.js";
+import { getOperationalConfig } from "../system/operational-config.js";
 
 export type NotifyType =
   | "trade_opened"
@@ -56,7 +56,8 @@ export async function notify(
     }
   }
 
-  if (prefs.whatsapp !== false && user.whatsappUsers.length && config.TWILIO_ACCOUNT_SID) {
+  const settings = await getOperationalConfig();
+  if (prefs.whatsapp !== false && user.whatsappUsers.length && settings.twilioAccountSid) {
     for (const wa of user.whatsappUsers) {
       try {
         await sendWhatsapp(wa.phone, `${title}\n${body}`);
@@ -84,17 +85,18 @@ async function record(
 
 /** Outbound WhatsApp via the Twilio API. */
 export async function sendWhatsapp(phone: string, body: string): Promise<void> {
-  if (!config.TWILIO_ACCOUNT_SID || !config.TWILIO_AUTH_TOKEN) {
+  const settings = await getOperationalConfig();
+  if (!settings.twilioAccountSid || !settings.twilioAuthToken) {
     throw new Error("Twilio not configured");
   }
   const to = phone.startsWith("whatsapp:") ? phone : `whatsapp:${phone}`;
-  const auth = Buffer.from(`${config.TWILIO_ACCOUNT_SID}:${config.TWILIO_AUTH_TOKEN}`).toString("base64");
+  const auth = Buffer.from(`${settings.twilioAccountSid}:${settings.twilioAuthToken}`).toString("base64");
   const res = await fetch(
-    `https://api.twilio.com/2010-04-01/Accounts/${config.TWILIO_ACCOUNT_SID}/Messages.json`,
+    `https://api.twilio.com/2010-04-01/Accounts/${settings.twilioAccountSid}/Messages.json`,
     {
       method: "POST",
       headers: { authorization: `Basic ${auth}`, "content-type": "application/x-www-form-urlencoded" },
-      body: new URLSearchParams({ From: config.TWILIO_WHATSAPP_FROM, To: to, Body: body }).toString(),
+      body: new URLSearchParams({ From: settings.twilioWhatsappFrom, To: to, Body: body }).toString(),
       signal: AbortSignal.timeout(15000),
     },
   );

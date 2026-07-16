@@ -43,7 +43,9 @@ export interface RiskContext {
   liveTradingEnabled: boolean;
   userLiveEnabled: boolean;
   twoFactorVerified: boolean;
-  exposureGate?: { passed: boolean; reasons: string[] };
+  strategyValidationApproved: boolean;
+  liveAccountVerified: boolean;
+  exposureGate?: { passed: boolean; reasons: string[]; adjustedLots?: number };
 }
 
 export interface RiskCheck {
@@ -71,6 +73,16 @@ export function validateTrade(p: TradeProposal, ctx: RiskContext): RiskResult {
     add("live_settings_enabled", ctx.liveTradingEnabled, ctx.liveTradingEnabled ? "live trading enabled in Settings" : "live trading is disabled in Settings");
     add("live_user_enabled", ctx.userLiveEnabled, ctx.userLiveEnabled ? "user enabled live mode" : "user has not enabled live mode");
     add("live_2fa", ctx.twoFactorVerified, ctx.twoFactorVerified ? "2FA verified" : "two-factor confirmation required for live trading");
+    add(
+      "live_strategy_certified",
+      ctx.strategyValidationApproved,
+      ctx.strategyValidationApproved ? "strategy validation gate approved" : "strategy validation has not been approved for live trading",
+    );
+    add(
+      "live_account_verified",
+      ctx.liveAccountVerified,
+      ctx.liveAccountVerified ? "connected live account is verified" : "connected live account has not been verified through the authenticated account flow",
+    );
   } else {
     add("demo_account", true, "demo account — live gates skipped");
   }
@@ -78,20 +90,38 @@ export function validateTrade(p: TradeProposal, ctx: RiskContext): RiskResult {
   // --- News gate ---
   add("news", ctx.newsAction !== "pause", ctx.newsAction === "pause" ? "news filter says pause" : `news action: ${ctx.newsAction}`);
   if (ctx.exposureGate) {
-    add("exposure", ctx.exposureGate.passed, ctx.exposureGate.passed ? "projected exposure within limits" : ctx.exposureGate.reasons.join("; "));
+    add(
+      "exposure",
+      ctx.exposureGate.passed,
+      ctx.exposureGate.passed
+        ? ctx.exposureGate.adjustedLots !== undefined
+          ? ctx.exposureGate.reasons.join("; ")
+          : "projected exposure within limits"
+        : ctx.exposureGate.reasons.join("; "),
+    );
   }
 
   // --- Stop-loss / take-profit requirements ---
-  const hasSl = p.stopLoss !== null && p.stopLoss > 0;
+  const entryValid = Number.isFinite(p.entry) && p.entry > 0;
+  const lotsValid = Number.isFinite(p.lots) && p.lots > 0;
+  const slValueValid = p.stopLoss === null || (Number.isFinite(p.stopLoss) && p.stopLoss > 0);
+  const tpValueValid = p.takeProfit === null || (Number.isFinite(p.takeProfit) && p.takeProfit > 0);
+  add("entry_value", entryValid, entryValid ? `entry=${p.entry}` : "entry must be a finite positive number");
+  add("lot_value", lotsValid, lotsValid ? `lots=${p.lots}` : "lot size must be a finite positive number");
+  add("stop_loss_value", slValueValid, slValueValid ? "SL value valid" : "SL must be null or a finite positive number");
+  add("take_profit_value", tpValueValid, tpValueValid ? "TP value valid" : "TP must be null or a finite positive number");
+
+  const hasSl = p.stopLoss !== null && slValueValid;
+  const hasTp = p.takeProfit !== null && tpValueValid;
   add("stop_loss_required", !s.requireStopLoss || hasSl, hasSl ? `SL=${p.stopLoss}` : "stop-loss is required for every trade");
   add(
     "take_profit_required",
-    !s.requireTakeProfit || (p.takeProfit !== null && p.takeProfit > 0),
+    !s.requireTakeProfit || hasTp,
     p.takeProfit ? `TP=${p.takeProfit}` : s.requireTakeProfit ? "take-profit required by settings" : "TP optional",
   );
 
   // --- Risk:reward ---
-  if (hasSl && p.takeProfit) {
+  if (hasSl && hasTp) {
     const riskDist = Math.abs(p.entry - (p.stopLoss as number));
     const rewardDist = Math.abs((p.takeProfit as number) - p.entry);
     const rr = riskDist > 0 ? rewardDist / riskDist : 0;
@@ -103,6 +133,10 @@ export function validateTrade(p: TradeProposal, ctx: RiskContext): RiskResult {
     const slValid = p.direction === "buy" ? (p.stopLoss as number) < p.entry : (p.stopLoss as number) > p.entry;
     add("stop_loss_direction", slValid, slValid ? "SL on correct side of entry" : "SL on wrong side of entry");
   }
+  if (hasTp) {
+    const tpValid = p.direction === "buy" ? (p.takeProfit as number) > p.entry : (p.takeProfit as number) < p.entry;
+    add("take_profit_direction", tpValid, tpValid ? "TP on correct side of entry" : "TP on wrong side of entry");
+  }
 
   // --- Per-trade monetary risk ---
   if (hasSl && ctx.account.balance > 0) {
@@ -113,11 +147,11 @@ export function validateTrade(p: TradeProposal, ctx: RiskContext): RiskResult {
       ? Math.abs(moneyForPriceMove(stopDist, p.lots, p.instrumentSpec))
       : stopDist * p.lots * valuePerPointPerLot(p.symbol, p.entry);
     const riskPct = (approxRisk / ctx.account.balance) * 100;
-    add("max_risk_per_trade", riskPct <= s.maxRiskPerTradePct * 1.5, `~${riskPct.toFixed(2)}% of balance (max ${s.maxRiskPerTradePct}%)`);
+    add("max_risk_per_trade", riskPct <= s.maxRiskPerTradePct + 1e-9, `~${riskPct.toFixed(2)}% of balance (max ${s.maxRiskPerTradePct}%)`);
   }
 
   // --- Lot size ---
-  add("max_lot_size", p.lots > 0 && p.lots <= s.maxLotSize, `lots=${p.lots} (max ${s.maxLotSize})`);
+  add("max_lot_size", lotsValid && p.lots <= s.maxLotSize, `lots=${p.lots} (max ${s.maxLotSize})`);
 
   // --- Exposure counts ---
   add("max_open_trades", ctx.openPositions.length < s.maxOpenTrades, `${ctx.openPositions.length}/${s.maxOpenTrades} open`);
@@ -170,7 +204,10 @@ export function validateTrade(p: TradeProposal, ctx: RiskContext): RiskResult {
 
   const ok = checks.every((c) => c.passed);
   // When news says "reduce", halve the lot size rather than block.
-  const adjustedLots = ctx.newsAction === "reduce" ? Math.max(0.01, Math.round(p.lots * 50) / 100) : p.lots;
+  const exposureAdjustedLots = ctx.exposureGate?.adjustedLots ?? p.lots;
+  const adjustedLots = ctx.newsAction === "reduce"
+    ? Math.max(p.instrumentSpec?.volumeMin ?? 0.01, Math.round(exposureAdjustedLots * 50) / 100)
+    : exposureAdjustedLots;
   return { ok, checks, adjustedLots };
 }
 

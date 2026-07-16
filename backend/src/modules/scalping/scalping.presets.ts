@@ -45,6 +45,7 @@ export const SCALPING_PRESETS: Record<ScalpingPresetKey, ScalpingPreset> = {
       scalpingRiskPreset: "low",
       lotMode: "risk_percent",
       riskPerTradePercent: 0.25,
+      maxTotalRiskExposurePercent: 1,
       allowFixedLot: false,
       maxOpenTradesTotal: 2,
       dailyLossLimitPercent: 2,
@@ -71,6 +72,7 @@ export const SCALPING_PRESETS: Record<ScalpingPresetKey, ScalpingPreset> = {
       scalpingRiskPreset: "medium",
       lotMode: "risk_percent",
       riskPerTradePercent: 0.5,
+      maxTotalRiskExposurePercent: 2,
       allowFixedLot: true,
       maxOpenTradesTotal: 3,
       dailyLossLimitPercent: 4,
@@ -97,6 +99,7 @@ export const SCALPING_PRESETS: Record<ScalpingPresetKey, ScalpingPreset> = {
       scalpingRiskPreset: "aggressive",
       lotMode: "risk_percent",
       riskPerTradePercent: 1.0,
+      maxTotalRiskExposurePercent: 5,
       allowFixedLot: true,
       maxOpenTradesTotal: 5,
       dailyLossLimitPercent: 7,
@@ -120,7 +123,7 @@ export const SCALPING_PRESETS: Record<ScalpingPresetKey, ScalpingPreset> = {
 
 /** Fields a preset controls, used by detectPreset for an exact-match check. */
 const PRESET_RISK_FIELDS: (keyof ScalpingRiskConfig)[] = [
-  "lotMode", "riskPerTradePercent", "allowFixedLot", "maxOpenTradesTotal",
+  "lotMode", "riskPerTradePercent", "maxTotalRiskExposurePercent", "allowFixedLot", "maxOpenTradesTotal",
   "dailyLossLimitPercent", "maxTradesPerDay", "reentryAfterLossSeconds",
   "maxConsecutiveLosses", "maxSharedCurrencyExposure", "stopBasis",
   "stopLossPoints", "takeProfitPoints", "allowedSessions", "maxSpreadPointsBySymbol",
@@ -174,9 +177,8 @@ export function exposureCapPct(preset: ScalpingPresetKey | "custom"): number {
  * risk-percent lot mode. Used at save-time to reject unsafe configs.
  */
 export function totalExposureExceedsCapForRisk(
-  risk: Pick<ScalpingRiskConfig, "lotMode" | "maxOpenTradesTotal" | "riskPerTradePercent" | "scalpingRiskPreset">,
+  risk: Pick<ScalpingRiskConfig, "lotMode" | "maxOpenTradesTotal" | "riskPerTradePercent" | "maxTotalRiskExposurePercent">,
 ): boolean {
   if (risk.lotMode !== "risk_percent") return false;
-  const cap = exposureCapPct(risk.scalpingRiskPreset);
-  return risk.maxOpenTradesTotal * risk.riskPerTradePercent > cap + 1e-9;
+  return risk.maxOpenTradesTotal * risk.riskPerTradePercent > risk.maxTotalRiskExposurePercent + 1e-9;
 }

@@ -2,6 +2,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { api } from "@/lib/api";
 import { IconBrain, IconX } from "@/components/icons";
+import { useToast } from "@/components/ToastProvider";
 
 interface Trader {
   id: string; name: string; source: string; active: boolean; riskScore: number;
@@ -16,10 +17,10 @@ const SAMPLE_METRICS = {
 };
 
 export function CopyPanel() {
+  const toast = useToast();
   const [traders, setTraders] = useState<Trader[]>([]);
   const [evalResult, setEvalResult] = useState<{ name: string; explanation: string } | null>(null);
   const [form, setForm] = useState({ name: "", source: "manual", metrics: JSON.stringify(SAMPLE_METRICS, null, 2) });
-  const [message, setMessage] = useState("");
 
   const load = useCallback(async () => {
     try { setTraders(await api<Trader[]>("/api/copy-traders")); } catch { /* noop */ }
@@ -28,22 +29,22 @@ export function CopyPanel() {
 
   async function add(e: React.FormEvent) {
     e.preventDefault();
-    setMessage("");
     try {
       const metrics = JSON.parse(form.metrics);
       await api("/api/copy-traders", { method: "POST", body: { name: form.name, source: form.source, metrics, copyRules: { lotMultiplier: 1, stopAfterLossStreak: 5, maxSourceLot: 1 } } });
       setForm({ ...form, name: "" });
       await load();
-    } catch (err) { setMessage(err instanceof Error ? err.message : "failed"); }
+      toast.success("Trader added", `${form.name} was added and scored.`);
+    } catch (err) { toast.error("Trader not added", err instanceof Error ? err.message : "The trader profile could not be created."); }
   }
 
   async function action(t: Trader, what: "activate" | "deactivate" | "evaluate") {
-    setMessage("");
     try {
       const res = await api<{ explanation?: string }>(`/api/copy-traders/${t.id}/${what}`, { method: "POST" });
       if (what === "evaluate" && res.explanation) setEvalResult({ name: t.name, explanation: res.explanation });
       await load();
-    } catch (err) { setMessage(err instanceof Error ? err.message : "failed"); }
+      if (what !== "evaluate") toast.success(what === "activate" ? "Copying started" : "Copying stopped", t.name);
+    } catch (err) { toast.error("Copy-trading action failed", err instanceof Error ? err.message : "The requested action could not be completed."); }
   }
 
   return (
@@ -105,8 +106,6 @@ export function CopyPanel() {
           <button className="btn-primary">Add & score</button>
         </form>
       </section>
-
-      {message && <p className="text-sm text-warn" role="status">{message}</p>}
 
       {evalResult && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4 backdrop-blur-sm" onClick={() => setEvalResult(null)}>

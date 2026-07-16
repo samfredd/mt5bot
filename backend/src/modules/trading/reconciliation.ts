@@ -5,6 +5,42 @@ import { notify } from "../notifications/service.js";
 import { broadcast } from "../ws/hub.js";
 import { reportIncident } from "../incidents/service.js";
 import { finalizeExecutionComparison } from "./execution-comparison.js";
+import { releaseMarketReservation } from "./execution-intent.js";
+
+export async function expirePendingTradeApprovals(now = new Date()): Promise<number> {
+  const expired = await prisma.tradeApproval.findMany({
+    where: { status: "pending", expiresAt: { lte: now }, trade: { status: "PENDING_APPROVAL" } },
+    select: { id: true, tradeId: true },
+    take: 500,
+  });
+  let count = 0;
+  for (const approval of expired) {
+    const claimed = await prisma.trade.updateMany({
+      where: { id: approval.tradeId, status: "PENDING_APPROVAL" },
+      data: { status: "CANCELLED" },
+    });
+    if (claimed.count !== 1) continue;
+    await prisma.tradeApproval.update({ where: { id: approval.id }, data: { status: "expired" } });
+    count += 1;
+  }
+  return count;
+}
+
+async function reconcilePendingIntents(positions: Awaited<ReturnType<typeof mt5.positions>>) {
+  const pending = await prisma.orderIntent.findMany({ where: { status: { in: ["SUBMITTING", "PLACED", "PARTIALLY_FILLED", "UNKNOWN"] } }, include: { trade: true }, take: 200 });
+  for (const intent of pending) {
+    // Older clients could produce a 32-character comment that MT5 truncated;
+    // the stable prefix remains collision-resistant enough for recovery.
+    const matchKey = intent.clientOrderId.slice(0, 20);
+    const position = positions.find((item) => item.comment?.includes(matchKey));
+    if (!position) continue;
+    await prisma.$transaction([
+      prisma.orderIntent.update({ where: { id: intent.id }, data: { status: "FILLED", filledVolume: position.volume, brokerPositionId: position.ticket, resolvedAt: new Date(), error: null } }),
+      prisma.trade.update({ where: { id: intent.tradeId }, data: { status: "EXECUTED", mt5Ticket: position.ticket, lots: position.volume, entryPrice: position.price_open, openedAt: intent.trade.openedAt ?? new Date() } }),
+    ]);
+  }
+  return pending.filter((intent) => !positions.some((item) => item.comment?.includes(intent.clientOrderId.slice(0, 20))));
+}
 
 /**
  * Reconcile DB trades against the broker: detect SL/TP closures and pull the
@@ -17,9 +53,12 @@ export async function syncClosedTrades(): Promise<void> {
   const info = await mt5.accountInfo().catch(() => null);
   if (!info) return;
   const accountScope = { OR: [{ accountId: null }, { account: { login: String(info.login) } }] };
+  const positions = await mt5.positions();
+  const unresolvedIntents = await reconcilePendingIntents(positions);
 
   const open = await prisma.trade.findMany({
-    where: { status: "EXECUTED", mt5Ticket: { not: null }, ...accountScope },
+    where: { status: { in: ["EXECUTED", "PARTIALLY_FILLED"] }, mt5Ticket: { not: null }, ...accountScope },
+    include: { orderIntent: { select: { id: true } } },
   });
   const needBackfill = await prisma.trade.findMany({
     where: {
@@ -30,16 +69,15 @@ export async function syncClosedTrades(): Promise<void> {
       ...accountScope,
     },
   });
-  if (!open.length && !needBackfill.length) return;
+  if (!open.length && !needBackfill.length && !unresolvedIntents.length) return;
 
-  const positions = await mt5.positions();
   const liveTickets = new Set(positions.map((position) => position.ticket));
   const justClosed = open.filter((trade) => !liveTickets.has(trade.mt5Ticket!));
-  if (!justClosed.length && !needBackfill.length) return;
+  if (!justClosed.length && !needBackfill.length && !unresolvedIntents.length) return;
 
   // Real MT5 deals carry position_id; the mock uses the position ticket.
   // Net profit is the sum of every deal attributed to the position.
-  let deals: { ticket?: string; position_id?: string; profit?: number; price?: number; time?: string }[] = [];
+  let deals: { ticket?: string; position_id?: string; profit?: number; commission?: number; swap?: number; fee?: number; price?: number; time?: string; comment?: string }[] = [];
   let historyError: string | null = null;
   try {
     deals = (await mt5.history(7)) as typeof deals;
@@ -72,9 +110,34 @@ export async function syncClosedTrades(): Promise<void> {
   const profitFor = (ticket: string): number | null => {
     const matched = dealsFor(ticket);
     return matched.length
-      ? Number(matched.reduce((total, deal) => total + (deal.profit ?? 0), 0).toFixed(2))
+      ? Number(matched.reduce((total, deal) => total + (deal.profit ?? 0) + (deal.commission ?? 0) + (deal.swap ?? 0) + (deal.fee ?? 0), 0).toFixed(2))
       : null;
   };
+
+  // Recover submissions whose HTTP result was lost. An opening deal carries
+  // the client id and yields the durable broker position id even if that
+  // position opened and closed between reconciliation polls.
+  for (const intent of unresolvedIntents) {
+    const openingDeal = deals.find((deal) => deal.comment?.includes(intent.clientOrderId.slice(0, 20)));
+    const positionId = openingDeal?.position_id ?? openingDeal?.ticket;
+    if (!positionId) continue;
+    const stillOpen = positions.some((position) => position.ticket === positionId);
+    const realizedProfit = stillOpen ? null : profitFor(positionId);
+    await prisma.$transaction([
+      prisma.orderIntent.update({ where: { id: intent.id }, data: {
+        status: "FILLED", brokerPositionId: positionId, brokerDealId: openingDeal?.ticket,
+        filledVolume: intent.requestedVolume, resolvedAt: new Date(), error: null,
+      } }),
+      prisma.trade.update({ where: { id: intent.tradeId }, data: {
+        status: stillOpen ? "EXECUTED" : "CLOSED", mt5Ticket: positionId,
+        openedAt: intent.trade.openedAt ?? new Date(),
+        ...(stillOpen ? {} : { closedAt: new Date(), profit: realizedProfit,
+          attributionConfidence: realizedProfit === null ? 0 : 1,
+          attributionReason: realizedProfit === null ? "deal_history_missing" : "recovered_client_order_id" }),
+      } }),
+    ]);
+    if (!stillOpen) await releaseMarketReservation(intent.id);
+  }
 
   const groupedClosed = new Map<string, typeof justClosed>();
   for (const trade of justClosed) {
@@ -105,6 +168,7 @@ export async function syncClosedTrades(): Promise<void> {
           },
         });
         await notify(trade.userId, "trade_closed", `Trade closed: ${trade.symbol}`, `Position ${positionId} closed; P/L attribution is ambiguous and excluded.`);
+        if (trade.orderIntent) await releaseMarketReservation(trade.orderIntent.id);
         broadcast("trade", { tradeId: closed.id, status: "CLOSED" });
       }
       continue;
@@ -153,6 +217,8 @@ export async function syncClosedTrades(): Promise<void> {
       `Trade closed: ${trade.symbol}`,
       `Ticket ${trade.mt5Ticket} closed (SL/TP hit or closed at broker).${profit !== null ? ` Realized P/L: ${profit.toFixed(2)}` : ""}`,
     );
+    const intent = await prisma.orderIntent.findUnique({ where: { tradeId: trade.id }, select: { id: true } });
+    if (intent) await releaseMarketReservation(intent.id);
     broadcast("trade", { tradeId: closed.id, status: "CLOSED" });
   }
 

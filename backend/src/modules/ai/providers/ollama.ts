@@ -1,11 +1,13 @@
-import { config } from "../../../config.js";
 import { CircuitOpenError, circuitSnapshot, withResilience } from "../../../lib/resilience.js";
 import { reportIncident, resolveIncidentByDedupeKey } from "../../incidents/service.js";
 import { resolveProviderConfig } from "../provider-config.js";
+import { getOperationalConfig } from "../../system/operational-config.js";
 import type { GenerateRequest, ProviderStatus } from "./types.js";
 
 export async function ollamaGenerate(request: GenerateRequest): Promise<string> {
-  const { model, baseUrl } = await resolveProviderConfig("ollama");
+  const { model: configuredModel, baseUrl } = await resolveProviderConfig("ollama");
+  const model = request.model?.trim() || configuredModel;
+  const { aiRequestTimeoutMs } = await getOperationalConfig();
   try {
     const response = await withResilience("ai", async () => {
       const res = await fetch(`${baseUrl}/api/generate`, {
@@ -19,7 +21,7 @@ export async function ollamaGenerate(request: GenerateRequest): Promise<string> 
           ...(request.json ? { format: "json" } : {}),
           options: { temperature: request.temperature },
         }),
-        signal: AbortSignal.timeout(config.OLLAMA_TIMEOUT_MS),
+        signal: AbortSignal.timeout(aiRequestTimeoutMs),
       });
       if (!res.ok) throw new Error(`ollama returned ${res.status}`);
       const payload = (await res.json()) as { response?: string };

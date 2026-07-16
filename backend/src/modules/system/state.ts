@@ -1,6 +1,6 @@
 import { prisma } from "../../lib/prisma.js";
 import { audit } from "../../lib/audit.js";
-import { readJson, redisAvailable, writeJson } from "../../lib/redis.js";
+import { redisAvailable, writeJson } from "../../lib/redis.js";
 
 export type BotStatus = "stopped" | "running" | "paused" | "emergency_stop";
 
@@ -19,6 +19,9 @@ export interface BotState {
   // per-trade TOTP. Only consulted on the auto path while requireLiveTwoFactor
   // is true; ignored (not needed) when 2FA is off.
   autoLiveAuthorized: boolean;
+  // Dynamically cap risk and let the selected AI reduce (never increase) the
+  // equity-sized lot recommendation.
+  adaptiveRiskEnabled: boolean;
 }
 
 const defaults: BotState = {
@@ -30,20 +33,21 @@ const defaults: BotState = {
   paperForward: false,
   requireLiveTwoFactor: true,
   autoLiveAuthorized: false,
+  adaptiveRiskEnabled: true,
 };
 
 let cache: BotState | null = null;
+let cacheAt = 0;
 const REDIS_STATE_KEY = "bot:state";
+const CACHE_TTL_MS = 2_000;
 
 export async function getBotState(): Promise<BotState> {
-  if (cache) return cache;
-  const mirrored = await readJson<Partial<BotState>>(REDIS_STATE_KEY);
-  if (mirrored) {
-    cache = { ...defaults, ...mirrored };
-    return cache;
-  }
+  if (cache && Date.now() - cacheAt < CACHE_TTL_MS) return cache;
+  // PostgreSQL is authoritative. Redis is only a mirror and must never revive
+  // an older running/live state after a restart or cross-instance update.
   const row = await prisma.systemSetting.findUnique({ where: { key: "bot_state" } });
   cache = row ? { ...defaults, ...(row.value as Partial<BotState>) } : { ...defaults };
+  cacheAt = Date.now();
   await writeJson(REDIS_STATE_KEY, cache);
   return cache;
 }
@@ -54,6 +58,7 @@ export async function setBotState(patch: Partial<BotState>, actor: string): Prom
   // Emergency stop overrides everything and forces status.
   if (next.emergencyStop) next.status = "emergency_stop";
   cache = next;
+  cacheAt = Date.now();
   await prisma.systemSetting.upsert({
     where: { key: "bot_state" },
     create: { key: "bot_state", value: next as object },

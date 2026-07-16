@@ -23,6 +23,8 @@ function ctx(overrides: Partial<RiskContext> = {}): RiskContext {
     emergencyStop: false, botRunning: true,
     isLiveAccount: false, liveTradingEnabled: false, userLiveEnabled: false,
     twoFactorVerified: false,
+    strategyValidationApproved: false,
+    liveAccountVerified: false,
     ...overrides,
   };
 }
@@ -125,9 +127,53 @@ describe("risk engine", () => {
       expect(r.checks.find((c) => c.name === "live_2fa")?.passed).toBe(false);
     });
     it("allows live trades once the live gates are open", () => {
-      const r = validateTrade(goodTrade, ctx({ ...live, liveTradingEnabled: true, userLiveEnabled: true, twoFactorVerified: true }));
+      const r = validateTrade(goodTrade, ctx({
+        ...live,
+        liveTradingEnabled: true,
+        userLiveEnabled: true,
+        twoFactorVerified: true,
+        strategyValidationApproved: true,
+        liveAccountVerified: true,
+      }));
       expect(r.ok).toBe(true);
     });
+    it("blocks live trades without strategy certification", () => {
+      const r = validateTrade(goodTrade, ctx({
+        ...live,
+        liveTradingEnabled: true,
+        userLiveEnabled: true,
+        twoFactorVerified: true,
+        liveAccountVerified: true,
+      }));
+      expect(r.checks.find((c) => c.name === "live_strategy_certified")?.passed).toBe(false);
+    });
+    it("blocks an unverified live account", () => {
+      const r = validateTrade(goodTrade, ctx({
+        ...live,
+        liveTradingEnabled: true,
+        userLiveEnabled: true,
+        twoFactorVerified: true,
+        strategyValidationApproved: true,
+      }));
+      expect(r.checks.find((c) => c.name === "live_account_verified")?.passed).toBe(false);
+    });
+  });
+
+  it("enforces the configured risk cap exactly", () => {
+    // 0.48 lots × 25-pip stop = $120 = 1.2% of a $10k balance.
+    const r = validateTrade({ ...goodTrade, lots: 0.48 }, ctx());
+    expect(r.checks.find((c) => c.name === "max_risk_per_trade")?.passed).toBe(false);
+  });
+
+  it("rejects a take-profit on the wrong side of entry", () => {
+    const r = validateTrade({ ...goodTrade, takeProfit: 1.08 }, ctx());
+    expect(r.checks.find((c) => c.name === "take_profit_direction")?.passed).toBe(false);
+  });
+
+  it("rejects non-finite trade values", () => {
+    const r = validateTrade({ ...goodTrade, lots: Number.NaN }, ctx());
+    expect(r.checks.find((c) => c.name === "lot_value")?.passed).toBe(false);
+    expect(r.ok).toBe(false);
   });
 
   it("enforces the per-trade risk cap on gold (instrument-aware)", () => {

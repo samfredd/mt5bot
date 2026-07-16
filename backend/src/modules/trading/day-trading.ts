@@ -60,23 +60,31 @@ export async function dayTradingBlocksEntry(now = new Date()): Promise<boolean> 
  * Intraday-only enforcement: once past the daily cutoff, flatten every open
  * position so nothing is held overnight. Idempotent — a no-op when nothing is
  * open (which it will be after the first flatten, since entries are blocked).
- * Closes ALL broker positions (including manual ones) — that is the point of
- * intraday-only mode.
+ * Closes only positions owned by this application. Manual positions and
+ * positions from other EAs must never be mutated by an automated cutoff.
  */
 export async function enforceDayTradingExit(now = new Date()): Promise<string[]> {
   const cfg = await getDayTradingConfig();
   if (!cfg.enabled || !isPastDailyClose(now, cfg.closeHourUtc, cfg.closeMinuteUtc)) return [];
 
+  const admin = await prisma.user.findFirst({ where: { role: "ADMIN" }, orderBy: { createdAt: "asc" } });
+  if (!admin) return [];
   const positions = await mt5.positions().catch(() => []);
   if (!positions.length) return [];
-
-  const admin = await prisma.user.findFirst({ where: { role: "ADMIN" }, orderBy: { createdAt: "asc" } });
+  const tracked = await prisma.trade.findMany({
+    where: { userId: admin.id, status: { in: ["EXECUTED", "PARTIALLY_FILLED"] }, mt5Ticket: { not: null } },
+    select: { mt5Ticket: true },
+  });
+  const trackedTickets = new Set(tracked.map((trade) => trade.mt5Ticket));
+  const ownedPositions = positions.filter((position) =>
+    trackedTickets.has(position.ticket) || position.magic === 770077 || position.comment?.startsWith("mt5bot:"),
+  );
   const closed: string[] = [];
-  for (const position of positions) {
+  for (const position of ownedPositions) {
     const result = await mt5.closePosition(position.ticket, "system:day-trading-close").catch(() => ({ ok: false as const }));
     if (result.ok) closed.push(position.ticket);
   }
-  if (closed.length && admin) {
+  if (closed.length) {
     await audit({
       actor: "system:day-trading-close", userId: admin.id, category: "trade", action: "day_trading_flatten",
       detail: { closed, cutoffUtc: `${String(cfg.closeHourUtc).padStart(2, "0")}:${String(cfg.closeMinuteUtc).padStart(2, "0")}` },

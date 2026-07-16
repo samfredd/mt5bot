@@ -20,12 +20,18 @@ import { incidentRoutes } from "./modules/incidents/routes.js";
 import { sentimentRoutes } from "./modules/sentiment/routes.js";
 import { journalRoutes } from "./modules/journal/routes.js";
 import { scalpingRoutes } from "./modules/scalping/scalping.routes.js";
+import { assistantRoutes } from "./modules/assistant/routes.js";
+import { mcpRoutes } from "./modules/mcp/server.js";
+import { memoryRoutes } from "./modules/memory/routes.js";
+import { intelligenceRoutes } from "./modules/intelligence/routes.js";
 import { addClient } from "./modules/ws/hub.js";
 import { createTelegramBot } from "./modules/telegram/bot.js";
 import { startWorkers, stopWorkers } from "./workers/scheduler.js";
 import { logError } from "./lib/audit.js";
 import { disconnectRedis, redisAvailable } from "./lib/redis.js";
 import { reportIncident, resolveIncidentByDedupeKey } from "./modules/incidents/service.js";
+import { ZodError } from "zod";
+import { validationFailure } from "./lib/validation.js";
 
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
@@ -74,7 +80,47 @@ async function main() {
     }
   });
 
-  app.get("/ws", { websocket: true }, (socket) => addClient(socket));
+  // Normalize every JSON failure, including older routes that still return only
+  // `{ error }`. Validation routes can supply richer field-level issues; this
+  // hook guarantees the UI always has a reason, next action, and traceable ID.
+  app.addHook("onSend", async (req, reply, payload) => {
+    if (reply.statusCode < 400 || typeof payload !== "string") return payload;
+    const contentType = String(reply.getHeader("content-type") ?? "");
+    if (!contentType.includes("application/json")) return payload;
+    try {
+      const data = JSON.parse(payload) as Record<string, unknown>;
+      if (typeof data.error !== "string") return payload;
+      const action = reply.statusCode === 401
+        ? "Sign in again and retry."
+        : reply.statusCode === 403
+          ? "Use an account with the required role or ask an administrator."
+          : reply.statusCode === 404
+            ? "Refresh the page and verify that the item still exists."
+            : reply.statusCode === 409
+              ? "Review the conflicting system state, correct it, and retry."
+              : reply.statusCode >= 500
+                ? "Retry once, then open Activity and use the request reference to inspect the recorded error."
+                : "Correct the invalid values listed in the response and retry.";
+      return JSON.stringify({
+        ...data,
+        reason: typeof data.reason === "string" ? data.reason : data.error,
+        action: typeof data.action === "string" ? data.action : action,
+        requestId: typeof data.requestId === "string" ? data.requestId : req.id,
+      });
+    } catch {
+      return payload;
+    }
+  });
+
+  app.get("/ws", {
+    websocket: true,
+    preHandler: [async (req, reply) => {
+      const protocols = String(req.headers["sec-websocket-protocol"] ?? "").split(",").map((value) => value.trim());
+      const token = protocols.find((value) => value.split(".").length === 3);
+      if (token) req.headers.authorization = `Bearer ${token}`;
+      await app.authenticate(req, reply);
+    }],
+  }, (socket) => addClient(socket));
 
   await app.register(authRoutes);
   await app.register(systemRoutes);
@@ -90,14 +136,36 @@ async function main() {
   await app.register(sentimentRoutes);
   await app.register(journalRoutes);
   await app.register(scalpingRoutes);
+  await app.register(assistantRoutes);
+  await app.register(memoryRoutes);
+  await app.register(intelligenceRoutes);
+  await app.register(mcpRoutes);
 
-  app.setErrorHandler(async (err: Error & { statusCode?: number }, _req, reply) => {
-    await logError("api", err.message, { stack: err.stack?.slice(0, 1000) });
-    // Never leak internals to clients.
-    reply.code(err.statusCode ?? 500).send({ error: err.statusCode ? err.message : "internal error" });
+  app.setErrorHandler(async (err: Error & { statusCode?: number }, req, reply) => {
+    const requestId = req.id;
+    await logError("api", err.message, { requestId, method: req.method, url: req.url, stack: err.stack?.slice(0, 1000) });
+    if (err instanceof ZodError) {
+      return reply.code(400).send({ ...validationFailure("Invalid request", err), requestId });
+    }
+    if (err.statusCode && err.statusCode < 500) {
+      return reply.code(err.statusCode).send({
+        error: err.message,
+        reason: err.message,
+        action: err.statusCode === 401 ? "Sign in again and retry." : err.statusCode === 403 ? "Use an account with the required role or ask an administrator." : "Correct the request and retry.",
+        requestId,
+      });
+    }
+    // Do not expose stack traces, credentials, or broker internals. The request
+    // reference links the full server-side ErrorLog to the UI-visible failure.
+    reply.code(500).send({
+      error: "Internal server error",
+      reason: "The server could not complete this operation. Full technical details were recorded securely.",
+      action: "Retry once. If it fails again, open Activity and use this reference when reviewing the error log.",
+      requestId,
+    });
   });
 
-  const bot = createTelegramBot();
+  const bot = await createTelegramBot();
   if (bot) {
     bot.start().catch((err) => logger.error({ err: String(err) }, "telegram bot failed to start"));
   }
@@ -129,7 +197,7 @@ async function main() {
 
   await app.listen({ port: config.PORT, host: "0.0.0.0" });
   logger.info(
-    { port: config.PORT, mock: config.MT5_MOCK },
+    { port: config.PORT },
     "backend started",
   );
 }

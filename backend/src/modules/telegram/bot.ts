@@ -1,5 +1,4 @@
-import { Bot, type Context } from "grammy";
-import { config } from "../../config.js";
+import { Bot, InlineKeyboard, type Context } from "grammy";
 import { prisma } from "../../lib/prisma.js";
 import { audit } from "../../lib/audit.js";
 import { logger } from "../../lib/logger.js";
@@ -10,6 +9,9 @@ import { decideTrade, emergencyStopAll } from "../trading/service.js";
 import { copySourceTrade } from "../copy/service.js";
 import { latestNews } from "../news/service.js";
 import { requireTwoFactor } from "../auth/service.js";
+import { getOperationalConfig } from "../system/operational-config.js";
+import { chatWithAssistant, getAssistantConfig } from "../assistant/service.js";
+import { replyTelegram, withTelegramTyping } from "./format.js";
 
 /**
  * Telegram connector. Security model:
@@ -23,10 +25,81 @@ import { requireTwoFactor } from "../auth/service.js";
 
 const pendingConfirm = new Map<string, { action: string; arg?: string; expires: number }>();
 
+export const TELEGRAM_COMMANDS = [
+  { command: "menu", description: "Open the trading control menu" },
+  { command: "ask", description: "Ask the system assistant" },
+  { command: "status", description: "Account and bot status" },
+  { command: "open_trades", description: "View open positions" },
+  { command: "profit", description: "View today's profit and loss" },
+  { command: "news", description: "View upcoming market events" },
+  { command: "settings", description: "View current risk settings" },
+  { command: "pause_bot", description: "Pause new trade entries" },
+  { command: "resume_bot", description: "Resume the trading bot" },
+  { command: "emergency_stop", description: "Stop bot and prepare to close positions" },
+  { command: "help", description: "Show command help" },
+] as const;
+
+function mainMenuKeyboard() {
+  return new InlineKeyboard()
+    .text("📊 Status", "menu:status").text("📈 Open trades", "menu:open_trades").row()
+    .text("💰 Profit & loss", "menu:profit").text("🗓 Market news", "menu:news").row()
+    .text("⚙️ Risk settings", "menu:settings").text("🤖 Ask AI", "menu:assistant").row()
+    .text("🎛 Bot controls", "menu:controls").text("❓ Help", "menu:help");
+}
+
+function controlsKeyboard() {
+  return new InlineKeyboard()
+    .text("⏸ Pause", "control:pause").text("▶️ Resume", "control:resume").row()
+    .text("🛑 Emergency stop", "control:emergency").row()
+    .text("⬅️ Main menu", "menu:home");
+}
+
+const helpText = `# MT5 AI Bot commands
+
+**Account and analysis**
+- /status — bot, account and margin status
+- /open_trades — live positions and floating P/L
+- /profit — today's closed and floating P/L
+- /news — upcoming market-moving events
+- /settings — active risk controls
+
+**AI assistant**
+- /ask followed by your question
+- Or simply send a normal message in this private chat
+
+**Bot controls**
+- /pause_bot — prevent new trades
+- /resume_bot — resume trading
+- /emergency_stop — prepare a protected emergency stop
+
+Use /menu at any time to open the command panel.`;
+
+async function completeTelegramLink(ctx: Context, code: string) {
+  const tgId = String(ctx.from?.id ?? "");
+  if (!tgId) return replyTelegram(ctx, "Telegram could not identify this account.");
+  const allow = (await getOperationalConfig()).telegramAllowedIds;
+  if (allow.length && !allow.includes(tgId)) return replyTelegram(ctx, "This Telegram account is not in the allowed-ID list configured in Settings.");
+  const pending = await prisma.telegramUser.findFirst({ where: { linkCode: code, verified: false } });
+  if (!pending) return replyTelegram(ctx, "Invalid or expired link code. Generate a fresh code in Settings → Connectors.");
+  const existing = await prisma.telegramUser.findUnique({ where: { telegramId: tgId } });
+  if (existing && existing.userId !== pending.userId) return replyTelegram(ctx, "This Telegram account is already linked to another application user.");
+  if (existing) {
+    await prisma.$transaction([
+      prisma.telegramUser.delete({ where: { id: pending.id } }),
+      prisma.telegramUser.update({ where: { id: existing.id }, data: { chatId: String(ctx.chat?.id), verified: true, linkCode: null } }),
+    ]);
+  } else {
+    await prisma.telegramUser.update({ where: { id: pending.id }, data: { telegramId: tgId, chatId: String(ctx.chat?.id), verified: true, linkCode: null } });
+  }
+  await prisma.telegramUser.deleteMany({ where: { userId: pending.userId, verified: false } });
+  await audit({ actor: `telegram:${tgId}`, userId: pending.userId, category: "telegram", action: "account_linked" });
+  return replyTelegram(ctx, "# ✅ Linked and verified\n\nYour account is connected. Open /menu to view the command panel, or send a question to the AI assistant.", { reply_markup: mainMenuKeyboard() });
+}
+
 async function linkedUser(ctx: Context) {
   const tgId = String(ctx.from?.id ?? "");
   if (!tgId) return null;
-  const allow = config.TELEGRAM_ALLOWED_IDS.split(",").map((s) => s.trim()).filter(Boolean);
+  const allow = (await getOperationalConfig()).telegramAllowedIds;
   if (allow.length && !allow.includes(tgId)) return null;
   const link = await prisma.telegramUser.findUnique({ where: { telegramId: tgId }, include: { user: true } });
   return link?.verified ? link : null;
@@ -39,112 +112,157 @@ async function guard(ctx: Context, command: string) {
     category: "telegram", action: "command", detail: { command, authorized: !!link },
   });
   if (!link) {
-    await ctx.reply("Unauthorized. Link your account first: generate a code in the web dashboard, then send /link <code>.");
+    await replyTelegram(ctx, "**Unauthorized.** Link your account first: generate a code in the web dashboard, then send `/link <code>`. ");
     return null;
   }
   return link;
 }
 
-export function createTelegramBot(): Bot | null {
-  if (!config.TELEGRAM_BOT_TOKEN) {
-    logger.warn("TELEGRAM_BOT_TOKEN not set — telegram connector disabled");
+export async function createTelegramBot(): Promise<Bot | null> {
+  const settings = await getOperationalConfig();
+  if (!settings.telegramBotToken) {
+    logger.warn("Telegram bot token not configured in Settings — telegram connector disabled");
     return null;
   }
-  const bot = new Bot(config.TELEGRAM_BOT_TOKEN);
+  const bot = new Bot(settings.telegramBotToken);
 
-  bot.command("start", (ctx) =>
-    ctx.reply("MT5 AI Trading Bot.\nLink your account with /link <code> (code from the dashboard).\nThen try /status."));
+  await Promise.all([
+    bot.api.setMyCommands([...TELEGRAM_COMMANDS]),
+    bot.api.setChatMenuButton({ menu_button: { type: "commands" } }),
+  ]).catch((error) => logger.warn({ error: String(error) }, "telegram command menu could not be configured"));
+
+  async function showMenu(ctx: Context) {
+    const link = await guard(ctx, "/menu"); if (!link) return;
+    await replyTelegram(ctx, "# Trading command center\n\nChoose an area below. Read-only information opens immediately; trading controls remain protected and audited.", { reply_markup: mainMenuKeyboard() });
+  }
+
+  async function showStatus(ctx: Context) {
+    const link = await guard(ctx, "/status"); if (!link) return;
+    await withTelegramTyping(ctx, async () => {
+      const [state, acc, positions] = await Promise.all([getBotState(), mt5.accountInfo(), mt5.positions()]);
+      const pnl = positions.reduce((a, p) => a + p.profit, 0);
+      await replyTelegram(ctx,
+        `# 🤖 System status\n\n` +
+        `**Bot:** ${state.status}\n**Mode:** ${state.mode}\n**Environment:** ${state.demoMode ? "DEMO" : "LIVE"}\n\n` +
+        `## Account\n- Balance: **${acc.balance.toFixed(2)} ${acc.currency}**\n- Equity: **${acc.equity.toFixed(2)} ${acc.currency}**\n- Margin level: **${acc.margin_level.toFixed(1)}%**\n- Open positions: **${positions.length}**\n- Floating P/L: **${pnl.toFixed(2)} ${acc.currency}**`,
+        { reply_markup: mainMenuKeyboard() });
+    });
+  }
+
+  async function showOpenTrades(ctx: Context) {
+    const link = await guard(ctx, "/open_trades"); if (!link) return;
+    await withTelegramTyping(ctx, async () => {
+      const positions = await mt5.positions();
+      if (!positions.length) return replyTelegram(ctx, "# 📈 Open trades\n\nNo open trades.", { reply_markup: mainMenuKeyboard() });
+      await replyTelegram(ctx, `# 📈 Open trades (${positions.length})\n\n${positions.map((p) =>
+        `- **${p.type.toUpperCase()} ${p.symbol}** · ${p.volume} lots\n  Ticket: \`${p.ticket}\` · Entry: ${p.price_open} · P/L: **${p.profit.toFixed(2)}**`).join("\n")}`, { reply_markup: mainMenuKeyboard() });
+    });
+  }
+
+  async function showProfit(ctx: Context) {
+    const link = await guard(ctx, "/profit"); if (!link) return;
+    await withTelegramTyping(ctx, async () => {
+      const dayStart = new Date(); dayStart.setHours(0, 0, 0, 0);
+      const accountId = await currentAccountId(link.userId);
+      const [agg, positions] = await Promise.all([
+        prisma.trade.aggregate({
+          _sum: { profit: true },
+          where: { userId: link.userId, closedAt: { gte: dayStart }, ...(accountId ? { accountId } : {}) },
+        }),
+        mt5.positions(),
+      ]);
+      const floating = positions.reduce((a, p) => a + p.profit, 0);
+      await replyTelegram(ctx, `# 💰 Today's profit and loss\n\n- Closed P/L: **${(agg._sum.profit ?? 0).toFixed(2)}**\n- Floating P/L: **${floating.toFixed(2)}**\n- Open positions: **${positions.length}**`, { reply_markup: mainMenuKeyboard() });
+    });
+  }
+
+  async function showNews(ctx: Context) {
+    const link = await guard(ctx, "/news"); if (!link) return;
+    await withTelegramTyping(ctx, async () => {
+      const events = await latestNews(8);
+      if (!events.length) return replyTelegram(ctx, "# 🗓 Market news\n\nNo notable events in the next 24 hours.", { reply_markup: mainMenuKeyboard() });
+      await replyTelegram(ctx, `# 🗓 Upcoming market events\n\n${events.map((event) =>
+        `- ${event.impact === "HIGH" ? "🔴" : event.impact === "MEDIUM" ? "🟠" : "⚪"} **${event.currency ?? "Market"}** · ${event.eventTime.toISOString().slice(5, 16)}\n  ${event.title}`).join("\n")}`, { reply_markup: mainMenuKeyboard() });
+    });
+  }
+
+  async function pauseBot(ctx: Context) {
+    const link = await guard(ctx, "/pause_bot"); if (!link) return;
+    await setBotState({ status: "paused" }, `telegram:${ctx.from?.id}`);
+    await replyTelegram(ctx, "# ⏸ Bot paused\n\nNo new trades will open. Use /resume_bot to continue.", { reply_markup: controlsKeyboard() });
+  }
+
+  async function resumeBot(ctx: Context) {
+    const link = await guard(ctx, "/resume_bot"); if (!link) return;
+    const state = await getBotState();
+    if (state.emergencyStop) return replyTelegram(ctx, "**Emergency stop is active.** Clear it from the dashboard safety controls first.", { reply_markup: controlsKeyboard() });
+    await setBotState({ status: "running" }, `telegram:${ctx.from?.id}`);
+    await replyTelegram(ctx, "# ▶️ Bot resumed\n\nThe bot may evaluate and open new trades according to its current mode and safety rules.", { reply_markup: controlsKeyboard() });
+  }
+
+  async function prepareEmergencyStop(ctx: Context) {
+    const link = await guard(ctx, "/emergency_stop"); if (!link) return;
+    pendingConfirm.set(String(ctx.from?.id), { action: "emergency_stop", expires: Date.now() + 60_000 });
+    const confirm = new InlineKeyboard().text("🛑 Confirm emergency stop", "confirm:emergency").row().text("Cancel", "menu:controls");
+    await replyTelegram(ctx, "# ⚠️ Emergency stop confirmation\n\nThis halts the bot **and closes every open position**. Confirm within 60 seconds to proceed.", { reply_markup: confirm });
+  }
+
+  async function confirmPending(ctx: Context) {
+    const link = await guard(ctx, "/confirm"); if (!link) return;
+    const pending = pendingConfirm.get(String(ctx.from?.id));
+    if (!pending || pending.expires < Date.now()) return replyTelegram(ctx, "Nothing to confirm, or the confirmation expired.", { reply_markup: controlsKeyboard() });
+    pendingConfirm.delete(String(ctx.from?.id));
+    if (pending.action === "emergency_stop") {
+      await withTelegramTyping(ctx, async () => {
+        const closed = await emergencyStopAll(`telegram:${ctx.from?.id}`, link.userId);
+        await replyTelegram(ctx, `# 🛑 Emergency stop active\n\nClosed **${closed.length}** position(s).`, { reply_markup: controlsKeyboard() });
+      });
+    }
+  }
+
+  async function showSettings(ctx: Context) {
+    const link = await guard(ctx, "/settings"); if (!link) return;
+    const rs = await prisma.riskSettings.findUnique({ where: { userId: link.userId } });
+    if (!rs) return replyTelegram(ctx, "No risk settings were found.", { reply_markup: mainMenuKeyboard() });
+    await replyTelegram(ctx,
+      `# ⚙️ Active risk settings\n\n` +
+      `- Risk per trade: **${rs.maxRiskPerTradePct}%**\n- Daily loss cap: **${rs.maxDailyLossPct}%**\n` +
+      `- Maximum open trades: **${rs.maxOpenTrades}**\n- Maximum lot: **${rs.maxLotSize}**\n` +
+      `- Minimum R:R: **${rs.minRiskReward}**\n- News limit: **${rs.newsRiskLimit}**\n- Stop loss required: **${rs.requireStopLoss ? "Yes" : "No"}**\n\nChange settings from the dashboard or ask the AI assistant to prepare a confirmed change.`,
+      { reply_markup: mainMenuKeyboard() });
+  }
+
+  bot.command("start", async (ctx) => {
+    const payload = (ctx.match ?? "").trim();
+    if (payload.startsWith("link_")) return completeTelegramLink(ctx, payload.slice(5));
+    const linked = await linkedUser(ctx);
+    if (linked) return replyTelegram(ctx, "# MT5 AI Trading Bot\n\nYour account is linked. Use the panel below or send a normal message to the assistant.", { reply_markup: mainMenuKeyboard() });
+    return replyTelegram(ctx, "# MT5 AI Trading Bot\n\nLink your account from **Settings → Connectors**, then open /menu or send `/ask <question>`. ");
+  });
 
   bot.command("link", async (ctx) => {
     const code = ctx.match?.trim();
-    const tgId = String(ctx.from?.id ?? "");
-    if (!code) return ctx.reply("Usage: /link <code>");
-    const pending = await prisma.telegramUser.findFirst({ where: { linkCode: code, verified: false } });
-    if (!pending) return ctx.reply("Invalid or expired link code.");
-    await prisma.telegramUser.update({
-      where: { id: pending.id },
-      data: { telegramId: tgId, chatId: String(ctx.chat?.id), verified: true, linkCode: null },
-    });
-    await audit({ actor: `telegram:${tgId}`, userId: pending.userId, category: "telegram", action: "account_linked" });
-    return ctx.reply("✅ Linked and verified. Try /status.");
+    if (!code) return replyTelegram(ctx, "Usage: `/link <code>`");
+    return completeTelegramLink(ctx, code);
   });
 
-  bot.command("status", async (ctx) => {
-    const link = await guard(ctx, "/status"); if (!link) return;
-    const [state, acc, positions] = await Promise.all([getBotState(), mt5.accountInfo(), mt5.positions()]);
-    const pnl = positions.reduce((a, p) => a + p.profit, 0);
-    await ctx.reply(
-      `🤖 Bot: ${state.status} | mode: ${state.mode} | ${state.demoMode ? "DEMO" : "LIVE"}\n` +
-      `💰 Balance: ${acc.balance.toFixed(2)} ${acc.currency} | Equity: ${acc.equity.toFixed(2)}\n` +
-      `📊 Margin level: ${acc.margin_level.toFixed(1)}% | Open: ${positions.length} | Floating P/L: ${pnl.toFixed(2)}`);
-  });
-
-  bot.command("open_trades", async (ctx) => {
-    const link = await guard(ctx, "/open_trades"); if (!link) return;
-    const positions = await mt5.positions();
-    if (!positions.length) return ctx.reply("No open trades.");
-    await ctx.reply(positions.map((p) =>
-      `#${p.ticket} ${p.type.toUpperCase()} ${p.symbol} ${p.volume} lots @ ${p.price_open} | P/L ${p.profit.toFixed(2)}`).join("\n"));
-  });
-
-  bot.command("profit", async (ctx) => {
-    const link = await guard(ctx, "/profit"); if (!link) return;
-    const dayStart = new Date(); dayStart.setHours(0, 0, 0, 0);
-    // Per-account: today's P/L for the account the terminal is on.
-    const accountId = await currentAccountId(link.userId);
-    const agg = await prisma.trade.aggregate({
-      _sum: { profit: true },
-      where: { userId: link.userId, closedAt: { gte: dayStart }, ...(accountId ? { accountId } : {}) },
-    });
-    const positions = await mt5.positions();
-    const floating = positions.reduce((a, p) => a + p.profit, 0);
-    await ctx.reply(`Today's closed P/L: ${(agg._sum.profit ?? 0).toFixed(2)}\nFloating P/L: ${floating.toFixed(2)}`);
-  });
-
-  bot.command("news", async (ctx) => {
-    const link = await guard(ctx, "/news"); if (!link) return;
-    const events = await latestNews(8);
-    if (!events.length) return ctx.reply("No notable events in the next 24h.");
-    await ctx.reply(events.map((e) => `${e.impact === "HIGH" ? "🔴" : e.impact === "MEDIUM" ? "🟠" : "⚪"} ${e.eventTime.toISOString().slice(5, 16)} ${e.currency ?? ""} ${e.title}`).join("\n"));
-  });
-
-  bot.command("pause_bot", async (ctx) => {
-    const link = await guard(ctx, "/pause_bot"); if (!link) return;
-    await setBotState({ status: "paused" }, `telegram:${ctx.from?.id}`);
-    await ctx.reply("⏸ Bot paused. No new trades will open. /resume_bot to continue.");
-  });
-
-  bot.command("resume_bot", async (ctx) => {
-    const link = await guard(ctx, "/resume_bot"); if (!link) return;
-    const state = await getBotState();
-    if (state.emergencyStop) return ctx.reply("Emergency stop is active — clear it from the dashboard first.");
-    await setBotState({ status: "running" }, `telegram:${ctx.from?.id}`);
-    await ctx.reply("▶️ Bot resumed.");
-  });
-
-  bot.command("emergency_stop", async (ctx) => {
-    const link = await guard(ctx, "/emergency_stop"); if (!link) return;
-    pendingConfirm.set(String(ctx.from?.id), { action: "emergency_stop", expires: Date.now() + 60_000 });
-    await ctx.reply("⚠️ This halts the bot AND closes ALL open positions.\nSend /confirm within 60s to proceed.");
-  });
-
-  bot.command("confirm", async (ctx) => {
-    const link = await guard(ctx, "/confirm"); if (!link) return;
-    const pending = pendingConfirm.get(String(ctx.from?.id));
-    if (!pending || pending.expires < Date.now()) return ctx.reply("Nothing to confirm (or it expired).");
-    pendingConfirm.delete(String(ctx.from?.id));
-    if (pending.action === "emergency_stop") {
-      const closed = await emergencyStopAll(`telegram:${ctx.from?.id}`, link.userId);
-      return ctx.reply(`🛑 EMERGENCY STOP active. Closed ${closed.length} position(s).`);
-    }
-  });
+  bot.command("menu", showMenu);
+  bot.command("help", async (ctx) => { const link = await guard(ctx, "/help"); if (link) await replyTelegram(ctx, helpText, { reply_markup: mainMenuKeyboard() }); });
+  bot.command("status", showStatus);
+  bot.command("open_trades", showOpenTrades);
+  bot.command("profit", showProfit);
+  bot.command("news", showNews);
+  bot.command("pause_bot", pauseBot);
+  bot.command("resume_bot", resumeBot);
+  bot.command("emergency_stop", prepareEmergencyStop);
+  bot.command("confirm", confirmPending);
 
   // /approve_trade <id> [lots] [totp] — choose your size; TOTP required in live mode.
   // 6-digit tokens are treated as 2FA codes, anything else numeric as lot size.
   bot.command("approve_trade", async (ctx) => {
     const link = await guard(ctx, "/approve_trade"); if (!link) return;
     const [tradeId, ...rest] = (ctx.match ?? "").trim().split(/\s+/).filter(Boolean);
-    if (!tradeId) return ctx.reply("Usage: /approve_trade <trade_id> [lots] [2fa_code]\nExample: /approve_trade abc123 0.05");
+    if (!tradeId) return replyTelegram(ctx, "Usage: `/approve_trade <trade_id> [lots] [2fa_code]`\n\nExample: `/approve_trade abc123 0.05`");
     let lots: number | undefined;
     let totp: string | undefined;
     for (const arg of rest) {
@@ -152,38 +270,86 @@ export function createTelegramBot(): Bot | null {
       else if (!Number.isNaN(Number(arg))) lots = Number(arg);
     }
     const state = await getBotState();
+    let twoFactorVerified = false;
     if (!state.demoMode || state.liveTradingEnabled) {
-      const ok = await requireTwoFactor(link.userId, totp);
-      if (!ok) return ctx.reply("Live mode: append a valid 2FA code — /approve_trade <id> [lots] <code>");
+      twoFactorVerified = await requireTwoFactor(link.userId, totp);
+      if (!twoFactorVerified) return replyTelegram(ctx, "**Live mode requires 2FA.**\n\nUse `/approve_trade <id> [lots] <code>`. ");
     }
-    const result = await decideTrade(tradeId, true, `telegram:${ctx.from?.id}`, "TELEGRAM", { lots });
-    await ctx.reply(result.message);
+    const result = await decideTrade(tradeId, true, `telegram:${ctx.from?.id}`, "TELEGRAM", { actorUserId: link.userId, lots, twoFactorVerified });
+    await replyTelegram(ctx, result.message);
   });
 
   bot.command("reject_trade", async (ctx) => {
     const link = await guard(ctx, "/reject_trade"); if (!link) return;
     const tradeId = (ctx.match ?? "").trim();
-    if (!tradeId) return ctx.reply("Usage: /reject_trade <trade_id>");
-    const result = await decideTrade(tradeId, false, `telegram:${ctx.from?.id}`, "TELEGRAM");
-    await ctx.reply(result.message);
+    if (!tradeId) return replyTelegram(ctx, "Usage: `/reject_trade <trade_id>`");
+    const result = await decideTrade(tradeId, false, `telegram:${ctx.from?.id}`, "TELEGRAM", { actorUserId: link.userId });
+    await replyTelegram(ctx, result.message);
   });
 
   bot.command("copy_trader", async (ctx) => {
     const link = await guard(ctx, "/copy_trader"); if (!link) return;
     const traders = await prisma.copyTrader.findMany({ where: { userId: link.userId } });
-    if (!traders.length) return ctx.reply("No copy traders configured. Add them in the dashboard.");
-    await ctx.reply(traders.map((t) => `${t.active ? "🟢" : "⚪"} ${t.name} — risk score ${t.riskScore}/100`).join("\n"));
+    if (!traders.length) return replyTelegram(ctx, "No copy traders are configured. Add them from the dashboard.");
+    await replyTelegram(ctx, `# Copy traders\n\n${traders.map((t) => `- ${t.active ? "🟢" : "⚪"} **${t.name}** — risk score ${t.riskScore}/100`).join("\n")}`);
   });
 
-  bot.command("settings", async (ctx) => {
-    const link = await guard(ctx, "/settings"); if (!link) return;
-    const rs = await prisma.riskSettings.findUnique({ where: { userId: link.userId } });
-    if (!rs) return ctx.reply("No risk settings found.");
-    await ctx.reply(
-      `Risk/trade: ${rs.maxRiskPerTradePct}% | Daily loss cap: ${rs.maxDailyLossPct}%\n` +
-      `Max open: ${rs.maxOpenTrades} | Max lot: ${rs.maxLotSize} | Min R:R ${rs.minRiskReward}\n` +
-      `News limit: ${rs.newsRiskLimit} | SL required: ${rs.requireStopLoss}\n` +
-      `(Change settings in the web dashboard.)`);
+  bot.command("settings", showSettings);
+
+  bot.callbackQuery(/^(menu|control|confirm):/, async (ctx) => {
+    await ctx.answerCallbackQuery().catch(() => undefined);
+    switch (ctx.callbackQuery.data) {
+      case "menu:home": return showMenu(ctx);
+      case "menu:status": return showStatus(ctx);
+      case "menu:open_trades": return showOpenTrades(ctx);
+      case "menu:profit": return showProfit(ctx);
+      case "menu:news": return showNews(ctx);
+      case "menu:settings": return showSettings(ctx);
+      case "menu:assistant": {
+        const link = await guard(ctx, "menu:assistant");
+        if (link) await replyTelegram(ctx, "# 🤖 AI assistant\n\nSend any normal message, or use `/ask` followed by your question.\n\nExamples:\n- Why has the bot not taken a trade?\n- Explain my current risk settings\n- Summarize today's activity", { reply_markup: mainMenuKeyboard() });
+        return;
+      }
+      case "menu:controls": {
+        const link = await guard(ctx, "menu:controls");
+        if (link) await replyTelegram(ctx, "# 🎛 Bot controls\n\nChoose an action. Every control is authenticated and audited.", { reply_markup: controlsKeyboard() });
+        return;
+      }
+      case "menu:help": {
+        const link = await guard(ctx, "menu:help");
+        if (link) await replyTelegram(ctx, helpText, { reply_markup: mainMenuKeyboard() });
+        return;
+      }
+      case "control:pause": return pauseBot(ctx);
+      case "control:resume": return resumeBot(ctx);
+      case "control:emergency": return prepareEmergencyStop(ctx);
+      case "confirm:emergency": return confirmPending(ctx);
+    }
+  });
+
+  bot.command("ask", async (ctx) => {
+    const link = await guard(ctx, "/ask"); if (!link) return;
+    const message = (ctx.match ?? "").trim();
+    if (!message) return replyTelegram(ctx, "Usage: `/ask <question or requested change>`");
+    const settings = await getAssistantConfig();
+    if (!settings.telegramEnabled) return replyTelegram(ctx, "Assistant access from Telegram is disabled in Settings.");
+    return withTelegramTyping(ctx, async () => {
+      const result = await chatWithAssistant({ userId: link.userId, actor: `telegram:${ctx.from?.id}`, role: link.user.role, message, channel: "telegram" });
+      const response = result.confirmation
+        ? `${result.message}\n\n**Confirmation required**\nReply with \`/assistant_confirm ${result.confirmation.token}\` within 5 minutes.`
+        : result.message;
+      await replyTelegram(ctx, response, { reply_markup: mainMenuKeyboard() });
+    });
+  });
+
+  bot.command("assistant_confirm", async (ctx) => {
+    const link = await guard(ctx, "/assistant_confirm"); if (!link) return;
+    const token = (ctx.match ?? "").trim();
+    if (!token) return replyTelegram(ctx, "Usage: `/assistant_confirm <token>`");
+    return withTelegramTyping(ctx, async () => {
+      const result = await chatWithAssistant({ userId: link.userId, actor: `telegram:${ctx.from?.id}`, role: link.user.role, confirmToken: token, channel: "telegram" });
+      await replyTelegram(ctx, result.message, { reply_markup: mainMenuKeyboard() });
+    });
   });
 
   /**
@@ -202,7 +368,17 @@ export function createTelegramBot(): Bot | null {
 
     const { looksLikeSignal, parseSignal } = await import("../copy/signal-parser.js");
     if (!looksLikeSignal(text)) {
-      if (isPrivate) await ctx.reply("That doesn't look like a trade signal. Forward a message like: BUY EURUSD SL 1.0800 TP 1.0950");
+      if (isPrivate) {
+        const assistant = await getAssistantConfig();
+        if (!assistant.telegramEnabled) return replyTelegram(ctx, "That does not look like a trade signal, and assistant access from Telegram is disabled in Settings.");
+        await withTelegramTyping(ctx, async () => {
+          const result = await chatWithAssistant({ userId: link.userId, actor: `telegram:${ctx.from?.id}`, role: link.user.role, message: text, channel: "telegram" });
+          const response = result.confirmation
+            ? `${result.message}\n\n**Confirmation required**\nReply with \`/assistant_confirm ${result.confirmation.token}\` within 5 minutes.`
+            : result.message;
+          await replyTelegram(ctx, response, { reply_markup: mainMenuKeyboard() });
+        });
+      }
       return;
     }
     const signal = await parseSignal(text);
@@ -211,7 +387,7 @@ export function createTelegramBot(): Bot | null {
       action: "signal_received", detail: { text: text.slice(0, 300), parsed: signal as unknown as Record<string, unknown> },
     });
     if (!signal) {
-      if (isPrivate) await ctx.reply("I couldn't extract a clear signal (need at least a symbol and buy/sell).");
+      if (isPrivate) await replyTelegram(ctx, "I could not extract a clear signal. Include at least a **symbol** and **buy/sell direction**.");
       return;
     }
 
@@ -238,14 +414,12 @@ export function createTelegramBot(): Bot | null {
           copyRules: { stopAfterLossStreak: 5, maxSourceLot: 1 } as object,
         },
       });
-      await ctx.reply(
-        `📡 New trader profile created: "${traderName}" (from this signal's origin).\n` +
-        `It starts INACTIVE for safety — review and press Copy in the dashboard's Copy Trading tab, then forward signals again.`,
-      );
+      await replyTelegram(ctx,
+        `# 📡 New trader profile\n\n**${traderName}** was created from this signal's origin.\n\nIt starts **inactive** for safety. Review it and press Copy in the dashboard's Copy Trading tab, then forward the signal again.`);
       return;
     }
     if (!trader.active) {
-      await ctx.reply(`"${trader.name}" is not active. Activate it in the dashboard's Copy Trading tab to copy this signal.`);
+      await replyTelegram(ctx, `**${trader.name}** is not active. Activate it in the dashboard's Copy Trading tab to copy this signal.`);
       return;
     }
 
@@ -255,14 +429,13 @@ export function createTelegramBot(): Bot | null {
       sl: signal.sl, tp: signal.tp, ref: `telegram:${ctx.message.message_id}`,
     });
     if (trade && trade.status === "EXECUTED") {
-      await ctx.reply(
-        `✅ Copied ${trader.name}: ${signal.direction.toUpperCase()} ${signal.symbol} ${trade.lots} lots @ ${trade.entryPrice}` +
-        `${trade.stopLoss ? ` | SL ${trade.stopLoss}` : ""}${trade.takeProfit ? ` | TP ${trade.takeProfit}` : ""} (ticket ${trade.mt5Ticket})`,
-      );
+      await replyTelegram(ctx,
+        `# ✅ Signal copied\n\n- Trader: **${trader.name}**\n- Trade: **${signal.direction.toUpperCase()} ${signal.symbol}**\n- Size: **${trade.lots} lots**\n- Entry: **${trade.entryPrice}**` +
+        `${trade.stopLoss ? `\n- Stop loss: **${trade.stopLoss}**` : ""}${trade.takeProfit ? `\n- Take profit: **${trade.takeProfit}**` : ""}\n- Ticket: \`${trade.mt5Ticket}\``);
     } else if (trade) {
-      await ctx.reply(`Copy attempt recorded but not executed (status: ${trade.status}). Check the dashboard for details.`);
+      await replyTelegram(ctx, `Copy attempt recorded but not executed.\n\nStatus: **${trade.status}**\n\nCheck the dashboard for details.`);
     } else {
-      await ctx.reply(`❌ Signal rejected by copy rules or the risk engine — see the Activity tab for the exact reason.`);
+      await replyTelegram(ctx, "# ❌ Signal rejected\n\nCopy rules or the risk engine rejected this signal. Open the Activity tab for the exact reason.");
     }
   });
 

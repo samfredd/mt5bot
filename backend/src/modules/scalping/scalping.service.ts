@@ -4,14 +4,15 @@ import { audit, logError } from "../../lib/audit.js";
 import { mt5, type Position } from "../mt5/client.js";
 import { detectSession } from "../analysis/engine.js";
 import { assessNewsRisk } from "../news/service.js";
-import { executeTrade } from "../trading/service.js";
-import type { TradeProposal } from "../risk/engine.js";
+import { buildRiskContext, executeTrade } from "../trading/service.js";
+import { validateTrade, type TradeProposal } from "../risk/engine.js";
 import { fallbackTradingSpec, moneyForPriceMove, priceDistanceFromPoints, type TradingInstrumentSpec } from "../risk/instruments.js";
 import { operationalTradingAvailable, getBotState } from "../system/state.js";
 import { marketKey } from "../trading/symbol-lock.js";
 import { notify } from "../notifications/service.js";
 import { broadcast } from "../ws/hub.js";
 import { getCachedPlan } from "./scalping.ai.js";
+import { getActiveProvider, PURE_LOGIC_PROVIDER } from "../ai/service.js";
 import { evaluateScalpingGate, profitTargetReached, scalpExitReason, sessionAllowed, type ScalpGateCheck } from "./scalping.risk.js";
 import { getScalpingConfig, getScalpingRisk, setScalpingStatus } from "./scalping.state.js";
 import {
@@ -26,14 +27,15 @@ import {
 import type { ScalpingConfig, ScalpingRiskConfig } from "./scalping.schema.js";
 
 /**
- * Scalping orchestration. Scalping owns its entry risk settings:
+ * Scalping orchestration. Scalping adds a strategy-specific risk layer before
+ * the platform's global risk engine:
  *
  *   Scalping Worker → scalping risk layer (evaluateScalpingGate)
+ *                   → global risk/live gates (validateTrade)
  *                   → MT5 bridge (executeTrade)
  *
- * The main strategy bot's global RiskSettings do not veto scalping entries.
- * System-level controls still apply: emergency stop, Redis/operational
- * availability, broker acceptance, and protective exits.
+ * Both layers must pass. Scalping settings may be stricter, but they never
+ * bypass account-wide exposure, loss, live-account, or certification gates.
  *
  * Scalping trades reuse the existing `Trade` model, tagged via
  * `explanation.source = "SCALPING_MODE"`, so the normal pipeline is untouched.
@@ -174,6 +176,7 @@ export function signedPointsMoved(pos: Pick<Position, "type" | "price_open" | "p
 
 interface ScalpCycleContext {
   user: User;
+  settings: NonNullable<Awaited<ReturnType<typeof prisma.riskSettings.findUnique>>>;
   config: ScalpingConfig;
   risk: ScalpingRiskConfig;
   account: Awaited<ReturnType<typeof mt5.accountInfo>>;
@@ -203,12 +206,14 @@ async function buildCycleContext(): Promise<ScalpCycleContext | { error: string 
   const user = await adminUser();
   if (!user) return { error: "no admin user" };
 
-  const [config, risk, state, redisOk] = await Promise.all([
+  const [config, risk, state, redisOk, settings] = await Promise.all([
     getScalpingConfig(),
     getScalpingRisk(),
     getBotState(),
     operationalTradingAvailable(),
+    prisma.riskSettings.findUnique({ where: { userId: user.id } }),
   ]);
+  if (!settings) return { error: "no global risk settings" };
   const account = await mt5.accountInfo();
   const positions = await mt5.positions();
 
@@ -234,7 +239,7 @@ async function buildCycleContext(): Promise<ScalpCycleContext | { error: string 
   ]);
 
   return {
-    user, config, risk, account, positions,
+    user, settings, config, risk, account, positions,
     emergencyStop: state.emergencyStop,
     redisOk,
     active,
@@ -281,9 +286,14 @@ export async function attemptScalpEntries(actor = "scalping:auto", options: { re
     blocked.push({ symbol: "*", reason: preflightBlock });
     return { opened, blocked, skipped };
   }
-  const entryConfig: ScalpingConfig = options.requireRunning === false
+  const configuredEntry: ScalpingConfig = options.requireRunning === false
     ? { ...ctx.config, status: "running", enabled: true }
     : ctx.config;
+  // The global AI selector takes precedence over the scalper's legacy local
+  // fire-control setting, so one Settings choice really controls the whole app.
+  const entryConfig: ScalpingConfig = (await getActiveProvider()) === PURE_LOGIC_PROVIDER
+    ? { ...configuredEntry, aiMode: "PURE_LOGIC", useAiFireControl: false }
+    : configuredEntry;
 
   const active = [...ctx.active]; // mutated as we open within this cycle
   const session = detectSession();
@@ -304,6 +314,11 @@ export async function attemptScalpEntries(actor = "scalping:auto", options: { re
       tick = await mt5.tick(symbol);
     } catch {
       skipped++;
+      continue;
+    }
+    const globalNews = await assessNewsRisk(symbol, ctx.settings).catch(() => null);
+    if (!globalNews) {
+      blocked.push({ symbol, reason: "global news/risk assessment unavailable" });
       continue;
     }
     const news = ctx.risk.pauseDuringNews
@@ -354,6 +369,35 @@ export async function attemptScalpEntries(actor = "scalping:auto", options: { re
       symbol, direction, lots, entry, stopLoss: stops.stopLoss, takeProfit: stops.takeProfit, instrumentSpec,
     };
 
+    // The scalping gate is additive. Re-run the platform-wide risk engine with
+    // fresh account/position state immediately before execution so a separate
+    // scalping toggle can never bypass live authorization or account-wide caps.
+    const globalRiskContext = await buildRiskContext(
+      ctx.user,
+      ctx.settings,
+      ctx.account,
+      tick.spread_points,
+      null,
+      session,
+      globalNews.action,
+      { proposal },
+    );
+    const globalRisk = validateTrade(proposal, globalRiskContext);
+    if (!globalRisk.ok) {
+      const failed = globalRisk.checks.filter((check) => !check.passed);
+      const reason = failed.map((check) => check.name).join(", ") || "global risk validation failed";
+      blocked.push({ symbol, reason: `global risk blocked: ${reason}` });
+      await audit({
+        actor,
+        userId: ctx.user.id,
+        category: "risk",
+        action: "scalp_global_risk_blocked",
+        detail: { symbol, failed },
+      });
+      continue;
+    }
+    proposal.lots = globalRisk.adjustedLots ?? proposal.lots;
+
     const explanation: ScalpExplanation = {
       source: SCALPING_SOURCE,
       strategyName: SCALPING_STRATEGY_NAME,
@@ -380,6 +424,7 @@ export async function attemptScalpEntries(actor = "scalping:auto", options: { re
         actor,
         expectedSpreadPoints: tick.spread_points,
         actualSpreadPoints: tick.spread_points,
+        maxEntriesPerMarket: ctx.risk.maxTradesPerSymbol,
       });
       opened.push({ symbol, direction, ticket: trade.mt5Ticket });
       active.push({ symbol, ticket: trade.mt5Ticket });

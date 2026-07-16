@@ -11,7 +11,7 @@ describe("web search gating", () => {
   it("is enabled when a key is present", () => {
     expect(shouldSearch("tvly-xxx")).toBe(true);
   });
-  it("webSearchConfigured returns a boolean reflecting current config", () => {
-    expect(typeof webSearchConfigured()).toBe("boolean");
+  it("webSearchConfigured returns a boolean reflecting current settings", async () => {
+    expect(typeof (await webSearchConfigured())).toBe("boolean");
   });
 });

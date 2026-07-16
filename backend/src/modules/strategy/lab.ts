@@ -13,6 +13,7 @@ import { latestNews } from "../news/service.js";
 import { webSearch, webSearchConfigured } from "../web/search.js";
 import { notify } from "../notifications/service.js";
 import { recordValidationRun } from "./validation-runs.js";
+import { randomUUID } from "node:crypto";
 
 /**
  * AI Strategy Lab — the AI is a hypothesis GENERATOR; the backtester is the
@@ -133,6 +134,54 @@ export interface LabRun {
   survivors: number;
 }
 
+export interface LabProgress {
+  runId: string;
+  status: "idle" | "running" | "completed" | "failed";
+  stage: "idle" | "context" | "generating" | "validating" | "recording" | "completed" | "failed";
+  percent: number;
+  message: string;
+  completedCandidates: number;
+  totalCandidates: number;
+  startedAt: string | null;
+  updatedAt: string;
+}
+
+const progressKey = (userId: string) => `strategy_lab:progress:${userId}`;
+
+async function persistLabProgress(userId: string, progress: LabProgress): Promise<void> {
+  await prisma.systemSetting.upsert({
+    where: { key: progressKey(userId) },
+    create: { key: progressKey(userId), value: progress as object },
+    update: { value: progress as object },
+  });
+}
+
+export async function lastLabProgress(userId: string): Promise<LabProgress> {
+  const row = await prisma.systemSetting.findUnique({ where: { key: progressKey(userId) } });
+  return (row?.value as LabProgress | undefined) ?? {
+    runId: "",
+    status: "idle",
+    stage: "idle",
+    percent: 0,
+    message: "No Strategy Lab run is active.",
+    completedCandidates: 0,
+    totalCandidates: 0,
+    startedAt: null,
+    updatedAt: new Date().toISOString(),
+  };
+}
+
+export async function failStrategyLabProgress(userId: string, error: unknown): Promise<void> {
+  const current = await lastLabProgress(userId);
+  await persistLabProgress(userId, {
+    ...current,
+    status: "failed",
+    stage: "failed",
+    message: `Strategy Lab failed: ${String(error).slice(0, 160)}`,
+    updatedAt: new Date().toISOString(),
+  });
+}
+
 /** Realistic spread (points) per instrument; falls back to a live tick. */
 async function spreadFor(symbol: string, live?: number): Promise<number> {
   if (symbol.toUpperCase().startsWith("XAU")) return 280;
@@ -163,15 +212,10 @@ async function buildContext(userId: string) {
   // Latest internet resources (only if a search key is configured).
   const web = (await webSearch("forex and gold market outlook this week EURUSD GBPUSD XAUUSD sentiment", 5))
     .map((r) => `${r.title}: ${r.snippet}`);
-  const recentRejected = (await prisma.validationRun.findMany({
-    where: { userId, status: { in: ["FAILED", "INVALID"] } },
-    orderBy: { createdAt: "desc" },
-    take: 12,
-  }).catch(() => [])).map((run) => ({
-    name: run.candidateName,
-    symbol: run.symbol,
-    reasons: Array.isArray(run.rejectionReasons) ? (run.rejectionReasons as string[]).slice(0, 3) : [],
-  }));
+  // Validation/holdout failures are deliberately not fed back into future
+  // hypothesis generation. Doing so would train on the supposed OOS set and
+  // invalidate every later claim of out-of-sample performance.
+  const recentRejected: RecentRejectedIdea[] = [];
   return { regimes, calendar, headlines, web, recentRejected };
 }
 
@@ -188,8 +232,6 @@ function buildPrompt(ctx: Awaited<ReturnType<typeof buildContext>>): string {
     "Upcoming calendar: " + (ctx.calendar.slice(0, 6).join("; ") || "none"),
     "Recent headlines: " + (ctx.headlines.slice(0, 6).join("; ") || "none"),
     "Latest web research: " + (ctx.web.slice(0, 5).join(" || ") || "none"),
-    "Recently rejected ideas: " + (ctx.recentRejected.map((r) => `${r.name} on ${r.symbol} (${r.reasons.join("; ").slice(0, 160)})`).join(" || ") || "none"),
-    "Do NOT repeat recently rejected symbol/style hypotheses unless the current regime has materially changed and your rationale states why.",
     "",
     "Respond ONLY with JSON: {\"ideas\":[{\"name\":string,\"rationale\":string,\"symbol\":string,\"style\":string,\"timeframe\":string,\"rsiOversold\":number,\"rsiOverbought\":number,\"regimeMaxAdx\":number,\"stopLossAtrMult\":number,\"takeProfitAtrMult\":number}]}",
     "rationale must reference the regime/news. Numbers optional where not relevant.",
@@ -266,9 +308,26 @@ function passes(wf: WalkForwardResult): boolean {
 }
 
 export async function runStrategyLab(trigger: "manual" | "schedule", userId: string): Promise<LabRun> {
+  let progress: LabProgress = {
+    runId: randomUUID(),
+    status: "running",
+    stage: "context",
+    percent: 2,
+    message: "Collecting market regimes, news, and recent validation history…",
+    completedCandidates: 0,
+    totalCandidates: 0,
+    startedAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  };
+  const report = async (patch: Partial<LabProgress>) => {
+    progress = { ...progress, ...patch, updatedAt: new Date().toISOString() };
+    await persistLabProgress(userId, progress).catch(() => undefined);
+  };
+  await report({});
   const ctx = await buildContext(userId);
   const spreadOf = (s: string) => ctx.regimes.find((r) => r.symbol === s)?.spread ?? (s.startsWith("XAU") ? 280 : 12);
   const contextSummary = `${ctx.regimes.length} symbols, ${ctx.calendar.length} calendar events, ${ctx.headlines.length} headlines, ${ctx.web.length} web results`;
+  await report({ stage: "generating", percent: 20, message: "Asking the selected AI provider for diverse strategy hypotheses…" });
 
   // 1. Generate ideas.
   let ideas: Idea[] = [];
@@ -285,11 +344,24 @@ export async function runStrategyLab(trigger: "manual" | "schedule", userId: str
     await logError("strategy-lab", "idea generation failed", { error: String(err) });
   }
   ideas = ideas.filter((idea) => !resemblesRecentRejectedIdea(idea, ctx.recentRejected)).slice(0, 5);
+  await report({
+    stage: "validating",
+    percent: 30,
+    message: ideas.length ? `Preparing to validate ${ideas.length} candidate strategies…` : "No valid AI candidates were returned; finalizing the run…",
+    totalCandidates: ideas.length,
+  });
 
   // 2. Validate each idea with a 2-year walk-forward at realistic cost.
   const candleCache = new Map<string, Candle[]>();
   const proposals: LabProposal[] = [];
-  for (const idea of ideas) {
+  for (const [ideaIndex, idea] of ideas.entries()) {
+    await report({
+      stage: "validating",
+      percent: 30 + Math.floor((ideaIndex / Math.max(ideas.length, 1)) * 60),
+      message: `Validating candidate ${ideaIndex + 1} of ${ideas.length}: ${idea.name}`,
+      completedCandidates: ideaIndex,
+      totalCandidates: ideas.length,
+    });
     const config = ideaToConfig(idea);
     if (!config) {
       proposals.push({
@@ -449,9 +521,21 @@ export async function runStrategyLab(trigger: "manual" | "schedule", userId: str
     }
   }
 
+  await report({
+    stage: "recording",
+    percent: 92,
+    message: "Recording validation evidence and saving any disabled survivors…",
+    completedCandidates: ideas.length,
+    totalCandidates: ideas.length,
+  });
+
   const survivors = proposals.filter((p) => p.status === "passed").length;
-  const run: LabRun = { ranAt: new Date().toISOString(), trigger, contextSummary, webSearchEnabled: webSearchConfigured(), proposals, survivors };
-  for (const proposal of proposals) {
+  const run: LabRun = { ranAt: new Date().toISOString(), trigger, contextSummary, webSearchEnabled: await webSearchConfigured(), proposals, survivors };
+  for (const [proposalIndex, proposal] of proposals.entries()) {
+    await report({
+      percent: 92 + Math.floor((proposalIndex / Math.max(proposals.length, 1)) * 6),
+      message: `Recording result ${proposalIndex + 1} of ${proposals.length}: ${proposal.name}`,
+    });
     await recordValidationRun({
       userId,
       strategyId: proposal.savedStrategyId,
@@ -489,6 +573,14 @@ export async function runStrategyLab(trigger: "manual" | "schedule", userId: str
     await notify(userId, "approval_request", `Strategy Lab: ${survivors} candidate(s) passed validation`,
       `The AI proposed ${proposals.length} strategies; ${survivors} survived 2-year walk-forward. Review them in Strategy Lab — they are saved DISABLED until you approve.`);
   }
+  await report({
+    status: "completed",
+    stage: "completed",
+    percent: 100,
+    message: `Strategy Lab complete: ${proposals.length} evaluated, ${survivors} passed.`,
+    completedCandidates: ideas.length,
+    totalCandidates: ideas.length,
+  });
   return run;
 }
 

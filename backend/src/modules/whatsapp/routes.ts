@@ -9,6 +9,8 @@ import { getBotState, setBotState } from "../system/state.js";
 import { decideTrade, emergencyStopAll } from "../trading/service.js";
 import { latestNews } from "../news/service.js";
 import { requireTwoFactor } from "../auth/service.js";
+import { getOperationalConfig } from "../system/operational-config.js";
+import { chatWithAssistant, getAssistantConfig } from "../assistant/service.js";
 
 /**
  * WhatsApp connector via Twilio webhooks. Plain-text command interface.
@@ -24,10 +26,11 @@ function twiml(message: string): string {
 }
 
 /** Validate X-Twilio-Signature so forged webhooks are rejected. */
-function validTwilioSignature(url: string, params: Record<string, string>, signature: string): boolean {
-  if (!config.TWILIO_AUTH_TOKEN) return false;
+async function validTwilioSignature(url: string, params: Record<string, string>, signature: string): Promise<boolean> {
+  const token = (await getOperationalConfig()).twilioAuthToken;
+  if (!token) return false;
   const data = url + Object.keys(params).sort().map((k) => k + params[k]).join("");
-  const expected = createHmac("sha1", config.TWILIO_AUTH_TOKEN).update(data).digest("base64");
+  const expected = createHmac("sha1", token).update(data).digest("base64");
   return expected === signature;
 }
 
@@ -35,12 +38,13 @@ export async function whatsappRoutes(app: FastifyInstance) {
   app.post("/webhooks/whatsapp", async (req, reply) => {
     const body = req.body as Record<string, string>;
     const from = (body.From ?? "").replace("whatsapp:", "");
-    const text = (body.Body ?? "").trim().toLowerCase();
+    const originalText = (body.Body ?? "").trim();
+    const text = originalText.toLowerCase();
 
     // Signature check (skippable only in development for local testing).
     const sig = req.headers["x-twilio-signature"] as string | undefined;
     const fullUrl = `${req.protocol}://${req.hostname}${req.url}`;
-    if (config.NODE_ENV === "production" && (!sig || !validTwilioSignature(fullUrl, body, sig))) {
+    if (config.NODE_ENV === "production" && (!sig || !(await validTwilioSignature(fullUrl, body, sig)))) {
       await audit({ actor: `whatsapp:${from}`, category: "whatsapp", action: "invalid_signature" });
       return reply.code(403).send("invalid signature");
     }
@@ -123,17 +127,18 @@ export async function whatsappRoutes(app: FastifyInstance) {
         else if (!Number.isNaN(Number(arg))) lots = Number(arg);
       }
       const state = await getBotState();
+      let twoFactorVerified = false;
       if (!state.demoMode || state.liveTradingEnabled) {
-        const ok = await requireTwoFactor(userId, totp);
-        if (!ok) return respond("Live mode: include your 2FA code — approve trade <id> [lots] <code>");
+        twoFactorVerified = await requireTwoFactor(userId, totp);
+        if (!twoFactorVerified) return respond("Live mode: include your 2FA code — approve trade <id> [lots] <code>");
       }
-      const result = await decideTrade(tradeId, true, `whatsapp:${from}`, "WHATSAPP", { lots });
+      const result = await decideTrade(tradeId, true, `whatsapp:${from}`, "WHATSAPP", { actorUserId: userId, lots, twoFactorVerified });
       return respond(result.message);
     }
     if (text.startsWith("reject trade")) {
       const tradeId = text.split(/\s+/)[2];
       if (!tradeId) return respond("Usage: reject trade <id>");
-      const result = await decideTrade(tradeId, false, `whatsapp:${from}`, "WHATSAPP");
+      const result = await decideTrade(tradeId, false, `whatsapp:${from}`, "WHATSAPP", { actorUserId: userId });
       return respond(result.message);
     }
     if (text === "copy trading status") {
@@ -143,6 +148,19 @@ export async function whatsappRoutes(app: FastifyInstance) {
         : "No copy traders configured.");
     }
 
-    return respond("Commands: status | open trades | today's profit | latest news | pause bot | resume bot | emergency stop | approve trade <id> | reject trade <id> | copy trading status");
+    const assistant = await getAssistantConfig();
+    if (assistant.whatsappEnabled) {
+      const confirmation = text.match(/^confirm\s+([a-z0-9-]+)$/i);
+      const result = await chatWithAssistant({
+        userId,
+        actor: `whatsapp:${from}`,
+        role: link.user.role,
+        ...(confirmation ? { confirmToken: confirmation[1] } : { message: originalText }),
+        channel: "whatsapp",
+      });
+      return respond(result.confirmation ? `${result.message}\nReply: confirm ${result.confirmation.token} (expires in 5 minutes).` : result.message);
+    }
+
+    return respond("Commands: status | open trades | today's profit | latest news | pause bot | resume bot | emergency stop | approve trade <id> | reject trade <id> | copy trading status. Assistant access is disabled in Settings.");
   });
 }

@@ -1,7 +1,7 @@
-import { config } from "../../config.js";
 import { logError } from "../../lib/audit.js";
 import { CircuitOpenError, circuitSnapshot, withResilience } from "../../lib/resilience.js";
 import { reportIncident, resolveIncidentByDedupeKey } from "../incidents/service.js";
+import { getOperationalConfig } from "../system/operational-config.js";
 
 /**
  * Web search for the Strategy Lab's "latest internet resources" context.
@@ -23,16 +23,17 @@ export function shouldSearch(apiKey: string): boolean {
   return apiKey.trim().length > 0;
 }
 
-export function webSearchConfigured(): boolean {
-  return shouldSearch(config.WEB_SEARCH_API_KEY);
+export async function webSearchConfigured(): Promise<boolean> {
+  return shouldSearch((await getOperationalConfig()).webSearchApiKey);
 }
 
 export async function webSearch(query: string, maxResults = 5): Promise<WebResult[]> {
-  if (!webSearchConfigured()) return [];
+  const config = await getOperationalConfig();
+  if (!shouldSearch(config.webSearchApiKey)) return [];
   try {
-    const results = await withResilience("web-search", () => config.WEB_SEARCH_PROVIDER === "serper"
-      ? serper(query, maxResults)
-      : tavily(query, maxResults), {
+    const results = await withResilience("web-search", () => config.webSearchProvider === "serper"
+      ? serper(query, maxResults, config.webSearchApiKey)
+      : tavily(query, maxResults, config.webSearchApiKey), {
       retries: 2,
       baseDelayMs: 250,
       maxDelayMs: 1000,
@@ -59,12 +60,12 @@ export async function webSearch(query: string, maxResults = 5): Promise<WebResul
   }
 }
 
-async function tavily(query: string, maxResults: number): Promise<WebResult[]> {
+async function tavily(query: string, maxResults: number, apiKey: string): Promise<WebResult[]> {
   const res = await fetch("https://api.tavily.com/search", {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({
-      api_key: config.WEB_SEARCH_API_KEY,
+      api_key: apiKey,
       query,
       max_results: maxResults,
       search_depth: "basic",
@@ -77,10 +78,10 @@ async function tavily(query: string, maxResults: number): Promise<WebResult[]> {
   return (body.results ?? []).map((r) => ({ title: r.title ?? "", url: r.url ?? "", snippet: (r.content ?? "").slice(0, 300) }));
 }
 
-async function serper(query: string, maxResults: number): Promise<WebResult[]> {
+async function serper(query: string, maxResults: number, apiKey: string): Promise<WebResult[]> {
   const res = await fetch("https://google.serper.dev/search", {
     method: "POST",
-    headers: { "content-type": "application/json", "X-API-KEY": config.WEB_SEARCH_API_KEY },
+    headers: { "content-type": "application/json", "X-API-KEY": apiKey },
     body: JSON.stringify({ q: query, num: maxResults }),
     signal: AbortSignal.timeout(12_000),
   });

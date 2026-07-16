@@ -25,6 +25,7 @@ const h = vi.hoisted(() => ({
   errors: [] as { source: string; message: string; detail: unknown }[],
   incidents: [] as { dedupeKey: string; severity: string }[],
   comparisons: [] as Record<string, unknown>[],
+  intents: [] as Record<string, unknown>[],
 }));
 
 vi.mock("../lib/prisma.js", () => ({
@@ -32,13 +33,20 @@ vi.mock("../lib/prisma.js", () => ({
     trade: {
       findMany: vi.fn(async ({ where }: { where: Record<string, unknown> }) => {
         h.findManyCalls.push(where);
-        return where.status === "EXECUTED" ? h.open : h.backfill;
+        return typeof where.status === "object" ? h.open : h.backfill;
       }),
       update: vi.fn(async ({ where, data }: { where: { id: string }; data: Record<string, unknown> }) => {
         h.updates.push({ id: where.id, data });
         return { id: where.id, ...data };
       }),
     },
+    orderIntent: {
+      findMany: vi.fn(async () => h.intents),
+      update: vi.fn(async () => ({})),
+      findUnique: vi.fn(async () => null),
+    },
+    marketReservation: { updateMany: vi.fn(async () => ({ count: 0 })) },
+    $transaction: vi.fn(async (ops: Promise<unknown>[]) => Promise.all(ops)),
   },
 }));
 
@@ -105,6 +113,7 @@ beforeEach(() => {
     errors: [],
     incidents: [],
     comparisons: [],
+    intents: [],
   });
 });
 
@@ -120,7 +129,7 @@ describe("syncClosedTrades", () => {
     await syncClosedTrades();
 
     expect(h.findManyCalls[0]).toMatchObject({
-      status: "EXECUTED",
+      status: { in: ["EXECUTED", "PARTIALLY_FILLED"] },
       OR: [{ accountId: null }, { account: { login: "100" } }],
     });
     expect(h.updates).toHaveLength(1);

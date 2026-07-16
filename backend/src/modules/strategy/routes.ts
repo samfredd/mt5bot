@@ -4,8 +4,9 @@ import { prisma } from "../../lib/prisma.js";
 import { audit } from "../../lib/audit.js";
 import { StrategyConfigSchema } from "./types.js";
 import { PRESET_STRATEGIES } from "./presets.js";
-import { runStrategyLab, lastLabRun } from "./lab.js";
+import { failStrategyLabProgress, lastLabProgress, runStrategyLab, lastLabRun } from "./lab.js";
 import { listValidationRuns } from "./validation-runs.js";
+import { validationFailure } from "../../lib/validation.js";
 
 export async function strategyRoutes(app: FastifyInstance) {
   // --- AI Strategy Lab: generate → auto-validate → DISABLED candidates ---
@@ -13,11 +14,20 @@ export async function strategyRoutes(app: FastifyInstance) {
     const { webSearchConfigured } = await import("../web/search.js");
     const last = (await lastLabRun()) ?? { proposals: [], survivors: 0, ranAt: null };
     // Always reflect CURRENT web-search config (a stored run may predate it).
-    return { ...last, webSearchEnabled: webSearchConfigured() };
+    return { ...last, webSearchEnabled: await webSearchConfigured() };
+  });
+
+  app.get("/api/strategy-lab/progress", { preHandler: [app.authenticate] }, async (req) => {
+    return lastLabProgress(req.user.id);
   });
 
   app.post("/api/strategy-lab/run", { preHandler: [app.requireRole("ADMIN", "MANAGER")] }, async (req) => {
-    return runStrategyLab("manual", req.user.id);
+    try {
+      return await runStrategyLab("manual", req.user.id);
+    } catch (error) {
+      await failStrategyLabProgress(req.user.id, error).catch(() => undefined);
+      throw error;
+    }
   });
 
   app.get("/api/strategies", { preHandler: [app.authenticate] }, async (req) => {
@@ -92,16 +102,16 @@ export async function strategyRoutes(app: FastifyInstance) {
 
   // --- Risk settings ---
   const RiskUpdate = z.object({
-    maxRiskPerTradePct: z.number().positive().max(10).optional(),
-    maxDailyLossPct: z.number().positive().max(50).optional(),
-    maxWeeklyLossPct: z.number().positive().max(50).optional(),
-    maxDrawdownPct: z.number().positive().max(80).optional(),
-    maxOpenTrades: z.number().int().positive().max(100).optional(),
-    maxTradesPerSymbol: z.number().int().positive().max(20).optional(),
-    maxTradesPerDay: z.number().int().positive().max(100).optional(),
-    maxLotSize: z.number().positive().max(100).optional(),
-    minRiskReward: z.number().positive().max(10).optional(),
-    maxConsecutiveLosses: z.number().int().positive().max(20).optional(),
+    maxRiskPerTradePct: z.number().positive().optional(),
+    maxDailyLossPct: z.number().positive().optional(),
+    maxWeeklyLossPct: z.number().positive().optional(),
+    maxDrawdownPct: z.number().positive().optional(),
+    maxOpenTrades: z.number().int().positive().optional(),
+    maxTradesPerSymbol: z.number().int().positive().optional(),
+    maxTradesPerDay: z.number().int().positive().optional(),
+    maxLotSize: z.number().positive().optional(),
+    minRiskReward: z.number().positive().optional(),
+    maxConsecutiveLosses: z.number().int().positive().optional(),
     requireStopLoss: z.boolean().optional(),
     requireTakeProfit: z.boolean().optional(),
     maxSpreadPoints: z.number().positive().optional(),
@@ -111,15 +121,15 @@ export async function strategyRoutes(app: FastifyInstance) {
     pauseAfterNewsMin: z.number().int().min(0).optional(),
     allowNewsTrading: z.boolean().optional(),
     allowedSessions: z.array(z.string()).optional(),
-    equityProtectionPct: z.number().min(0).max(100).optional(),
-    copyExposureLimitPct: z.number().positive().max(100).optional(),
+    equityProtectionPct: z.number().min(0).optional(),
+    copyExposureLimitPct: z.number().positive().optional(),
     maxDailyCopiedTrades: z.number().int().positive().optional(),
-    maxCurrencyExposurePct: z.number().positive().max(5000).optional(),
-    maxCorrelatedExposurePct: z.number().positive().max(5000).optional(),
+    maxCurrencyExposurePct: z.number().positive().optional(),
+    maxCorrelatedExposurePct: z.number().positive().optional(),
     autoFlattenNewsEnabled: z.boolean().optional(),
-    autoFlattenLeadMin: z.number().int().min(0).max(240).optional(),
+    autoFlattenLeadMin: z.number().int().min(0).optional(),
     autoFlattenMinimumImpact: z.enum(["LOW", "MEDIUM", "HIGH"]).optional(),
-    autoFlattenSymbols: z.array(z.string().min(3)).max(50).optional(),
+    autoFlattenSymbols: z.array(z.string().min(3)).optional(),
   });
 
   app.get("/api/risk-settings", { preHandler: [app.authenticate] }, async (req) => {
@@ -132,7 +142,7 @@ export async function strategyRoutes(app: FastifyInstance) {
 
   app.put("/api/risk-settings", { preHandler: [app.requireRole("ADMIN", "MANAGER")] }, async (req, reply) => {
     const body = RiskUpdate.safeParse(req.body);
-    if (!body.success) return reply.code(400).send({ error: "invalid risk settings", issues: body.error.issues });
+    if (!body.success) return reply.code(400).send(validationFailure("Invalid global risk settings", body.error));
     // requireStopLoss can only be turned OFF by an admin — safety rule #4.
     if (body.data.requireStopLoss === false && req.user.role !== "ADMIN") {
       return reply.code(403).send({ error: "only an admin may disable the stop-loss requirement" });

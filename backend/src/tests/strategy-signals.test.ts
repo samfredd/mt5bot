@@ -72,6 +72,30 @@ function analysis(primary: TimeframeAnalysis, higher: TimeframeAnalysis): Market
 }
 
 describe("confluence signal direction", () => {
+  it("stands aside when trend strength is below the configured ADX floor", () => {
+    const filtered = {
+      ...strategy,
+      config: { ...strategy.config, entry: { ...strategy.config.entry, trendMinAdx: 22 } },
+    } as Strategy;
+    const primary = timeframe({ trend: "bullish", adx: 18, structure: "higher_highs" });
+    const higher = timeframe({ timeframe: "H4", trend: "bullish" });
+
+    expect(evaluateStrategy(filtered, analysis(primary, higher)).direction).toBeNull();
+  });
+
+  it("enforces deterministic rule confidence even without an AI model", () => {
+    const filtered = {
+      ...strategy,
+      config: { ...strategy.config, entry: { ...strategy.config.entry, minRuleConfidence: 0.75 } },
+    } as Strategy;
+    const primary = timeframe({ trend: "bullish", structure: "higher_highs" });
+    const higher = timeframe({ timeframe: "H4", trend: "bullish" });
+
+    const result = evaluateStrategy(filtered, analysis(primary, higher));
+    expect(result.confidence).toBe(0.4);
+    expect(result.direction).toBeNull();
+  });
+
   it("supports a trend-alignment-only diagnostic configuration", () => {
     const trendOnly = {
       ...strategy,

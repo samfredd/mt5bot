@@ -123,6 +123,9 @@ vi.mock("../modules/ai/service.js", () => ({
     valid: h.aiValid,
     decision: h.aiDecision,
   })),
+  getActiveProvider: vi.fn(async () => "ollama"),
+  PURE_LOGIC_PROVIDER: "pure_logic",
+  pureLogicDecision: vi.fn((direction: "buy" | "sell") => ({ ...h.aiDecision, decision: direction, confidence: 1 })),
 }));
 
 vi.mock("../modules/ai/prompts.js", () => ({

@@ -4,6 +4,7 @@ import { withSchedulerLease } from "../../workers/scheduler-lease.js";
 import { getScalpingConfig } from "./scalping.state.js";
 import { refreshStalePlans } from "./scalping.ai.js";
 import { attemptScalpEntries, manageOpenScalps } from "./scalping.service.js";
+import { getOperationalConfig } from "../system/operational-config.js";
 
 /**
  * Scalping runs on its OWN cadence, fully separate from the 60-second strategy/
@@ -21,14 +22,11 @@ import { attemptScalpEntries, manageOpenScalps } from "./scalping.service.js";
  * on lease acquisition). Entries also fail closed when Redis is unavailable.
  */
 
-const FIRE_INTERVAL_MS = 1_000;
-const ENTRY_LEASE_MS = 5_000;
-const BLOCK_AUDIT_THROTTLE_MS = 30_000;
-
 let fireTimer: NodeJS.Timeout | null = null;
 let aiTimer: NodeJS.Timeout | null = null;
 let firing = false;
 let refreshing = false;
+let workerRunning = false;
 
 type ScalpEntryAttemptResult = Awaited<ReturnType<typeof attemptScalpEntries>>;
 
@@ -41,7 +39,7 @@ export function maybeScalpingBlockAudit(
   result: ScalpEntryAttemptResult,
   previous: ScalpBlockAuditState | null,
   now = Date.now(),
-  throttleMs = BLOCK_AUDIT_THROTTLE_MS,
+  throttleMs: number,
 ): { event: { detail: Record<string, unknown> } | null; state: ScalpBlockAuditState | null } {
   if (result.opened.length > 0 || result.blocked.length === 0) {
     return { event: null, state: previous };
@@ -79,13 +77,14 @@ async function fireTick(): Promise<void> {
 
     const config = await getScalpingConfig();
     if (config.status !== "running" || !config.enabled) return;
+    const operational = await getOperationalConfig();
 
     // New entries: single-writer via Redis lease; null = another process holds it.
-    const result = await withSchedulerLease("scalping-entries", ENTRY_LEASE_MS, () => attemptScalpEntries("scalping:auto"))
+    const result = await withSchedulerLease("scalping-entries", operational.scalpingEntryLeaseMs, () => attemptScalpEntries("scalping:auto"))
       .catch((err) => logError("scalping-worker", "entry attempt failed", { error: String(err) }));
     if (!result) return;
 
-    const nextAudit = maybeScalpingBlockAudit(result, lastBlockAudit);
+    const nextAudit = maybeScalpingBlockAudit(result, lastBlockAudit, Date.now(), operational.scalpingBlockAuditThrottleMs);
     lastBlockAudit = nextAudit.state;
     if (nextAudit.event) {
       await audit({
@@ -116,20 +115,38 @@ async function aiTick(): Promise<void> {
   }
 }
 
-export function startScalpingWorker(): void {
-  if (fireTimer || aiTimer) return;
-  fireTimer = setInterval(() => void fireTick(), FIRE_INTERVAL_MS);
+async function scheduleFire(): Promise<void> {
+  if (!workerRunning) return;
+  const { scalpingFireIntervalMs } = await getOperationalConfig();
+  fireTimer = setTimeout(async () => {
+    await fireTick();
+    void scheduleFire();
+  }, scalpingFireIntervalMs);
   fireTimer.unref?.();
-  // Refresh stale plans a few times per TTL window; refreshStalePlans no-ops on
-  // still-fresh plans, so a short interval is cheap. Default TTL 60s → ~15s.
-  aiTimer = setInterval(() => void aiTick(), 15_000);
+}
+
+async function scheduleAi(): Promise<void> {
+  if (!workerRunning) return;
+  const { scalpingAiRefreshIntervalMs } = await getOperationalConfig();
+  aiTimer = setTimeout(async () => {
+    await aiTick();
+    void scheduleAi();
+  }, scalpingAiRefreshIntervalMs);
   aiTimer.unref?.();
-  logger.info("scalping worker started (1s fire loop + AI refresh cadence)");
+}
+
+export function startScalpingWorker(): void {
+  if (workerRunning) return;
+  workerRunning = true;
+  void scheduleFire();
+  void scheduleAi();
+  logger.info("scalping worker started with database-managed cadences");
 }
 
 export function stopScalpingWorker(): void {
-  if (fireTimer) clearInterval(fireTimer);
-  if (aiTimer) clearInterval(aiTimer);
+  workerRunning = false;
+  if (fireTimer) clearTimeout(fireTimer);
+  if (aiTimer) clearTimeout(aiTimer);
   fireTimer = null;
   aiTimer = null;
 }

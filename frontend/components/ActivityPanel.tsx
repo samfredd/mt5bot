@@ -1,6 +1,6 @@
 "use client";
 import { useCallback, useEffect, useRef, useState } from "react";
-import { api, WS_URL } from "@/lib/api";
+import { api, webSocketProtocols, WS_URL } from "@/lib/api";
 import { IconInfo, IconPause, IconPlay, IconX } from "@/components/icons";
 
 interface AuditEvent {
@@ -86,7 +86,7 @@ export function ActivityPanel({
 
   useEffect(() => {
     void load();
-    const ws = new WebSocket(WS_URL);
+    const ws = new WebSocket(WS_URL, webSocketProtocols());
     ws.onmessage = (msg) => {
       if (pausedRef.current) return;
       try {

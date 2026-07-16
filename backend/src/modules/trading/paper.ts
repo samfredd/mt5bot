@@ -4,8 +4,8 @@ import { mt5 } from "../mt5/client.js";
 import type { TradeProposal } from "../risk/engine.js";
 import { fallbackTradingSpec, moneyForPriceMove, type TradingInstrumentSpec } from "../risk/instruments.js";
 import { reportIncident } from "../incidents/service.js";
+import { getOperationalConfig } from "../system/operational-config.js";
 
-const STALE_TICK_MS = 5 * 60_000;
 const money = (value: number) => Number(value.toFixed(2));
 const price = (value: number, digits: number) => Number(value.toFixed(digits));
 const json = (value: unknown) => JSON.parse(JSON.stringify(value)) as Prisma.InputJsonValue;
@@ -15,6 +15,56 @@ interface PaperTick {
   ask: number;
   spread_points: number;
   time: string;
+}
+
+export type PromotablePaperTrade = {
+  symbol: string;
+  direction: "BUY" | "SELL";
+  lots: number;
+  entryPrice: number;
+  stopLoss: number | null;
+  takeProfit: number | null;
+  instrumentSpec: unknown;
+};
+
+/**
+ * Rebuild a paper setup around the current executable price. The original
+ * stop/target distances are preserved, but a setup that has already moved by
+ * more than half its initial risk is stale and must be analyzed again.
+ */
+export function buildPaperPromotionProposal(
+  trade: PromotablePaperTrade,
+  currentEntry: number,
+  requestedLots?: number,
+): { ok: true; proposal: TradeProposal; driftR: number } | { ok: false; error: string } {
+  if (!trade.stopLoss || !trade.takeProfit) {
+    return { ok: false, error: "Paper setup must have both a stop-loss and take-profit before broker execution." };
+  }
+  const isBuy = trade.direction === "BUY";
+  const stopDistance = isBuy ? trade.entryPrice - trade.stopLoss : trade.stopLoss - trade.entryPrice;
+  const targetDistance = isBuy ? trade.takeProfit - trade.entryPrice : trade.entryPrice - trade.takeProfit;
+  if (!(stopDistance > 0) || !(targetDistance > 0)) {
+    return { ok: false, error: "Paper setup has invalid stop-loss or take-profit geometry." };
+  }
+  const driftR = Math.abs(currentEntry - trade.entryPrice) / stopDistance;
+  if (driftR > 0.5) {
+    return { ok: false, error: `Paper setup is stale: price moved ${driftR.toFixed(2)}R from its paper entry. Run a fresh analysis.` };
+  }
+  const spec = trade.instrumentSpec as TradingInstrumentSpec;
+  const round = (value: number) => price(value, spec.digits);
+  return {
+    ok: true,
+    driftR,
+    proposal: {
+      symbol: trade.symbol,
+      direction: isBuy ? "buy" : "sell",
+      lots: requestedLots ?? trade.lots,
+      entry: currentEntry,
+      stopLoss: round(isBuy ? currentEntry - stopDistance : currentEntry + stopDistance),
+      takeProfit: round(isBuy ? currentEntry + targetDistance : currentEntry - targetDistance),
+      instrumentSpec: spec,
+    },
+  };
 }
 
 export async function openPaperTrade(input: {
@@ -74,6 +124,8 @@ function exitFor(
 }
 
 export async function reconcilePaperTrades(now = new Date()) {
+  const { paperTradeStaleTickMin } = await getOperationalConfig();
+  const staleTickMs = paperTradeStaleTickMin * 60_000;
   const openTrades = await prisma.paperTrade.findMany({ where: { status: "OPEN" } });
   const ticks = new Map<string, PaperTick>();
   for (const trade of openTrades) {
@@ -82,7 +134,7 @@ export async function reconcilePaperTrades(now = new Date()) {
       tick ??= await mt5.tick(trade.symbol);
       ticks.set(trade.symbol, tick);
     } catch (error) {
-      if (now.getTime() - trade.openedAt.getTime() >= STALE_TICK_MS) {
+      if (now.getTime() - trade.openedAt.getTime() >= staleTickMs) {
         await reportIncident({
           dedupeKey: `paper-trade:stale:${trade.id}`,
           severity: "WARNING",
@@ -94,7 +146,7 @@ export async function reconcilePaperTrades(now = new Date()) {
       }
       continue;
     }
-    if (now.getTime() - Date.parse(tick.time) > STALE_TICK_MS) {
+    if (now.getTime() - Date.parse(tick.time) > staleTickMs) {
       await reportIncident({
         dedupeKey: `paper-trade:stale:${trade.id}`,
         severity: "WARNING",

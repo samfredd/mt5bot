@@ -2,6 +2,7 @@ import "./globals.css";
 import type { Metadata, Viewport } from "next";
 import { Inter } from "next/font/google";
 import { AuthExpiryGuard } from "@/components/AuthExpiryGuard";
+import { ToastProvider } from "@/components/ToastProvider";
 
 const inter = Inter({
   subsets: ["latin"],
@@ -23,8 +24,10 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
   return (
     <html lang="en" className={inter.variable}>
       <body className="min-h-dvh font-sans antialiased">
-        <AuthExpiryGuard />
-        {children}
+        <ToastProvider>
+          <AuthExpiryGuard />
+          {children}
+        </ToastProvider>
       </body>
     </html>
   );

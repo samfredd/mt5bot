@@ -2,6 +2,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { api } from "@/lib/api";
 import { IconBrain } from "@/components/icons";
+import { useToast } from "@/components/ToastProvider";
 
 interface WfConsistency {
   foldCount: number; profitableFolds: number; profitableFraction: number;
@@ -19,24 +20,67 @@ interface LabRun {
   webSearchEnabled?: boolean;
   proposals: Proposal[]; survivors: number;
 }
+interface LabProgress {
+  runId: string;
+  status: "idle" | "running" | "completed" | "failed";
+  stage: "idle" | "context" | "generating" | "validating" | "recording" | "completed" | "failed";
+  percent: number;
+  message: string;
+  completedCandidates: number;
+  totalCandidates: number;
+  startedAt: string | null;
+  updatedAt: string;
+}
 
 export function StrategyLabPanel() {
+  const toast = useToast();
   const [run, setRun] = useState<LabRun | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  const [progress, setProgress] = useState<LabProgress | null>(null);
 
   const load = useCallback(async () => {
     try { setRun(await api<LabRun>("/api/strategy-lab/last")); } catch { /* none yet */ }
   }, []);
-  useEffect(() => { void load(); }, [load]);
+  const loadProgress = useCallback(async () => {
+    try {
+      const next = await api<LabProgress>("/api/strategy-lab/progress");
+      setProgress(next);
+      setBusy(next.status === "running");
+      if (next.status === "completed") void load();
+      if (next.status === "failed") setError(next.message);
+    } catch { /* retain the last visible progress snapshot */ }
+  }, [load]);
+  useEffect(() => { void load(); void loadProgress(); }, [load, loadProgress]);
+  useEffect(() => {
+    if (!busy) return;
+    const timer = window.setInterval(() => { void loadProgress(); }, 1_200);
+    return () => window.clearInterval(timer);
+  }, [busy, loadProgress]);
 
   async function generate() {
     setError("");
     setBusy(true);
+    setProgress({
+      runId: "starting",
+      status: "running",
+      stage: "context",
+      percent: 1,
+      message: "Starting Strategy Lab…",
+      completedCandidates: 0,
+      totalCandidates: 0,
+      startedAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    });
     try {
-      setRun(await api<LabRun>("/api/strategy-lab/run", { method: "POST", body: {} }));
+      const result = await api<LabRun>("/api/strategy-lab/run", { method: "POST", body: {} });
+      setRun(result);
+      await loadProgress();
+      toast.success("Strategy Lab completed", result.survivors > 0 ? `${result.survivors} validated candidate(s) were saved disabled for review.` : "No candidate survived validation; nothing was enabled or saved as active.");
     } catch (err) {
-      setError(err instanceof Error ? err.message : "lab run failed");
+      const message = err instanceof Error ? err.message : "Strategy Lab run failed.";
+      setError(message);
+      toast.error("Strategy Lab failed", message);
     } finally {
       setBusy(false);
     }
@@ -55,11 +99,41 @@ export function StrategyLabPanel() {
         <button onClick={generate} disabled={busy} className="btn-primary">
           {busy ? "Generating & validating… (can take a minute)" : "Generate candidates"}
         </button>
+        {progress && progress.status !== "idle" && (
+          <div className="mt-4 rounded-xl border border-line bg-surface-2 p-3" aria-live="polite">
+            <div className="mb-2 flex flex-wrap items-center justify-between gap-2 text-xs">
+              <span className={progress.status === "failed" ? "font-medium text-down" : progress.status === "completed" ? "font-medium text-up" : "font-medium text-ink"}>
+                {progress.status === "running" ? "Strategy Lab running" : progress.status === "completed" ? "Strategy Lab complete" : "Strategy Lab failed"}
+              </span>
+              <span className="tnum text-ink-dim">
+                {Math.round(progress.percent)}%
+                {progress.totalCandidates > 0 ? ` · ${progress.completedCandidates}/${progress.totalCandidates} candidates` : ""}
+              </span>
+            </div>
+            <div
+              className="h-2 overflow-hidden rounded-full bg-surface-3"
+              role="progressbar"
+              aria-label="Strategy Lab progress"
+              aria-valuemin={0}
+              aria-valuemax={100}
+              aria-valuenow={Math.round(progress.percent)}
+            >
+              <div
+                className={`h-full rounded-full transition-[width] duration-500 ${progress.status === "failed" ? "bg-red-500" : progress.status === "completed" ? "bg-emerald-500" : "bg-primary"}`}
+                style={{ width: `${Math.max(0, Math.min(100, progress.percent))}%` }}
+              />
+            </div>
+            <p className="mt-2 text-xs text-ink-dim">{progress.message}</p>
+            {progress.startedAt && progress.status === "running" && (
+              <p className="mt-1 text-[11px] text-ink-faint">Started {new Date(progress.startedAt).toLocaleTimeString()} · progress is saved if you leave this tab</p>
+            )}
+          </div>
+        )}
         <p className="mt-3 text-xs text-ink-faint">
           Inputs: chart regime + economic calendar + live RSS headlines
           {run?.webSearchEnabled
             ? " + live web search ✓"
-            : " · web search OFF (set WEB_SEARCH_API_KEY in backend .env — free key at tavily.com)"}
+            : " · web search OFF (add a Tavily or Serper key in Settings → Operational configuration)"}
         </p>
         {error && <p className="mt-3 text-sm text-down" role="alert">{error}</p>}
       </section>

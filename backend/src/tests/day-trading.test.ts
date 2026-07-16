@@ -15,6 +15,7 @@ vi.mock("../lib/prisma.js", () => ({
       upsert: vi.fn(async () => ({})),
     },
     user: { findFirst: vi.fn(async () => ({ id: "admin", email: "a@x.com", role: "ADMIN" })) },
+    trade: { findMany: vi.fn(async () => h.positions.map((position) => ({ mt5Ticket: position.ticket }))) },
   },
 }));
 vi.mock("../lib/audit.js", () => ({ audit: vi.fn(async ({ action }: { action: string }) => { h.audits.push(action); }), logError: vi.fn(async () => {}) }));

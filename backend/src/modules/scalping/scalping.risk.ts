@@ -3,7 +3,6 @@ import { countConsecutiveLosses } from "../risk/engine.js";
 import type { ScalpingConfig, ScalpingRiskConfig } from "./scalping.schema.js";
 import { aiFireControlActive } from "./scalping.types.js";
 import type { ActiveScalp, ClosedScalp, ScalpingAiDecision } from "./scalping.types.js";
-import { exposureCapPct } from "./scalping.presets.js";
 
 /**
  * The scalping risk layer — PURE, no I/O, so every rule is unit-testable.
@@ -34,10 +33,14 @@ export function currencies(symbol: string): string[] {
   return [core.slice(0, 3), core.slice(3, 6)];
 }
 
-/** One active scalping trade per pair — the headline rule of Multi-Pair mode. */
-export function hasActiveScalpForSymbol(active: ActiveScalp[], symbol: string): boolean {
+export function activeScalpsForSymbol(active: ActiveScalp[], symbol: string): number {
   const key = marketKey(symbol);
-  return active.some((a) => marketKey(a.symbol) === key);
+  return active.filter((a) => marketKey(a.symbol) === key).length;
+}
+
+/** Kept for callers that only need a yes/no position check. */
+export function hasActiveScalpForSymbol(active: ActiveScalp[], symbol: string): boolean {
+  return activeScalpsForSymbol(active, symbol) > 0;
 }
 
 export function withinMaxTotal(activeCount: number, max: number): boolean {
@@ -250,7 +253,9 @@ export function evaluateScalpingGate(input: ScalpGateInput): ScalpGateResult {
     `${input.symbol} ${input.config.symbols.map((s) => s.toUpperCase()).includes(input.symbol.toUpperCase()) ? "in" : "not in"} watchlist`);
 
   add("max_open_total", withinMaxTotal(input.active.length, r.maxOpenTradesTotal), `${input.active.length}/${r.maxOpenTradesTotal} open`);
-  add("one_per_symbol", !hasActiveScalpForSymbol(input.active, input.symbol), `active on ${marketKey(input.symbol)}? ${hasActiveScalpForSymbol(input.active, input.symbol)}`);
+  const activeOnSymbol = activeScalpsForSymbol(input.active, input.symbol);
+  add("max_trades_per_symbol", activeOnSymbol < r.maxTradesPerSymbol,
+    `${activeOnSymbol}/${r.maxTradesPerSymbol} active on ${marketKey(input.symbol)}`);
   add("max_trades_per_day", input.tradesToday < r.maxTradesPerDay, `${input.tradesToday}/${r.maxTradesPerDay} today`);
 
   const cooldownMs = reentryCooldownRemainingMs(input.lastClosedForSymbol, r, now);
@@ -264,9 +269,9 @@ export function evaluateScalpingGate(input: ScalpGateInput): ScalpGateResult {
     r.profitTargetMoney != null ? `net today ${input.todayNetProfit.toFixed(2)} / goal ${r.profitTargetMoney}` : "no goal set");
 
   if (r.lotMode === "risk_percent") {
-    const cap = exposureCapPct(r.scalpingRiskPreset);
+    const cap = r.maxTotalRiskExposurePercent;
     add("exposure_cap", !totalExposureExceedsCap(r.maxOpenTradesTotal, r.riskPerTradePercent, cap),
-      `${(r.maxOpenTradesTotal * r.riskPerTradePercent).toFixed(2)}% of ${r.maxOpenTradesTotal} slots / cap ${cap}% (${r.scalpingRiskPreset})`);
+      `${(r.maxOpenTradesTotal * r.riskPerTradePercent).toFixed(2)}% of ${r.maxOpenTradesTotal} slots / configured cap ${cap}%`);
   }
 
   add("currency_exposure", !currencyExposureWouldExceed(input.active.map((a) => a.symbol), input.symbol, r.maxSharedCurrencyExposure),

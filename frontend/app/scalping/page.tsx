@@ -1,10 +1,13 @@
 "use client";
 import { useCallback, useEffect, useState } from "react";
-import { api, WS_URL } from "@/lib/api";
+import { api, webSocketProtocols, WS_URL } from "@/lib/api";
 import { scalpingControlState } from "@/lib/scalping-controls";
 import { IconZap, IconPlay, IconPause, IconStop, IconScan, IconShield, IconUp, IconDown, IconWallet, IconRefresh } from "@/components/icons";
-import { Sidebar, MobileNav, SCALPING_NAV_ID } from "@/components/Sidebar";
+import { Sidebar, MobileBottomNav, SCALPING_NAV_ID } from "@/components/Sidebar";
 import { ActivityPanel } from "@/components/ActivityPanel";
+import Link from "next/link";
+import { FloatingAssistant } from "@/components/AssistantPanel";
+import { useToast } from "@/components/ToastProvider";
 
 /**
  * Keep only scalping-mode events in the shared live activity feed. All scalping
@@ -55,12 +58,20 @@ function clsStatus(s: string) {
     : { dot: "bg-ink-faint", text: "text-ink-dim", label: "Stopped" };
 }
 
+function scalpingControlMessage(path: string): string {
+  if (path.endsWith("/start")) return "Scalping mode is running.";
+  if (path.endsWith("/pause")) return "Scalping mode is paused.";
+  if (path.endsWith("/stop")) return "Scalping mode is stopped.";
+  if (path.endsWith("/emergency-reset")) return "Emergency state was reset.";
+  return "The requested control change was applied.";
+}
+
 export default function ScalpingPage() {
+  const toast = useToast();
   const [state, setState] = useState<ScalpState | null>(null);
   const [overview, setOverview] = useState<Overview | null>(null);
   const [trades, setTrades] = useState<Trade[]>([]);
   const [decisions, setDecisions] = useState<AiDecision[]>([]);
-  const [msg, setMsg] = useState("");
   const [busy, setBusy] = useState(false);
 
   const refresh = useCallback(async () => {
@@ -84,7 +95,7 @@ export default function ScalpingPage() {
     let ws: WebSocket | null = null; let stopped = false; let retry: ReturnType<typeof setTimeout> | null = null;
     const connect = () => {
       if (stopped) return;
-      ws = new WebSocket(WS_URL);
+      ws = new WebSocket(WS_URL, webSocketProtocols());
       ws.onmessage = (m) => { try { const { event } = JSON.parse(m.data); if (event === "scalping" || event === "trade" || event === "floating_pnl") void refresh(); } catch { /* ignore */ } };
       ws.onclose = () => { if (!stopped) retry = setTimeout(connect, 2000); };
       ws.onerror = () => ws?.close();
@@ -94,39 +105,29 @@ export default function ScalpingPage() {
   }, [refresh]);
 
   async function control(path: string, body?: unknown) {
-    setBusy(true); setMsg("");
-    try { const r = await api<unknown>(path, { method: "POST", body: body ?? {} }); setMsg(typeof r === "object" ? "Done." : String(r)); await refresh(); }
-    catch (e) { setMsg(e instanceof Error ? e.message : "Request failed"); }
+    setBusy(true);
+    try {
+      await api<unknown>(path, { method: "POST", body: body ?? {} });
+      await refresh();
+      if (path.includes("emergency-stop")) toast.warning("Emergency stop executed", "The bot was halted and the close-position workflow was requested.");
+      else toast.success("Scalping control updated", scalpingControlMessage(path));
+    }
+    catch (e) { toast.error("Scalping control failed", e instanceof Error ? e.message : "The request could not be completed."); }
     finally { setBusy(false); }
   }
 
   async function runOnce() {
-    setBusy(true); setMsg("Running one cycle…");
+    setBusy(true);
     try {
       const r = await api<{ entries: { opened: unknown[]; blocked: { symbol?: string; reason: string }[] }; plansRefreshed: number }>("/api/scalping/run-once", { method: "POST", body: {} });
       const blocked = r.entries.blocked.map((b) => b.symbol && b.symbol !== "*" ? `${b.symbol}: ${b.reason}` : b.reason).join("; ");
-      setMsg(`Cycle done — ${r.entries.opened.length} opened, ${r.entries.blocked.length} blocked, ${r.plansRefreshed} AI plan(s) refreshed.${blocked ? ` Blocked: ${blocked}` : ""}`);
+      const description = `Cycle done — ${r.entries.opened.length} opened, ${r.entries.blocked.length} blocked, ${r.plansRefreshed} AI plan(s) refreshed.${blocked ? ` Blocked: ${blocked}` : ""}`;
+      (r.entries.opened.length > 0 ? toast.success : toast.info)("Scalping cycle completed", description);
       await refresh();
-    } catch (e) { setMsg(e instanceof Error ? e.message : "Run failed"); }
+    } catch (e) { toast.error("Scalping cycle failed", e instanceof Error ? e.message : "The cycle could not be completed."); }
     finally { setBusy(false); }
   }
 
-  async function saveConfig(patch: Partial<ScalpConfig>) {
-    setMsg("");
-    try { await api("/api/scalping", { method: "PUT", body: patch }); await refresh(); setMsg("Saved."); }
-    catch (e) { setMsg(e instanceof Error ? e.message : "Save failed"); }
-  }
-  async function saveRisk(patch: Partial<ScalpRisk>) {
-    setMsg("");
-    try { await api("/api/scalping/risk-settings", { method: "PUT", body: patch }); await refresh(); setMsg("Saved."); }
-    catch (e) { setMsg(e instanceof Error ? e.message : "Save failed"); }
-  }
-  async function applyPreset(preset: "low" | "medium" | "aggressive") {
-    if (preset === "aggressive" && !confirm("Aggressive preset: up to 1% risk/trade and 5% total exposure. Higher drawdown — still hard-capped. Apply to your LIVE config?")) return;
-    setMsg("");
-    try { await api("/api/scalping/preset", { method: "POST", body: { preset } }); await refresh(); setMsg(`Applied ${preset} preset.`); }
-    catch (e) { setMsg(e instanceof Error ? e.message : "Apply failed"); }
-  }
 
   const sm = state?.summary;
   const st = clsStatus(sm?.status ?? "stopped");
@@ -138,16 +139,15 @@ export default function ScalpingPage() {
     <div className="flex min-h-dvh">
       <Sidebar active={SCALPING_NAV_ID} />
       <div className="min-w-0 flex-1">
-        {/* Mobile header + nav (sidebar is desktop-only) */}
+        {/* Mobile header (sidebar becomes a bottom navigation). */}
         <header className="sticky top-0 z-30 border-b border-line bg-bg/80 backdrop-blur lg:hidden">
           <div className="flex items-center gap-3 px-4 py-3">
             <span className="flex h-8 w-8 items-center justify-center rounded-lg bg-primary-dim text-white"><IconZap size={15} /></span>
             <span className="text-sm font-semibold">Scalping Mode</span>
           </div>
-          <MobileNav active={SCALPING_NAV_ID} />
         </header>
 
-        <main className="mx-auto max-w-6xl px-4 py-6 md:px-8">
+        <main className="mx-auto max-w-6xl px-3 py-4 pb-24 sm:px-4 sm:py-6 md:px-8 lg:pb-6">
       {/* Header */}
       <div className="mb-5 flex items-center justify-between gap-3">
         <div className="flex items-center gap-3">
@@ -169,7 +169,6 @@ export default function ScalpingPage() {
           </div>
         )}
       </div>
-
       {/* Experimental note */}
       <div className="mb-5 rounded-xl border border-amber-900/70 bg-amber-950/40 px-4 py-3 text-xs text-amber-200">
         <strong>Scalping Mode is experimental.</strong> The AI is a gate, not a guarantee. It never bypasses the global risk
@@ -238,7 +237,6 @@ export default function ScalpingPage() {
             Emergency stop
           </button>
         </div>
-        {msg && <div className="mt-2 text-xs text-ink-dim">{msg}</div>}
       </div>
 
       {/* Live activity (scalping-scoped) */}
@@ -246,22 +244,13 @@ export default function ScalpingPage() {
         <ActivityPanel title="Live scalping activity" eventFilter={isScalpingEvent} />
       </div>
 
-      {state && (
-        <PresetSelector risk={state.risk} balance={overview?.account.balance ?? null} onApply={applyPreset} />
-      )}
-
-      {state && (
-        <div className="mt-5 grid gap-5 lg:grid-cols-2">
-          {/* 2. Symbol selection */}
-          <SymbolForm config={state.config} onSave={saveConfig} />
-          {/* 3. AI Fire Control */}
-          <AiForm config={state.config} onSave={saveConfig} />
-          {/* 4. Scalping risk settings */}
-          <RiskForm risk={state.risk} onSave={saveRisk} />
-          {/* 5. Execution settings */}
-          <ExecutionForm risk={state.risk} onSave={saveRisk} />
+      <div className="card mt-5 flex flex-wrap items-center justify-between gap-3">
+        <div>
+          <div className="text-sm font-semibold">Scalping configuration moved to Settings</div>
+          <div className="mt-1 text-xs text-ink-dim">All bot, provider, risk, scanner and scalping settings are now managed from one place.</div>
         </div>
-      )}
+        <Link href="/dashboard?tab=Settings#scalping-settings" className="btn-primary">Open scalping settings</Link>
+      </div>
 
       {/* 6. Active scalping trades */}
       <Section title="Active scalping trades">
@@ -315,6 +304,8 @@ export default function ScalpingPage() {
       <ScalpPerformance />
         </main>
       </div>
+      <FloatingAssistant contextPage={SCALPING_NAV_ID} />
+      <MobileBottomNav active={SCALPING_NAV_ID} />
     </div>
   );
 }

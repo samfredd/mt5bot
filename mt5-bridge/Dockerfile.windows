@@ -1,0 +1,38 @@
+# escape=`
+# Production MT5 bridge image. Build and run this on a Windows Server 2022
+# container host in Windows-container mode (not Docker Desktop Linux mode).
+FROM mcr.microsoft.com/windows/servercore:ltsc2022
+
+SHELL ["powershell", "-NoProfile", "-Command", "$ErrorActionPreference = 'Stop'; $ProgressPreference = 'SilentlyContinue';"]
+
+# Windows Python is required by MetaQuotes' MetaTrader5 Python integration.
+ARG PYTHON_VERSION=3.12.7
+RUN Invoke-WebRequest "https://www.python.org/ftp/python/${PYTHON_VERSION}/python-${PYTHON_VERSION}-amd64.exe" -OutFile C:\python-installer.exe ; `
+    Start-Process C:\python-installer.exe -ArgumentList '/quiet InstallAllUsers=1 PrependPath=1 Include_test=0' -Wait ; `
+    Remove-Item C:\python-installer.exe
+
+# Install the terminal once, then retain a pristine portable template. At
+# runtime start.ps1 seeds the persistent data volume from this template.
+RUN Invoke-WebRequest "https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5setup.exe" -OutFile C:\mt5setup.exe ; `
+    Start-Process C:\mt5setup.exe -ArgumentList '/auto' -Wait ; `
+    Remove-Item C:\mt5setup.exe ; `
+    Copy-Item 'C:\Program Files\MetaTrader 5' C:\mt5-template -Recurse
+
+WORKDIR C:\app
+COPY requirements.txt .
+RUN python -m pip install --no-cache-dir -r requirements.txt ; `
+    python -m pip install --no-cache-dir MetaTrader5
+COPY main.py filling.py start-windows.ps1 .
+
+# C:\mt5-data is a persistent named volume. It contains terminal profiles,
+# server catalogues, logs and market history; never bake account state into the
+# image. The bridge API key is mounted as C:\run\secrets\bridge_api_key.
+VOLUME C:\mt5-data
+EXPOSE 5001
+ENV MT5_MOCK=false `
+    MT5_PATH=C:\mt5-data\terminal64.exe `
+    MT5_PORTABLE=true `
+    BRIDGE_API_KEY_FILE=C:\run\secrets\bridge_api_key `
+    PORT=5001
+
+ENTRYPOINT ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "C:\\app\\start-windows.ps1"]

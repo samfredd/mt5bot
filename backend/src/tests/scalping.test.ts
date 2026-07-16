@@ -47,14 +47,15 @@ function gateInput(overrides: Partial<ScalpGateInput> = {}): ScalpGateInput {
 }
 
 describe("scalping risk settings validation", () => {
-  it("rejects maxOpenTradesTotal outside 1..10", () => {
+  it("accepts operator-defined open capacity and rejects non-positive values", () => {
     expect(ScalpingRiskSchema.safeParse({ maxOpenTradesTotal: 0 }).success).toBe(false);
-    expect(ScalpingRiskSchema.safeParse({ maxOpenTradesTotal: 11 }).success).toBe(false);
+    expect(ScalpingRiskSchema.safeParse({ maxOpenTradesTotal: 11 }).success).toBe(true);
     expect(ScalpingRiskSchema.safeParse({ maxOpenTradesTotal: 5 }).success).toBe(true);
   });
 
-  it("rejects maxTradesPerSymbol > 1 in v1", () => {
-    expect(ScalpingRiskSchema.safeParse({ maxTradesPerSymbol: 2 }).success).toBe(false);
+  it("allows operator-defined multi-entry capacity", () => {
+    expect(ScalpingRiskSchema.safeParse({ maxTradesPerSymbol: 2 }).success).toBe(true);
+    expect(ScalpingRiskSchema.safeParse({ maxTradesPerSymbol: 11 }).success).toBe(true);
     expect(ScalpingRiskSchema.safeParse({ maxTradesPerSymbol: 1 }).success).toBe(true);
   });
 
@@ -65,9 +66,9 @@ describe("scalping risk settings validation", () => {
     expect(ScalpingRiskSchema.safeParse({ reentryAfterLossSeconds: 0 }).success).toBe(false);
   });
 
-  it("rejects minAiConfidence outside 0..1 and an unrealistic daily loss cap", () => {
+  it("rejects confidence outside 0..1 and accepts operator-defined loss limits", () => {
     expect(ScalpingConfigSchema.safeParse({ minAiConfidence: 1.5 }).success).toBe(false);
-    expect(ScalpingRiskSchema.safeParse({ dailyLossLimitPercent: 99 }).success).toBe(false);
+    expect(ScalpingRiskSchema.safeParse({ dailyLossLimitPercent: 99 }).success).toBe(true);
     expect(ScalpingRiskSchema.safeParse({ dailyLossLimitPercent: 1.5 }).success).toBe(true);
   });
 
@@ -88,13 +89,21 @@ describe("scalping risk settings validation", () => {
   });
 });
 
-describe("one-trade-per-symbol enforcement", () => {
-  it("blocks a second trade on the same pair (suffix-tolerant)", () => {
+describe("per-symbol trade capacity", () => {
+  it("blocks another trade when the configured capacity is full (suffix-tolerant)", () => {
     expect(hasActiveScalpForSymbol([{ symbol: "EURUSDm", ticket: "1" }], "EURUSD")).toBe(true);
     expect(hasActiveScalpForSymbol([{ symbol: "GBPUSD", ticket: "1" }], "EURUSD")).toBe(false);
     const gate = evaluateScalpingGate(gateInput({ active: [{ symbol: "EURUSD", ticket: "1" }] }));
     expect(gate.ok).toBe(false);
-    expect(gate.reason).toContain("one_per_symbol");
+    expect(gate.reason).toContain("max_trades_per_symbol");
+  });
+
+  it("allows another entry while per-symbol capacity remains", () => {
+    const gate = evaluateScalpingGate(gateInput({
+      risk: { ...RISK, maxTradesPerSymbol: 2 },
+      active: [{ symbol: "EURUSDm", ticket: "1" }],
+    }));
+    expect(gate.ok).toBe(true);
   });
 });
 
@@ -298,7 +307,7 @@ describe("automatic scalping entry telemetry", () => {
       skipped: 2,
     };
 
-    const first = maybeScalpingBlockAudit(blocked, null, 1_000);
+    const first = maybeScalpingBlockAudit(blocked, null, 1_000, 30_000);
     expect(first.event?.detail).toMatchObject({
       symbol: "USDJPY",
       reason: "global risk: exposure: USD net exposure exceeds cap",
@@ -306,17 +315,17 @@ describe("automatic scalping entry telemetry", () => {
       skipped: 2,
     });
 
-    const repeated = maybeScalpingBlockAudit(blocked, first.state, 5_000);
+    const repeated = maybeScalpingBlockAudit(blocked, first.state, 5_000, 30_000);
     expect(repeated.event).toBeNull();
 
-    const afterThrottle = maybeScalpingBlockAudit(blocked, first.state, 32_000);
+    const afterThrottle = maybeScalpingBlockAudit(blocked, first.state, 32_000, 30_000);
     expect(afterThrottle.event?.detail.reason).toContain("global risk");
 
     const changedReason = maybeScalpingBlockAudit({
       opened: [],
       blocked: [{ symbol: "USDJPY", reason: "scalp_spread: spread 42 pts" }],
       skipped: 2,
-    }, first.state, 6_000);
+    }, first.state, 6_000, 30_000);
     expect(changedReason.event?.detail.reason).toContain("scalp_spread");
   });
 
@@ -325,7 +334,7 @@ describe("automatic scalping entry telemetry", () => {
       opened: [{ symbol: "USDJPY", direction: "buy", ticket: "123" }],
       blocked: [{ symbol: "AUDUSD", reason: "max_open_total: 5/5 open" }],
       skipped: 0,
-    }, null, 1_000);
+    }, null, 1_000, 30_000);
 
     expect(result.event).toBeNull();
   });

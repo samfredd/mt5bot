@@ -42,7 +42,7 @@ RUN xvfb-run -a wine python -m pip install --no-cache-dir MetaTrader5 fastapi uv
     wineserver -w
 
 WORKDIR /app
-COPY main.py entrypoint-real.sh ./
+COPY main.py filling.py entrypoint-real.sh ./
 RUN chmod +x entrypoint-real.sh
 
 EXPOSE 5001

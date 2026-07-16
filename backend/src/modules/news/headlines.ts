@@ -1,9 +1,9 @@
 import { z } from "zod";
-import { config } from "../../config.js";
 import { prisma } from "../../lib/prisma.js";
 import { audit, logError } from "../../lib/audit.js";
 import { generateJson } from "../ai/service.js";
 import { withResilience } from "../../lib/resilience.js";
+import { getOperationalConfig } from "../system/operational-config.js";
 
 /**
  * Breaking-news headlines: pulled from financial RSS feeds, classified by
@@ -82,7 +82,7 @@ function classificationPrompt(headlines: RawHeadline[]): string {
 
 /** Fetch feeds, classify new headlines with the AI, store them. */
 export async function refreshHeadlines(): Promise<number> {
-  const feeds = config.NEWS_RSS_FEEDS.split(",").map((s) => s.trim()).filter(Boolean);
+  const feeds = (await getOperationalConfig()).newsRssFeeds;
   if (!feeds.length) return 0;
 
   const all: RawHeadline[] = [];

@@ -63,6 +63,7 @@ export const DEFAULT_SCALPING_RISK: ScalpingRiskConfig = {
   maxLotSize: 0.01,
   lotMode: "fixed",
   riskPerTradePercent: 0.5,
+  maxTotalRiskExposurePercent: 5,
   allowFixedLot: true,
   profitTargetMoney: null,
   reentryAfterWinSeconds: 1,

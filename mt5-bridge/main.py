@@ -5,9 +5,9 @@ Two modes:
   * MT5_MOCK=true  (default): a self-contained mock broker with random-walk
     prices and a paper position book. Runs on any OS — use this for all
     development and demo testing.
-  * MT5_MOCK=false: wraps the official MetaTrader5 Python package
-    (Windows / Wine only). Credentials come from environment variables set
-    by the operator, never from API calls.
+  * MT5_MOCK=false: wraps the official MetaTrader5 Python package on Windows.
+    Broker account credentials arrive only through the authenticated backend
+    connect flow and are never baked into this image or an env file.
 
 Every request requires the X-API-Key header. Every order/modify/close is
 logged to stdout (the backend additionally writes its own audit trail).
@@ -16,6 +16,7 @@ logged to stdout (the backend additionally writes its own audit trail).
 import logging
 import os
 import random
+import secrets
 import sys
 import threading
 import time
@@ -32,13 +33,32 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger("mt5-bridge")
 
 MOCK = os.environ.get("MT5_MOCK", "true").lower() in ("1", "true", "yes")
-API_KEY = os.environ.get("BRIDGE_API_KEY", "change-me-bridge-key")
+
+
+def _read_bootstrap_secret(name: str, default: str = "") -> str:
+    """Read a mounted deployment secret before considering a legacy env var."""
+    path = os.environ.get(f"{name}_FILE", "")
+    if path:
+        try:
+            with open(path, "r", encoding="utf-8") as secret_file:
+                value = secret_file.read().strip()
+            if value:
+                return value
+        except OSError as exc:
+            raise RuntimeError(f"cannot read {name}_FILE: {exc}") from exc
+    return os.environ.get(name, default)
+
+
+API_KEY = _read_bootstrap_secret("BRIDGE_API_KEY", "change-me-bridge-key")
+if not MOCK and API_KEY == "change-me-bridge-key":
+    raise RuntimeError("real MT5 bridge requires BRIDGE_API_KEY_FILE with a non-default secret")
 
 app = FastAPI(title="MT5 Bridge", version="0.1.0")
+BROKER_MUTATION_LOCK = threading.RLock()
 
 
 def require_key(x_api_key: str = Header(default="")) -> None:
-    if x_api_key != API_KEY:
+    if not secrets.compare_digest(x_api_key, API_KEY):
         raise HTTPException(status_code=401, detail="invalid api key")
 
 
@@ -49,6 +69,9 @@ class OrderRequest(BaseModel):
     sl: float | None = None
     tp: float | None = None
     comment: str = "mt5bot"
+    client_order_id: str = Field(min_length=8, max_length=64)
+    expected_login: str
+    expected_server: str | None = None
 
 
 class ModifyRequest(BaseModel):
@@ -84,6 +107,9 @@ class MockBroker:
         self.balance = 10_000.0
         self.positions: dict[str, dict] = {}
         self.deals: list[dict] = []
+        self.order_results: dict[str, dict] = {}
+        self.login = "mock-12345678"
+        self.server = "MockBroker-Demo"
         self.seeds = {s: random.Random(hash(s) & 0xFFFF) for s in MOCK_SYMBOLS}
         t = threading.Thread(target=self._tick_loop, daemon=True)
         t.start()
@@ -178,7 +204,7 @@ class MockBroker:
             equity = self.balance + floating
             margin = sum(p["volume"] * 1000 for p in self.positions.values())
             return {
-                "login": "mock-12345678",
+                "login": self.login,
                 "balance": round(self.balance, 2),
                 "equity": round(equity, 2),
                 "margin": round(margin, 2),
@@ -186,7 +212,9 @@ class MockBroker:
                 "margin_level": round((equity / margin) * 100, 2) if margin else 100000.0,
                 "currency": "USD",
                 "is_demo": True,
-                "server": "MockBroker-Demo",
+                "server": self.server,
+                "margin_mode": 2,
+                "fifo_close": False,
             }
 
     def open_positions(self) -> list[dict]:
@@ -198,17 +226,23 @@ class MockBroker:
 
     def place(self, req: OrderRequest) -> dict:
         with self.lock:
+            if req.client_order_id in self.order_results:
+                return self.order_results[req.client_order_id]
+            if str(req.expected_login) != str(self.login) or (req.expected_server and req.expected_server != self.server):
+                return {"ok": False, "status": "REJECTED", "requested_volume": req.volume, "filled_volume": 0, "error": "account fence mismatch"}
             t = self.tick_unlocked(req.symbol)
             price = t["ask"] if req.direction == "buy" else t["bid"]
             ticket = uuid.uuid4().hex[:10]
             self.positions[ticket] = {
                 "ticket": ticket, "symbol": req.symbol, "type": req.direction,
                 "volume": req.volume, "price_open": price, "sl": req.sl, "tp": req.tp,
-                "time": datetime.now(timezone.utc).isoformat(),
+                "time": datetime.now(timezone.utc).isoformat(), "magic": 770077, "comment": req.comment,
             }
             log.info("MOCK ORDER %s %s %s %.2f lots @ %s sl=%s tp=%s", ticket, req.direction, req.symbol, req.volume, price, req.sl, req.tp)
             # Mock has one ticket per position, so position_id == ticket.
-            return {"ok": True, "ticket": ticket, "position_id": ticket, "price": price, "retcode": 10009}
+            result = {"ok": True, "status": "FILLED", "ticket": ticket, "deal_id": ticket, "position_id": ticket, "price": price, "retcode": 10009, "requested_volume": req.volume, "filled_volume": req.volume}
+            self.order_results[req.client_order_id] = result
+            return result
 
     def tick_unlocked(self, symbol: str) -> dict:
         if symbol not in self.prices:
@@ -268,7 +302,7 @@ class MockBroker:
 
 
 # ---------------------------------------------------------------------------
-# Real MT5 adapter (Windows / Wine only)
+# Real MT5 adapter (Windows; Wine is retained only as a development fallback)
 # ---------------------------------------------------------------------------
 
 class RealBroker:
@@ -336,6 +370,8 @@ class RealBroker:
             "margin_level": info.margin_level or 0.0, "currency": info.currency,
             "is_demo": info.trade_mode == 0,
             "server": info.server,
+            "margin_mode": int(info.margin_mode),
+            "fifo_close": bool(getattr(info, "fifo_close", False)),
         }
 
     def tick(self, symbol: str) -> dict:
@@ -400,12 +436,17 @@ class RealBroker:
                 "sl": p.sl or None, "tp": p.tp or None,
                 "profit": p.profit,
                 "time": datetime.fromtimestamp(p.time, tz=timezone.utc).isoformat(),
+                "magic": int(getattr(p, "magic", 0)),
+                "comment": str(getattr(p, "comment", "")),
             }
             for p in positions
         ]
 
     def place(self, req: OrderRequest) -> dict:
         mt5 = self.mt5
+        account = self.account()
+        if str(account["login"]) != str(req.expected_login) or (req.expected_server and account.get("server") != req.expected_server):
+            return {"ok": False, "status": "REJECTED", "requested_volume": req.volume, "filled_volume": 0, "error": "account fence mismatch"}
         info = self._ensure_symbol(req.symbol)
         t = mt5.symbol_info_tick(req.symbol)
         if t is None:
@@ -415,17 +456,21 @@ class RealBroker:
         request = {
             "action": mt5.TRADE_ACTION_DEAL, "symbol": req.symbol, "volume": req.volume,
             "type": order_type, "price": price, "deviation": 20, "magic": 770077,
-            "comment": req.comment, "type_time": mt5.ORDER_TIME_GTC,
+            "comment": req.comment[:31], "type_time": mt5.ORDER_TIME_GTC,
             "type_filling": select_filling_mode(mt5, info),
         }
         if req.sl:
             request["sl"] = req.sl
         if req.tp:
             request["tp"] = req.tp
+        check = mt5.order_check(request)
+        if check is None or getattr(check, "retcode", 1) != 0:
+            return {"ok": False, "status": "REJECTED", "requested_volume": req.volume, "filled_volume": 0, "retcode": getattr(check, "retcode", None), "error": f"order_check failed: {getattr(check, 'comment', mt5.last_error())}"}
         result = mt5.order_send(request)
         if result is None:
             return {"ok": False, "error": str(mt5.last_error())}
-        ok = result.retcode == mt5.TRADE_RETCODE_DONE
+        status = "FILLED" if result.retcode == mt5.TRADE_RETCODE_DONE else "PARTIALLY_FILLED" if result.retcode == mt5.TRADE_RETCODE_DONE_PARTIAL else "PLACED" if result.retcode == mt5.TRADE_RETCODE_PLACED else "REJECTED"
+        ok = status in ("FILLED", "PARTIALLY_FILLED")
         # Resolve the POSITION identifier (not just the order ticket). They are
         # equal on a hedging account, but on a netting account a new order
         # merges into the existing position whose id is the first order's
@@ -439,10 +484,12 @@ class RealBroker:
             except Exception as exc:  # noqa: BLE001 — fall back to order ticket
                 log.warning("could not resolve position_id from deal %s: %s", result.deal, exc)
         return {
-            "ok": ok, "ticket": str(result.order) if ok else None,
+            "ok": ok, "status": status, "ticket": str(result.order) if result.order else None,
+            "deal_id": str(result.deal) if getattr(result, "deal", 0) else None,
             "position_id": position_id,
             "price": result.price, "retcode": result.retcode,
-            "error": None if ok else f"retcode {result.retcode}: {result.comment}",
+            "requested_volume": req.volume, "filled_volume": float(getattr(result, "volume", 0.0)),
+            "error": None if status in ("FILLED", "PARTIALLY_FILLED", "PLACED") else f"retcode {result.retcode}: {result.comment}",
         }
 
     def modify(self, ticket: str, req: ModifyRequest) -> dict:
@@ -496,7 +543,9 @@ class RealBroker:
         return [
             {"ticket": str(d.ticket), "position_id": str(d.position_id),
              "symbol": d.symbol, "volume": d.volume,
-             "price": d.price, "profit": d.profit,
+             "price": d.price, "profit": d.profit, "commission": getattr(d, "commission", 0.0),
+             "swap": getattr(d, "swap", 0.0), "fee": getattr(d, "fee", 0.0),
+             "comment": str(getattr(d, "comment", "")), "magic": int(getattr(d, "magic", 0)),
              "time": datetime.fromtimestamp(d.time, tz=timezone.utc).isoformat()}
             for d in deals
         ]
@@ -566,9 +615,16 @@ def symbols() -> dict:
 def connect(req: ConnectRequest) -> dict:
     """Switch the terminal to another account (demo or real). Credentials are
     used for the login call only and never logged or stored here."""
+    with BROKER_MUTATION_LOCK:
+        return _connect_unlocked(req)
+
+
+def _connect_unlocked(req: ConnectRequest) -> dict:
     if MOCK:
         log.info("MOCK CONNECT login=%s server=%s", req.login, req.server)
-        return {"ok": True, "login": str(req.login), "is_demo": True, "balance": broker.balance}
+        broker.login = str(req.login)
+        broker.server = req.server
+        return {"ok": True, "login": broker.login, "is_demo": True, "balance": broker.balance}
     # Switching to a server the terminal hasn't seen before can take well over
     # the package's 60s default while it fetches the server config.
     timeout_ms = int(os.environ.get("MT5_LOGIN_TIMEOUT_MS", "90000"))
@@ -595,19 +651,22 @@ def connect(req: ConnectRequest) -> dict:
 @app.post("/order", dependencies=[Depends(require_key)])
 def order(req: OrderRequest) -> dict:
     log.info("ORDER REQUEST %s", req.model_dump())
-    result = broker.place(req)
+    with BROKER_MUTATION_LOCK:
+        result = broker.place(req)
     log.info("ORDER RESULT %s", result)
     return result
 
 
 @app.post("/position/{ticket}/modify", dependencies=[Depends(require_key)])
 def modify(ticket: str, req: ModifyRequest) -> dict:
-    return broker.modify(ticket, req)
+    with BROKER_MUTATION_LOCK:
+        return broker.modify(ticket, req)
 
 
 @app.post("/position/{ticket}/close", dependencies=[Depends(require_key)])
 def close(ticket: str) -> dict:
-    return broker.close(ticket)
+    with BROKER_MUTATION_LOCK:
+        return broker.close(ticket)
 
 
 if __name__ == "__main__":

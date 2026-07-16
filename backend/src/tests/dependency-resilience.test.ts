@@ -10,6 +10,13 @@ vi.mock("../lib/redis.js", () => ({
   writeJson: vi.fn(async () => true),
 }));
 
+vi.mock("../lib/prisma.js", () => ({
+  prisma: {
+    systemSetting: { findUnique: vi.fn(async ({ where }: { where: { key: string } }) =>
+      where.key === "ai_provider" ? { value: { provider: "ollama" } } : null), upsert: vi.fn(async () => ({})) },
+  },
+}));
+
 const { __resetCircuitsForTests } = await import("../lib/resilience.js");
 const { mt5 } = await import("../modules/mt5/client.js");
 const { generateJson } = await import("../modules/ai/service.js");

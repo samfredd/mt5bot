@@ -11,7 +11,7 @@ import {
   type ScalpingRiskPatch,
 } from "./scalping.schema.js";
 import { DEFAULT_SCALPING_CONFIG, DEFAULT_SCALPING_RISK, type ScalpingStatus } from "./scalping.types.js";
-import { SCALPING_PRESETS, detectPreset, exposureCapPct, totalExposureExceedsCapForRisk, type ScalpingPresetKey } from "./scalping.presets.js";
+import { SCALPING_PRESETS, detectPreset, totalExposureExceedsCapForRisk, type ScalpingPresetKey } from "./scalping.presets.js";
 
 /**
  * Persistence for scalping config + scalping-specific risk settings.
@@ -48,6 +48,7 @@ export async function getScalpingConfig(): Promise<ScalpingConfig> {
   const row = await prisma.systemSetting.findUnique({ where: { key: CONFIG_KEY } });
   const merged = { ...DEFAULT_SCALPING_CONFIG, ...((row?.value as Partial<ScalpingConfig>) ?? {}) };
   const value = ScalpingConfigSchema.parse(merged);
+  if (!row) await prisma.systemSetting.upsert({ where: { key: CONFIG_KEY }, create: { key: CONFIG_KEY, value: value as object }, update: {} });
   configCache = { value, ts: Date.now() };
   return value;
 }
@@ -88,6 +89,7 @@ export async function getScalpingRisk(): Promise<ScalpingRiskConfig> {
   const stored = normalizeLegacyScalpingRisk((row?.value as Partial<ScalpingRiskConfig>) ?? {});
   const merged = { ...DEFAULT_SCALPING_RISK, ...stored };
   const value = ScalpingRiskSchema.parse(merged);
+  if (!row) await prisma.systemSetting.upsert({ where: { key: RISK_KEY }, create: { key: RISK_KEY, value: value as object }, update: {} });
   riskCache = { value, ts: Date.now() };
   return value;
 }
@@ -109,11 +111,18 @@ export async function setScalpingRisk(
     ? merged
     : { ...merged, scalpingRiskPreset: detectPreset(config, merged) };
 
+  if (next.maxTradesPerSymbol > next.maxOpenTradesTotal) {
+    throw new ScalpingRiskError(
+      `Maximum per symbol is ${next.maxTradesPerSymbol}, but Maximum open trades is only ${next.maxOpenTradesTotal}. ` +
+      "Maximum per symbol cannot exceed the total open-trade capacity",
+    );
+  }
+
   // Hard exposure ceiling — block the save rather than silently allow reckless
   // total open risk (defense in depth; the entry gate checks this too).
   if (totalExposureExceedsCapForRisk(next)) {
     throw new ScalpingRiskError(
-      `total exposure ${(next.maxOpenTradesTotal * next.riskPerTradePercent).toFixed(2)}% exceeds the ${exposureCapPct(next.scalpingRiskPreset)}% cap for "${next.scalpingRiskPreset}" — lower max open trades or risk per trade`,
+      `total exposure ${(next.maxOpenTradesTotal * next.riskPerTradePercent).toFixed(2)}% exceeds your configured ${next.maxTotalRiskExposurePercent}% cap — raise Maximum total risk exposure or lower maximum open trades/risk per trade`,
     );
   }
 

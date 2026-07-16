@@ -44,7 +44,13 @@ export function evaluateStrategy(strategy: Strategy, analysis: MarketAnalysis): 
     return evaluateMeanReversion(strategy, config, analysis, primary, higher, reasons);
   }
   if (config.entry.style === "breakout") {
-    return evaluateBreakout(strategy, config, analysis, primary, reasons);
+    return evaluateBreakout(strategy, config, analysis, primary, higher, reasons);
+  }
+
+  const minTrendAdx = config.entry.trendMinAdx;
+  if (minTrendAdx && primary.adx !== null && primary.adx < minTrendAdx) {
+    reasons.push(`${primary.timeframe} ADX ${primary.adx.toFixed(1)} < ${minTrendAdx} — insufficient trend strength`);
+    return { symbol: analysis.symbol, direction: null, confidence: 0, reasons, strategyId: strategy.id, strategyName: strategy.name, config };
   }
 
   let bullScore = 0;
@@ -110,7 +116,8 @@ export function evaluateStrategy(strategy: Strategy, analysis: MarketAnalysis): 
   // 20 EMA in the trade direction, stand aside and wait for the retest.
   if (direction && primary.emaFast !== null && primary.atr && primary.lastClose !== null) {
     const extension = (primary.lastClose - primary.emaFast) / primary.atr;
-    if ((direction === "buy" && extension > 1.5) || (direction === "sell" && extension < -1.5)) {
+    const maxExtension = config.entry.maxExtensionAtr ?? 1.5;
+    if ((direction === "buy" && extension > maxExtension) || (direction === "sell" && extension < -maxExtension)) {
       reasons.push(`Rejected: over-extended ${Math.abs(extension).toFixed(1)} ATR from EMA20 — waiting for pullback, not chasing`);
       direction = null;
     }
@@ -118,6 +125,10 @@ export function evaluateStrategy(strategy: Strategy, analysis: MarketAnalysis): 
 
   const directionalScore = direction === "buy" ? bullScore : direction === "sell" ? bearScore : Math.max(bullScore, bearScore);
   const confidence = possibleScore > 0 ? Number((directionalScore / possibleScore).toFixed(4)) : 0;
+  if (direction && config.entry.minRuleConfidence && confidence < config.entry.minRuleConfidence) {
+    reasons.push(`Rejected: rule confidence ${(confidence * 100).toFixed(0)}% < ${(config.entry.minRuleConfidence * 100).toFixed(0)}%`);
+    direction = null;
+  }
   return { symbol: analysis.symbol, direction, confidence, reasons, strategyId: strategy.id, strategyName: strategy.name, config };
 }
 
@@ -191,6 +202,7 @@ function evaluateBreakout(
   config: ReturnType<typeof StrategyConfigSchema.parse>,
   analysis: MarketAnalysis,
   primary: MarketAnalysis["timeframes"][number],
+  higher: MarketAnalysis["timeframes"][number] | undefined,
   reasons: string[],
 ): StrategySignal {
   const done = (direction: "buy" | "sell" | null) =>
@@ -201,12 +213,31 @@ function evaluateBreakout(
   if (!range) { reasons.push("no completed Asian-session range yet — nothing to break"); return done(null); }
   if (close === null) { reasons.push("no price"); return done(null); }
 
+  const atr = primary.atr;
+  if (!atr || atr <= 0) { reasons.push("no ATR available to validate breakout quality"); return done(null); }
+  const rangeAtr = (range.high - range.low) / atr;
+  const minRangeAtr = config.entry.breakoutMinRangeAtr ?? 0.5;
+  const maxRangeAtr = config.entry.breakoutMaxRangeAtr ?? 3;
+  if (rangeAtr < minRangeAtr || rangeAtr > maxRangeAtr) {
+    reasons.push(`Asian range ${rangeAtr.toFixed(2)} ATR is outside ${minRangeAtr}–${maxRangeAtr} ATR quality band`);
+    return done(null);
+  }
+
   reasons.push(`Asian range ${range.low} – ${range.high}`);
-  if (close > range.high) {
+  const buffer = atr * (config.entry.breakoutBufferAtr ?? 0.1);
+  if (close > range.high + buffer) {
+    if (config.entry.breakoutRequireHigherAlignment && higher && higher !== primary && higher.trend !== "bullish") {
+      reasons.push(`${higher.timeframe} is ${higher.trend}; long breakout lacks higher-timeframe confirmation`);
+      return done(null);
+    }
     reasons.push(`close ${close} broke ABOVE the range — long breakout`);
     return done("buy");
   }
-  if (close < range.low) {
+  if (close < range.low - buffer) {
+    if (config.entry.breakoutRequireHigherAlignment && higher && higher !== primary && higher.trend !== "bearish") {
+      reasons.push(`${higher.timeframe} is ${higher.trend}; short breakout lacks higher-timeframe confirmation`);
+      return done(null);
+    }
     reasons.push(`close ${close} broke BELOW the range — short breakout`);
     return done("sell");
   }

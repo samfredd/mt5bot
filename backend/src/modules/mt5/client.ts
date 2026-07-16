@@ -1,9 +1,9 @@
-import { config } from "../../config.js";
 import { logger } from "../../lib/logger.js";
 import { audit, logError } from "../../lib/audit.js";
 import { CircuitOpenError, circuitSnapshot, withResilience } from "../../lib/resilience.js";
 import type { TradingInstrumentSpec } from "../risk/instruments.js";
 import { reportIncident, resolveIncidentByDedupeKey } from "../incidents/service.js";
+import { getOperationalConfig } from "../system/operational-config.js";
 
 /**
  * HTTP client for the Python MT5 bridge. This is the ONLY place in the
@@ -21,6 +21,8 @@ export interface AccountInfo {
   is_demo: boolean;
   // Broker server name; absent until the bridge is restarted on a build that sends it.
   server?: string;
+  margin_mode?: number;
+  fifo_close?: boolean;
 }
 
 export interface Position {
@@ -34,6 +36,8 @@ export interface Position {
   tp: number | null;
   profit: number;
   time: string;
+  magic?: number;
+  comment?: string;
 }
 
 export interface Tick {
@@ -86,6 +90,9 @@ export interface OrderRequest {
   sl?: number;
   tp?: number;
   comment?: string;
+  client_order_id?: string;
+  expected_login?: string;
+  expected_server?: string;
 }
 
 export interface OrderResult {
@@ -97,6 +104,10 @@ export interface OrderResult {
   price?: number;
   error?: string;
   retcode?: number;
+  status?: "PLACED" | "PARTIALLY_FILLED" | "FILLED" | "REJECTED" | "UNKNOWN";
+  requested_volume?: number;
+  filled_volume?: number;
+  deal_id?: string;
 }
 
 /**
@@ -175,14 +186,15 @@ async function resolveSymbol(symbol: string): Promise<string> {
 type BridgeInit = Omit<RequestInit, "body"> & { body?: string; timeoutMs?: number };
 
 async function bridge<T>(path: string, init?: BridgeInit): Promise<T> {
-  const url = `${config.MT5_BRIDGE_URL}${path}`;
+  const settings = await getOperationalConfig();
+  const url = `${settings.mt5BridgeUrl.replace(/\/$/, "")}${path}`;
   const started = Date.now();
   try {
     const res = await fetch(url, {
       ...init,
       headers: {
         "content-type": "application/json",
-        "x-api-key": config.MT5_BRIDGE_API_KEY,
+        "x-api-key": settings.mt5BridgeApiKey,
         ...(init?.headers ?? {}),
       },
       signal: AbortSignal.timeout(init?.timeoutMs ?? 15000),

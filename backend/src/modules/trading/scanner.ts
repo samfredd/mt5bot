@@ -1,19 +1,23 @@
 import { prisma } from "../../lib/prisma.js";
 import { audit } from "../../lib/audit.js";
-import { matchBrokerSymbol, mt5, type Tick } from "../mt5/client.js";
+import { matchBrokerSymbol, mt5, type Candle, type Tick } from "../mt5/client.js";
 import { accountIdForLogin } from "../mt5/account.js";
 import { buildMarketAnalysis, type MarketAnalysis } from "../analysis/engine.js";
+import { buildDecisionContext } from "../analysis/context.js";
 import { assessNewsRisk } from "../news/service.js";
-import { askModel } from "../ai/service.js";
+import { askModel, getActiveProvider, PURE_LOGIC_PROVIDER, pureLogicDecision } from "../ai/service.js";
 import { buildTradePrompt } from "../ai/prompts.js";
+import { clampSuggestedLevels } from "../ai/schema.js";
+import { cachedSentiment, refreshSentimentSoon } from "../sentiment/service.js";
 import { calculateLots, validateTrade, type TradeProposal } from "../risk/engine.js";
 import { buildRiskContext, executeTrade, sessionNow } from "./service.js";
 import { getBotState } from "../system/state.js";
 import { notify } from "../notifications/service.js";
 import { broadcast } from "../ws/hub.js";
 import { normalizeCandles } from "../backtest/market-data.js";
-import { fallbackTradingSpec } from "../risk/instruments.js";
+import { fallbackTradingSpec, moneyForPriceMove } from "../risk/instruments.js";
 import { openPaperTrade } from "./paper.js";
+import { adaptiveRiskSettings, applyAiLotSizing } from "../risk/adaptive.js";
 
 /**
  * Autonomous market scanner: sweeps a watchlist on its own (no strategy
@@ -84,6 +88,7 @@ async function defaultScannerConfig(): Promise<ScannerConfig> {
 export async function getScannerConfig(): Promise<ScannerConfig> {
   const row = await prisma.systemSetting.findUnique({ where: { key: "scanner" } });
   const cfg = { ...(await defaultScannerConfig()), ...((row?.value as Partial<ScannerConfig>) ?? {}) };
+  if (!row) await prisma.systemSetting.upsert({ where: { key: "scanner" }, create: { key: "scanner", value: cfg as object }, update: {} });
   try {
     return { ...cfg, symbols: resolveScannerSymbols(cfg.symbols, await mt5.symbols()) };
   } catch {
@@ -108,6 +113,7 @@ interface Candidate {
   score: number;
   reasons: string[];
   analysis: MarketAnalysis;
+  candlesByTf: Record<string, Candle[]>;
   tick: Tick;
 }
 
@@ -246,7 +252,7 @@ export async function runScanner(
       const s = scoreSymbol(analysis);
       if (directed) directedAnalysis = { symbol: brokerSymbol, direction: s.direction, score: s.score, reasons: s.reasons };
       if (s.direction && s.score >= minScore) {
-        candidates.push({ symbol: brokerSymbol, direction: s.direction, score: s.score, reasons: s.reasons, analysis, tick });
+        candidates.push({ symbol: brokerSymbol, direction: s.direction, score: s.score, reasons: s.reasons, analysis, candlesByTf, tick });
       }
     } catch (err) {
       fetchErrors.push(symbol);
@@ -301,13 +307,68 @@ export async function runScanner(
       continue;
     }
 
-    // 3. AI vetting
-    const prompt = buildTradePrompt(
-      best.analysis, news,
-      `Autonomous scanner: ${best.direction.toUpperCase()} candidate on ${best.symbol}, confluence score ${best.score} — ${best.reasons.join("; ")}`,
-      `maxRiskPerTrade=${settings.maxRiskPerTradePct}%, minRR=${settings.minRiskReward}`,
+    // 3. Deterministic setup preview + AI vetting. Build the same compact
+    // DecisionContext used by configured strategies; the model never receives
+    // raw indicator objects or gets to invent an unbounded setup.
+    const primary = best.analysis.timeframes.find((t) => t.timeframe === "H1") ?? best.analysis.timeframes[0];
+    if (!primary?.atr) continue;
+    const entry = best.direction === "buy" ? best.analysis.ask : best.analysis.bid;
+    const slDist = primary.atr * 1.5;
+    const tpDist = primary.atr * 3.0;
+    const engineeredStopLoss = best.direction === "buy" ? entry - slDist : entry + slDist;
+    const engineeredTakeProfit = best.direction === "buy" ? entry + tpDist : entry - tpDist;
+    const account = await mt5.accountInfo();
+    const capital = adaptiveRiskSettings(settings, account.equity, state.adaptiveRiskEnabled);
+    const effectiveSettings = capital.settings;
+    const instrumentSpec = await mt5.symbolInfo(best.symbol).catch(() => fallbackTradingSpec(best.symbol, entry));
+    const previewLots = calculateLots(
+      best.symbol,
+      account.balance,
+      effectiveSettings.maxRiskPerTradePct,
+      entry,
+      engineeredStopLoss,
+      effectiveSettings.maxLotSize,
+      instrumentSpec,
     );
-    const { decision: ai, logId, valid: aiValid } = await askModel(prompt, best.symbol);
+    const sentiment = await cachedSentiment(best.symbol).catch(() => null);
+    refreshSentimentSoon(best.symbol);
+    const context = buildDecisionContext({
+      symbol: best.symbol,
+      session: best.analysis.session,
+      quote: { bid: best.analysis.bid, ask: best.analysis.ask, spreadPoints: best.analysis.spreadPoints },
+      candlesByTf: best.candlesByTf,
+      news,
+      sentiment,
+      setup: {
+        source: `scanner:${trigger}`,
+        direction: best.direction,
+        signalReasons: best.reasons,
+        entry,
+        stopLoss: engineeredStopLoss,
+        takeProfit: engineeredTakeProfit,
+        suggestedLots: previewLots,
+        moneyAtRisk: Math.abs(moneyForPriceMove(Math.abs(entry - engineeredStopLoss), previewLots, instrumentSpec)),
+        riskPctOfBalance: effectiveSettings.maxRiskPerTradePct,
+      },
+      account: { balance: account.balance, equity: account.equity, currency: account.currency, openPositions: (await mt5.positions().catch(() => [])).length },
+      limits: {
+        min_rr: effectiveSettings.minRiskReward,
+        max_risk_per_trade_pct: effectiveSettings.maxRiskPerTradePct,
+        max_spread_points: effectiveSettings.maxSpreadPoints,
+        max_open_trades: effectiveSettings.maxOpenTrades,
+      },
+    });
+    const aiMode = await getActiveProvider();
+    const pureLogic = aiMode === PURE_LOGIC_PROVIDER;
+    const aiResult = pureLogic ? null : await askModel(buildTradePrompt(context), best.symbol, {
+      userId: user.id,
+      direction: best.direction,
+      source: "scanner",
+    });
+    const ai = pureLogic ? pureLogicDecision(best.direction) : aiResult!.decision;
+    const judgment = pureLogic ? null : aiResult!.judgment;
+    const logId = pureLogic ? null : aiResult!.logId;
+    const aiValid = pureLogic || aiResult!.valid;
     // If the AI is unreachable it would veto every candidate identically —
     // stop and say so plainly rather than reporting a vague "no setup".
     if (!aiValid) {
@@ -319,7 +380,7 @@ export async function runScanner(
         };
       }
     }
-    const aiPasses = aiValid && ai.decision === best.direction && ai.confidence >= cfg.minAiConfidence;
+    const aiPasses = pureLogic || (aiValid && ai.decision === best.direction && ai.confidence >= cfg.minAiConfidence);
     if (!aiPasses) {
       aiVetoes++;
       await audit({
@@ -342,20 +403,31 @@ export async function runScanner(
       if (cfg.aiMode === "STRICT") continue;
     }
 
-    // 4. Levels + suggested size (user picks the real amount at approval)
-    const primary = best.analysis.timeframes.find((t) => t.timeframe === "H1") ?? best.analysis.timeframes[0];
-    if (!primary?.atr) continue;
-    const entry = best.direction === "buy" ? best.analysis.ask : best.analysis.bid;
-    const slDist = primary.atr * 1.5;
-    const tpDist = primary.atr * 3.0;
-    const stopLoss = ai.suggested_stop_loss ?? (best.direction === "buy" ? entry - slDist : entry + slDist);
-    const takeProfit = ai.suggested_take_profit ?? (best.direction === "buy" ? entry + tpDist : entry - tpDist);
-    const account = await mt5.accountInfo();
-    const instrumentSpec = await mt5.symbolInfo(best.symbol).catch(() => fallbackTradingSpec(best.symbol, entry));
-    const suggestedLots = calculateLots(best.symbol, account.balance, settings.maxRiskPerTradePct, entry, stopLoss, settings.maxLotSize, instrumentSpec);
+    // 4. Levels + suggested size (user picks the real amount at approval).
+    // AI refinements are accepted only on the correct side and within an ATR
+    // band; otherwise the deterministic scanner levels remain in force.
+    const clamped = clampSuggestedLevels(
+      best.direction,
+      entry,
+      primary.atr,
+      ai.suggested_stop_loss,
+      ai.suggested_take_profit,
+    );
+    const stopLoss = clamped.stopLoss ?? engineeredStopLoss;
+    const takeProfit = clamped.takeProfit ?? engineeredTakeProfit;
+    const baseLots = calculateLots(best.symbol, account.balance, effectiveSettings.maxRiskPerTradePct, entry, stopLoss, effectiveSettings.maxLotSize, instrumentSpec);
+    const aiSizing = applyAiLotSizing({
+      baseLots,
+      direction: best.direction,
+      decision: ai,
+      judgment,
+      instrument: instrumentSpec,
+      enabled: state.adaptiveRiskEnabled,
+      pureLogic,
+    });
 
     // 5. Risk pre-check with the suggested size
-    const proposal: TradeProposal = { symbol: best.symbol, direction: best.direction, lots: suggestedLots, entry, stopLoss, takeProfit, instrumentSpec };
+    const proposal: TradeProposal = { symbol: best.symbol, direction: best.direction, lots: aiSizing.lots, entry, stopLoss, takeProfit, instrumentSpec };
     const ctx = await buildRiskContext(user, settings, account, best.analysis.spreadPoints, primary.atrPct, sessionNow(), news.action, { proposal });
     const risk = validateTrade(proposal, ctx);
     if (!risk.ok) {
@@ -368,7 +440,31 @@ export async function runScanner(
     const explanation = {
       scanner: true, trigger, confluenceScore: best.score,
       strategy: { name: "Autonomous scanner", reasons: best.reasons },
-      ai: { decision: ai.decision, confidence: ai.confidence, reasoning: ai.reasoning, risk_level: ai.risk_level, valid: aiValid, passed: aiPasses, gateMode: cfg.aiMode },
+      ai: {
+        mode: aiMode,
+        skipped: pureLogic,
+        decision: ai.decision,
+        confidence: ai.confidence,
+        reasoning: ai.reasoning,
+        risk_level: ai.risk_level,
+        valid: aiValid,
+        passed: aiPasses,
+        gateMode: cfg.aiMode,
+        ...(judgment
+          ? {
+              finalVerdict: judgment.final_verdict,
+              reasonsAgainst: judgment.reasons_against_trade,
+              invalidators: judgment.trade_invalidators,
+              requiredConfirmations: judgment.required_confirmations,
+            }
+          : {}),
+      },
+      context: {
+        marketRegime: context.market_regime,
+        confidenceEngine: context.confidence_engine,
+        missingData: context.missing_data,
+      },
+      capitalSizing: { profile: capital.profile, ai: aiSizing },
       news: { level: news.level, action: news.action, reason: news.reason },
       risk: { ok: true, checks: risk.checks },
     };
@@ -406,7 +502,7 @@ export async function runScanner(
         };
       }
       const trade = await executeTrade(user, proposal, {
-        aiLogId: logId,
+          aiLogId: logId ?? undefined,
         explanation,
         mode: "AUTO",
         actor: `scanner:${trigger}:auto`,

@@ -1,13 +1,17 @@
-import { config } from "../../../config.js";
 import { CircuitOpenError, circuitSnapshot, withResilience } from "../../../lib/resilience.js";
 import { reportIncident, resolveIncidentByDedupeKey } from "../../incidents/service.js";
 import { resolveProviderConfig } from "../provider-config.js";
+import { getOperationalConfig } from "../../system/operational-config.js";
 import type { GenerateRequest, ProviderStatus } from "./types.js";
 
-type OpenAiProvider = "openai" | "openrouter";
-const LABELS: Record<OpenAiProvider, string> = { openai: "OpenAI", openrouter: "OpenRouter" };
-const extraHeadersFor = (provider: OpenAiProvider): Record<string, string> =>
-  provider === "openrouter" ? { "HTTP-Referer": config.FRONTEND_URL, "X-Title": "MT5 AI Trading Bot" } : {};
+type OpenAiCompatibleProvider = "openai" | "openrouter" | "nvidia";
+const LABELS: Record<OpenAiCompatibleProvider, string> = {
+  openai: "OpenAI",
+  openrouter: "OpenRouter",
+  nvidia: "NVIDIA NIM",
+};
+const extraHeadersFor = (provider: OpenAiCompatibleProvider): Record<string, string> =>
+  provider === "openrouter" ? { "X-Title": "MT5 AI Trading Bot" } : {};
 
 /**
  * One client for every OpenAI-compatible chat-completions API — OpenAI,
@@ -35,10 +39,12 @@ export function extractChatContent(payload: unknown): string {
   return choices[0]?.message?.content ?? "";
 }
 
-async function generate(provider: OpenAiProvider, request: GenerateRequest): Promise<string> {
+async function generate(provider: OpenAiCompatibleProvider, request: GenerateRequest): Promise<string> {
   const cfg = await resolveProviderConfig(provider);
+  const model = request.model?.trim() || cfg.model;
+  const { aiRequestTimeoutMs } = await getOperationalConfig();
   const label = LABELS[provider];
-  if (!cfg.apiKey || !cfg.model) throw new Error(`${label} is not configured`);
+  if (!cfg.apiKey || !model) throw new Error(`${label} is not configured`);
   try {
     const response = await withResilience("ai", async () => {
       const res = await fetch(`${cfg.baseUrl.replace(/\/$/, "")}/chat/completions`, {
@@ -48,8 +54,8 @@ async function generate(provider: OpenAiProvider, request: GenerateRequest): Pro
           authorization: `Bearer ${cfg.apiKey}`,
           ...extraHeadersFor(provider),
         },
-        body: JSON.stringify(buildChatCompletionsBody(cfg.model, request)),
-        signal: AbortSignal.timeout(config.OLLAMA_TIMEOUT_MS),
+        body: JSON.stringify(buildChatCompletionsBody(model, request)),
+        signal: AbortSignal.timeout(aiRequestTimeoutMs),
       });
       if (!res.ok) throw new Error(`${label} returned ${res.status}`);
       return extractChatContent(await res.json());
@@ -73,7 +79,7 @@ async function generate(provider: OpenAiProvider, request: GenerateRequest): Pro
   }
 }
 
-async function status(provider: OpenAiProvider): Promise<ProviderStatus> {
+async function status(provider: OpenAiCompatibleProvider): Promise<ProviderStatus> {
   const cfg = await resolveProviderConfig(provider);
   if (!cfg.apiKey || !cfg.model) return { reachable: false, modelPresent: false };
   try {
@@ -95,3 +101,5 @@ export const openaiGenerate = (request: GenerateRequest) => generate("openai", r
 export const openaiStatus = () => status("openai");
 export const openrouterGenerate = (request: GenerateRequest) => generate("openrouter", request);
 export const openrouterStatus = () => status("openrouter");
+export const nvidiaGenerate = (request: GenerateRequest) => generate("nvidia", request);
+export const nvidiaStatus = () => status("nvidia");

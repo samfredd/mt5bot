@@ -8,8 +8,9 @@ import { buildRiskContext, decideTrade, executeTrade, sessionNow } from "./servi
 import { requireTwoFactor } from "../auth/service.js";
 import { getBotState } from "../system/state.js";
 import { currentAccountId } from "../mt5/account.js";
-import { paperPerformance } from "./paper.js";
+import { buildPaperPromotionProposal, paperPerformance } from "./paper.js";
 import { calculateExposure } from "../risk/exposure.js";
+import { audit } from "../../lib/audit.js";
 
 export async function tradingRoutes(app: FastifyInstance) {
   // --- Dashboard overview ---
@@ -63,7 +64,7 @@ export async function tradingRoutes(app: FastifyInstance) {
     // id shows that account's history (e.g. while disconnected).
     let accountId: string | null = null;
     if (account && account !== "all" && account !== "current") {
-      const saved = await prisma.mt5Account.findFirst({ where: { id: account, userId: req.user.id }, select: { id: true } });
+      const saved = await prisma.mt5Account.findFirst({ where: { id: account, userId: req.user.id, archivedAt: null }, select: { id: true } });
       if (!saved) return reply.code(404).send({ error: "unknown account" });
       accountId = saved.id;
     } else if (account !== "all") {
@@ -102,6 +103,145 @@ export async function tradingRoutes(app: FastifyInstance) {
     });
   });
 
+  /** Complete paginated paper ledger used by the Evidence UI. */
+  app.get("/api/paper-trades/history", { preHandler: [app.authenticate] }, async (req, reply) => {
+    const query = z.object({
+      status: z.enum(["ALL", "OPEN", "CLOSED", "CANCELLED", "PROMOTED"]).default("ALL"),
+      page: z.coerce.number().int().min(1).default(1),
+      pageSize: z.coerce.number().int().min(10).max(100).default(50),
+    }).safeParse(req.query);
+    if (!query.success) return reply.code(400).send({ error: "invalid paper-trade history query" });
+    const { status, page, pageSize } = query.data;
+    const where = {
+      userId: req.user.id,
+      ...(status === "PROMOTED" ? { promotedAt: { not: null } }
+        : status !== "ALL" ? { status: status as "OPEN" | "CLOSED" | "CANCELLED" }
+          : {}),
+    };
+    const [total, items] = await prisma.$transaction([
+      prisma.paperTrade.count({ where }),
+      prisma.paperTrade.findMany({
+        where,
+        orderBy: { createdAt: "desc" },
+        skip: (page - 1) * pageSize,
+        take: pageSize,
+        include: {
+          strategy: { select: { name: true } },
+          promotedTrade: { select: { id: true, status: true, mt5Ticket: true, entryPrice: true, openedAt: true } },
+        },
+      }),
+    ]);
+    return { items, total, page, pageSize, totalPages: Math.max(1, Math.ceil(total / pageSize)) };
+  });
+
+  /**
+   * Submit one still-open paper setup to the currently connected broker
+   * account. This is a fresh manual execution: price, news, exposure, account,
+   * live permissions and 2FA are all revalidated immediately before ordering.
+   */
+  app.post("/api/paper-trades/:id/execute", { preHandler: [app.requireRole("ADMIN", "MANAGER")] }, async (req, reply) => {
+    const { id } = req.params as { id: string };
+    const body = z.object({
+      lots: z.number().positive().optional(),
+      durationMin: z.number().int().positive().max(7 * 24 * 60).optional(),
+      totp: z.string().optional(),
+      confirmation: z.literal("EXECUTE"),
+    }).safeParse(req.body ?? {});
+    if (!body.success) return reply.code(400).send({ error: "Type EXECUTE to confirm broker execution." });
+
+    const [paperTrade, user, settings] = await Promise.all([
+      prisma.paperTrade.findFirst({ where: { id, userId: req.user.id, status: "OPEN" } }),
+      prisma.user.findUnique({ where: { id: req.user.id } }),
+      prisma.riskSettings.findUnique({ where: { userId: req.user.id } }),
+    ]);
+    if (!paperTrade) return reply.code(404).send({ error: "Open paper trade not found." });
+    if (paperTrade.promotedAt || paperTrade.promotedTradeId) {
+      return reply.code(409).send({ error: "This paper trade has already been submitted to the broker." });
+    }
+    if (!user || !settings) return reply.code(409).send({ error: "Risk settings are not configured." });
+
+    const [tick, account] = await Promise.all([mt5.tick(paperTrade.symbol), mt5.accountInfo()]);
+    if (!Number.isFinite(Date.parse(tick.time)) || Date.now() - Date.parse(tick.time) > 5 * 60_000) {
+      return reply.code(409).send({ error: "The broker tick is stale. Wait for the market to reopen and run a fresh analysis." });
+    }
+    const currentEntry = paperTrade.direction === "BUY" ? tick.ask : tick.bid;
+    const rebuilt = buildPaperPromotionProposal(paperTrade, currentEntry, body.data.lots);
+    if (!rebuilt.ok) return reply.code(409).send({ error: rebuilt.error });
+
+    const twoFactorVerified = account.is_demo ? false : await requireTwoFactor(user.id, body.data.totp);
+    if (!account.is_demo && !twoFactorVerified) {
+      return reply.code(403).send({ error: "A valid 2FA code is required for a real-account broker trade." });
+    }
+    const news = await assessNewsRisk(paperTrade.symbol, settings);
+    const riskContext = await buildRiskContext(
+      user, settings, account, tick.spread_points, null, sessionNow(), news.action,
+      { twoFactorVerified, proposal: rebuilt.proposal },
+    );
+    const risk = validateTrade(rebuilt.proposal, riskContext);
+    if (!risk.ok) {
+      return reply.code(422).send({
+        error: `Broker execution blocked: ${risk.checks.filter((check) => !check.passed).map((check) => check.name).join(", ")}`,
+        checks: risk.checks.filter((check) => !check.passed),
+      });
+    }
+    rebuilt.proposal.lots = risk.adjustedLots ?? rebuilt.proposal.lots;
+
+    // Claim exactly once after all read-only checks, immediately before broker
+    // I/O. Concurrent double-clicks can never submit two orders.
+    const claimedAt = new Date();
+    const claimed = await prisma.paperTrade.updateMany({
+      where: { id: paperTrade.id, userId: req.user.id, status: "OPEN", promotedAt: null, promotedTradeId: null },
+      data: { promotedAt: claimedAt },
+    });
+    if (claimed.count !== 1) return reply.code(409).send({ error: "This paper trade is already being submitted." });
+
+    try {
+      const trade = await executeTrade(user, rebuilt.proposal, {
+        strategyId: paperTrade.strategyId ?? undefined,
+        explanation: {
+          ...((paperTrade.explanation ?? {}) as Record<string, unknown>),
+          paperPromotion: {
+            paperTradeId: paperTrade.id,
+            paperEntry: paperTrade.entryPrice,
+            currentEntry,
+            driftR: rebuilt.driftR,
+            requestedBy: req.user.email,
+            confirmedAt: claimedAt.toISOString(),
+            riskChecks: risk.checks,
+          },
+        },
+        mode: "MANUAL",
+        actor: req.user.email,
+        durationMin: body.data.durationMin,
+        expectedSpreadPoints: paperTrade.expectedSpreadPoints,
+        actualSpreadPoints: tick.spread_points,
+      });
+      await prisma.paperTrade.update({ where: { id: paperTrade.id }, data: { promotedTradeId: trade.id } });
+      await audit({
+        actor: req.user.email, userId: req.user.id, category: "trade", action: "paper_trade_submitted_to_broker",
+        detail: { paperTradeId: paperTrade.id, tradeId: trade.id, status: trade.status, isDemo: account.is_demo },
+      });
+      return {
+        ok: trade.status === "EXECUTED",
+        tradeId: trade.id,
+        status: trade.status,
+        ticket: trade.mt5Ticket,
+        isDemo: account.is_demo,
+        message: trade.status === "EXECUTED"
+          ? `${account.is_demo ? "Demo" : "REAL"} broker trade opened.`
+          : `Broker rejected the order (${trade.status}).`,
+      };
+    } catch (error) {
+      await audit({
+        actor: req.user.email, userId: req.user.id, category: "trade", action: "paper_trade_broker_submission_uncertain",
+        detail: { paperTradeId: paperTrade.id, error: String(error) },
+      });
+      return reply.code(502).send({
+        error: "The broker submission result is uncertain. Check MT5 positions before taking any further action; duplicate submission is locked.",
+      });
+    }
+  });
+
   app.get("/api/execution-comparisons", { preHandler: [app.authenticate] }, async (req, reply) => {
     const query = z.object({ limit: z.coerce.number().int().min(1).max(500).default(100) }).safeParse(req.query);
     if (!query.success) return reply.code(400).send({ error: "invalid execution-comparison query" });
@@ -132,16 +272,22 @@ export async function tradingRoutes(app: FastifyInstance) {
     }).safeParse(req.body ?? {});
     if (!body.success) return reply.code(400).send({ error: "invalid approval payload" });
     const state = await getBotState();
+    let twoFactorVerified = false;
     if (!state.demoMode) {
-      const ok = await requireTwoFactor(req.user.id, body.data.totp);
-      if (!ok) return reply.code(403).send({ error: "2FA token required for live approvals" });
+      twoFactorVerified = await requireTwoFactor(req.user.id, body.data.totp);
+      if (!twoFactorVerified) return reply.code(403).send({ error: "2FA token required for live approvals" });
     }
-    return decideTrade(id, true, req.user.email, "DASHBOARD", { lots: body.data.lots, durationMin: body.data.durationMin });
+    return decideTrade(id, true, req.user.email, "DASHBOARD", {
+      actorUserId: req.user.id,
+      lots: body.data.lots,
+      durationMin: body.data.durationMin,
+      twoFactorVerified,
+    });
   });
 
   app.post("/api/trades/:id/reject", { preHandler: [app.requireRole("ADMIN", "MANAGER")] }, async (req) => {
     const { id } = req.params as { id: string };
-    return decideTrade(id, false, req.user.email, "DASHBOARD");
+    return decideTrade(id, false, req.user.email, "DASHBOARD", { actorUserId: req.user.id });
   });
 
   // --- Manual trading (still risk-gated — manual is never a bypass) ---
@@ -225,9 +371,9 @@ export async function tradingRoutes(app: FastifyInstance) {
   app.put("/api/scanner", { preHandler: [app.requireRole("ADMIN", "MANAGER")] }, async (req, reply) => {
     const body = z.object({
       enabled: z.boolean().optional(),
-      symbols: z.array(z.string().min(3)).min(1).max(30).optional(),
-      intervalMin: z.number().int().min(2).max(120).optional(),
-      maxPerDay: z.number().int().min(1).max(50).optional(),
+      symbols: z.array(z.string().min(3)).min(1).optional(),
+      intervalMin: z.number().int().positive().optional(),
+      maxPerDay: z.number().int().min(1).optional(),
       minScore: z.number().int().min(2).max(6).optional(),
       aiMode: z.enum(["STRICT", "ADVISORY"]).optional(),
       minAiConfidence: z.number().min(0).max(1).optional(),

@@ -1,12 +1,12 @@
 "use client";
 import { useCallback, useEffect, useState } from "react";
-import Link from "next/link";
-import { api, logout, WS_URL } from "@/lib/api";
+import { api, logout, webSocketProtocols, WS_URL } from "@/lib/api";
 import { Controls } from "@/components/Controls";
 import { TradesPanel } from "@/components/TradesPanel";
 import { StrategiesPanel } from "@/components/StrategiesPanel";
 import { CopyPanel } from "@/components/CopyPanel";
 import { NewsPanel } from "@/components/NewsPanel";
+import { ResearchPanel } from "@/components/ResearchPanel";
 import { SettingsPanel } from "@/components/SettingsPanel";
 import { PerformancePanel } from "@/components/PerformancePanel";
 import { ActivityPanel } from "@/components/ActivityPanel";
@@ -19,9 +19,11 @@ import { PaperForwardPanel } from "@/components/PaperForwardPanel";
 import { ExposurePanel } from "@/components/ExposurePanel";
 import { ExecutionComparisonPanel } from "@/components/ExecutionComparisonPanel";
 import { TradeJournalPanel } from "@/components/TradeJournalPanel";
+import { AssistantPanel, FloatingAssistant } from "@/components/AssistantPanel";
+import { Sidebar, MobileBottomNav, NAV, type NavId } from "@/components/Sidebar";
+import { useToast, type ToastInput, type ToastTone } from "@/components/ToastProvider";
 import {
-  IconActivity, IconChart, IconCopy, IconFlask, IconHome, IconNews, IconSettings,
-  IconStrategy, IconTrades, IconUp, IconDown, IconWallet, IconShield, IconZap, IconX, IconBrain, IconBell,
+  IconTrades, IconUp, IconDown, IconWallet, IconShield, IconZap, IconLogout,
 } from "@/components/icons";
 
 export interface Overview {
@@ -33,33 +35,6 @@ export interface Overview {
   pendingApprovals: number;
   activeStrategies: { id: string; name: string }[];
   activeCopyTraders: number;
-}
-
-const NAV = [
-  { id: "Overview", label: "Overview", icon: IconHome },
-  { id: "Trades", label: "Trades", icon: IconTrades },
-  { id: "Activity", label: "Activity", icon: IconActivity },
-  { id: "Performance", label: "Performance", icon: IconChart },
-  { id: "Backtest", label: "Backtest", icon: IconFlask },
-  { id: "Strategy Lab", label: "Strategy Lab", icon: IconBrain },
-  { id: "Evidence", label: "Evidence", icon: IconShield },
-  { id: "Journal", label: "Journal", icon: IconTrades },
-  { id: "Strategies", label: "Strategies", icon: IconStrategy },
-  { id: "Copy Trading", label: "Copy Trading", icon: IconCopy },
-  { id: "News", label: "News", icon: IconNews },
-  { id: "Settings", label: "Settings", icon: IconSettings },
-] as const;
-
-type TabId = (typeof NAV)[number]["id"];
-
-type ToastTone = "info" | "success" | "warn" | "danger" | "activity";
-interface ToastMessage {
-  id: string;
-  tone: ToastTone;
-  label: string;
-  title: string;
-  body: string;
-  createdAt: number;
 }
 
 interface LiveNotification {
@@ -76,13 +51,10 @@ interface LiveAudit {
   createdAt?: string;
 }
 
-const TOAST_TTL_MS = 7000;
-const MAX_TOASTS = 6;
-
 export default function Dashboard() {
-  const [tab, setTab] = useState<TabId>("Overview");
+  const { show: showToast } = useToast();
+  const [tab, setTabState] = useState<NavId>("Overview");
   const [data, setData] = useState<Overview | null>(null);
-  const [toasts, setToasts] = useState<ToastMessage[]>([]);
   const [notifTick, setNotifTick] = useState(0);
   const [evidenceTick, setEvidenceTick] = useState(0);
 
@@ -92,21 +64,19 @@ export default function Dashboard() {
     } catch { /* backend may be starting */ }
   }, []);
 
-  const pushToast = useCallback((toast: Omit<ToastMessage, "id" | "createdAt">) => {
-    const stamp = Date.now();
-    const id = `${stamp}-${Math.random().toString(36).slice(2)}`;
-    setToasts((prev) => [{ ...toast, id, createdAt: stamp }, ...prev].slice(0, MAX_TOASTS));
-  }, []);
-
-  const dismissToast = useCallback((id: string) => {
-    setToasts((prev) => prev.filter((toast) => toast.id !== id));
-  }, []);
-
   // Deep-link support: /dashboard?tab=Trades opens that tab. Used by the shared
   // Sidebar on standalone pages (e.g. /scalping) so its nav lands correctly.
   useEffect(() => {
     const requested = new URLSearchParams(window.location.search).get("tab");
-    if (requested && NAV.some((n) => n.id === requested)) setTab(requested as TabId);
+    if (requested && NAV.some((n) => n.id === requested)) setTabState(requested as NavId);
+  }, []);
+
+  const setTab = useCallback((next: NavId) => {
+    setTabState(next);
+    const url = new URL(window.location.href);
+    url.searchParams.set("tab", next);
+    window.history.replaceState(null, "", url);
+    window.scrollTo({ top: 0, behavior: "smooth" });
   }, []);
 
   useEffect(() => {
@@ -122,21 +92,20 @@ export default function Dashboard() {
 
     const connect = () => {
       if (stopped) return;
-      ws = new WebSocket(WS_URL);
+      ws = new WebSocket(WS_URL, webSocketProtocols());
       ws.onmessage = (msg) => {
         try {
           const { event, data: d } = JSON.parse(msg.data);
           if (event === "notification") {
             const notification = d as LiveNotification;
-            pushToast({
+            showToast({
               tone: notificationTone(notification.type),
-              label: "Notification",
               title: notification.title ?? "Notification",
-              body: notification.body ?? "",
+              description: notification.body ?? "",
             });
             setNotifTick((n) => n + 1);
           }
-          if (event === "audit") pushToast(activityToast(d as LiveAudit));
+          if (event === "audit") showToast(activityToast(d as LiveAudit));
           if (event === "incident") setEvidenceTick((value) => value + 1);
           // Reflect bot state instantly (start/pause/mode/guardian/emergency).
           if (event === "bot_state") setData((prev) => (prev ? { ...prev, botState: { ...prev.botState, ...d } } : prev));
@@ -164,54 +133,13 @@ export default function Dashboard() {
       if (retry) clearTimeout(retry);
       ws?.close();
     };
-  }, [pushToast, refresh]);
-
-  useEffect(() => {
-    if (toasts.length === 0) return;
-    const timer = setInterval(() => {
-      const now = Date.now();
-      setToasts((prev) => prev.filter((toast) => now - toast.createdAt < TOAST_TTL_MS));
-    }, 1000);
-    return () => clearInterval(timer);
-  }, [toasts.length]);
+  }, [refresh, showToast]);
 
   const s = data?.botState;
 
   return (
     <div className="flex min-h-dvh">
-      {/* Sidebar — desktop */}
-      <aside className="sticky top-0 hidden h-dvh w-60 shrink-0 flex-col border-r border-line bg-surface/60 p-4 lg:flex">
-        <div className="mb-8 flex items-center gap-2.5 px-2 pt-1">
-          <span className="flex h-9 w-9 items-center justify-center rounded-xl bg-primary-dim text-white">
-            <IconZap size={18} />
-          </span>
-          <div>
-            <div className="text-sm font-semibold leading-tight">MT5 AI Bot</div>
-            <div className="text-[11px] text-ink-faint">Trading platform</div>
-          </div>
-        </div>
-        <nav className="flex flex-1 flex-col gap-1" aria-label="Main">
-          {NAV.map(({ id, label, icon: I }) => (
-            <button key={id} onClick={() => setTab(id)} aria-current={tab === id ? "page" : undefined}
-              className={`flex cursor-pointer items-center gap-3 rounded-xl px-3 py-2.5 text-sm transition-colors duration-200 ${
-                tab === id ? "bg-surface-3 font-medium text-ink" : "text-ink-dim hover:bg-surface-2 hover:text-ink"
-              }`}>
-              <I size={17} className={tab === id ? "text-primary" : ""} />
-              {label}
-              {id === "Trades" && (data?.pendingApprovals ?? 0) > 0 && (
-                <span className="tnum ml-auto rounded-full bg-warn px-2 py-0.5 text-[11px] font-bold text-black">
-                  {data?.pendingApprovals}
-                </span>
-              )}
-            </button>
-          ))}
-          {/* Scalping Mode is a separate page (its own engine), not a dashboard tab. */}
-          <Link href="/scalping"
-            className="flex cursor-pointer items-center gap-3 rounded-xl px-3 py-2.5 text-sm text-ink-dim transition-colors duration-200 hover:bg-surface-2 hover:text-ink">
-            <IconZap size={17} /> Scalping Mode
-          </Link>
-        </nav>
-        {s && (
+      <Sidebar active={tab} onSelect={setTab} pendingApprovals={data?.pendingApprovals ?? 0} footer={s && (
           <div className="card mt-4 !p-3 text-xs">
             <div className="mb-2 flex items-center justify-between">
               <span className="text-ink-faint">Status</span>
@@ -229,21 +157,20 @@ export default function Dashboard() {
               </span>
             </div>
           </div>
-        )}
-      </aside>
+        )} />
 
       {/* Main column */}
       <div className="min-w-0 flex-1">
         <header className="sticky top-0 z-30 border-b border-line bg-bg/80 backdrop-blur">
-          <div className="mx-auto flex max-w-6xl items-center justify-between gap-3 px-4 py-3 md:px-8">
-            <div className="flex items-center gap-3 lg:hidden">
+          <div className="mx-auto flex max-w-6xl items-center justify-between gap-2 px-3 py-3 sm:px-4 md:px-8">
+            <div className="flex min-w-0 items-center gap-2 lg:hidden">
               <span className="flex h-8 w-8 items-center justify-center rounded-lg bg-primary-dim text-white"><IconZap size={15} /></span>
-              <span className="text-sm font-semibold">MT5 AI Bot</span>
+              <span className="hidden truncate text-sm font-semibold min-[380px]:inline">MT5 AI Bot</span>
             </div>
             <h1 className="hidden text-lg font-semibold lg:block">{tab}</h1>
-            <div className="flex items-center gap-4">
+            <div className="flex min-w-0 items-center gap-1.5 sm:gap-3 lg:gap-4">
               {data && (
-                <div className="text-right">
+                <div className="hidden text-right sm:block">
                   <div className="tnum text-base font-semibold leading-tight">
                     {fmt(data.account.balance)} <span className="text-xs font-normal text-ink-faint">{data.account.currency}</span>
                   </div>
@@ -253,37 +180,17 @@ export default function Dashboard() {
                   </div>
                 </div>
               )}
-              <HealthBadge />
+              <div className="hidden md:block"><HealthBadge /></div>
               <NotificationsBell liveEvent={notifTick} />
               <button onClick={() => void logout()} title="Sign out"
-                className="btn-ghost !px-3 text-xs text-ink-dim hover:text-ink">
-                Sign out
+                aria-label="Sign out" className="btn-ghost !p-2 text-xs text-ink-dim hover:text-ink sm:!px-3">
+                <IconLogout size={15} /><span className="hidden sm:inline">Sign out</span>
               </button>
             </div>
           </div>
-          {/* Mobile nav */}
-          <nav className="flex gap-1 overflow-x-auto px-3 pb-2 lg:hidden" aria-label="Main">
-            {NAV.map(({ id, label, icon: I }) => (
-              <button key={id} onClick={() => setTab(id)}
-                className={`flex shrink-0 cursor-pointer items-center gap-1.5 rounded-lg px-3 py-2 text-xs transition-colors ${
-                  tab === id ? "bg-surface-3 font-medium text-ink" : "text-ink-dim"
-                }`}>
-                <I size={14} className={tab === id ? "text-primary" : ""} />
-                {label}
-                {id === "Trades" && (data?.pendingApprovals ?? 0) > 0 && (
-                  <span className="tnum rounded-full bg-warn px-1.5 text-[10px] font-bold text-black">{data?.pendingApprovals}</span>
-                )}
-              </button>
-            ))}
-            <Link href="/scalping" className="flex shrink-0 cursor-pointer items-center gap-1.5 rounded-lg px-3 py-2 text-xs text-ink-dim">
-              <IconZap size={14} /> Scalping Mode
-            </Link>
-          </nav>
         </header>
 
-        <ToastStack toasts={toasts} onDismiss={dismissToast} />
-
-        <main className="mx-auto max-w-6xl px-4 py-6 md:px-8">
+        <main className="mx-auto max-w-6xl px-3 py-4 pb-24 sm:px-4 sm:py-6 md:px-8 lg:pb-6">
           {tab === "Overview" && (
             <div className="space-y-6">
               {data && <OverviewPanel data={data} />}
@@ -292,120 +199,52 @@ export default function Dashboard() {
             </div>
           )}
           {tab === "Trades" && <TradesPanel openTrades={data?.openTrades ?? []} onChanged={refresh} />}
+          {tab === "Assistant" && <AssistantPanel contextPage="Assistant" onNavigate={setTab} />}
+          {tab === "Paper Trades" && <PaperForwardPanel />}
           {tab === "Activity" && <ActivityPanel />}
           {tab === "Performance" && <PerformancePanel />}
           {tab === "Backtest" && <BacktestPanel />}
           {tab === "Strategy Lab" && <StrategyLabPanel />}
-          {tab === "Evidence" && <div className="space-y-4"><IncidentCenter refreshKey={evidenceTick} /><ValidationEvidencePanel /><PaperForwardPanel /><ExposurePanel /><ExecutionComparisonPanel /></div>}
+          {tab === "Evidence" && <div className="space-y-4"><IncidentCenter refreshKey={evidenceTick} /><ValidationEvidencePanel /><ExposurePanel /><ExecutionComparisonPanel /></div>}
           {tab === "Journal" && <TradeJournalPanel />}
           {tab === "Strategies" && <StrategiesPanel />}
           {tab === "Copy Trading" && <CopyPanel />}
           {tab === "News" && <NewsPanel />}
+          {tab === "Research" && <ResearchPanel />}
           {tab === "Settings" && <SettingsPanel />}
         </main>
       </div>
-    </div>
-  );
-}
-
-const TOAST_STYLES: Record<ToastTone, { shell: string; icon: string; badge: string }> = {
-  info: {
-    shell: "border-sky-900/70 bg-sky-950/90 text-sky-100",
-    icon: "bg-sky-900 text-sky-200",
-    badge: "text-sky-300",
-  },
-  success: {
-    shell: "border-emerald-900/70 bg-emerald-950/90 text-emerald-100",
-    icon: "bg-emerald-900 text-emerald-200",
-    badge: "text-emerald-300",
-  },
-  warn: {
-    shell: "border-amber-900/70 bg-amber-950/90 text-amber-100",
-    icon: "bg-amber-900 text-amber-200",
-    badge: "text-amber-300",
-  },
-  danger: {
-    shell: "border-red-900/70 bg-red-950/90 text-red-100",
-    icon: "bg-red-900 text-red-200",
-    badge: "text-red-300",
-  },
-  activity: {
-    shell: "border-line-strong bg-surface/95 text-ink",
-    icon: "bg-surface-3 text-primary",
-    badge: "text-primary",
-  },
-};
-
-function ToastStack({ toasts, onDismiss }: { toasts: ToastMessage[]; onDismiss: (id: string) => void }) {
-  if (toasts.length === 0) return null;
-  return (
-    <div
-      role="status"
-      aria-live="polite"
-      className="pointer-events-none fixed right-3 top-20 z-50 flex w-[min(24rem,calc(100vw-1.5rem))] flex-col gap-2 sm:right-5"
-    >
-      {toasts.map((toast) => {
-        const style = TOAST_STYLES[toast.tone];
-        const Icon = toast.label === "Activity" ? IconActivity : IconBell;
-        return (
-          <div
-            key={toast.id}
-            className={`pointer-events-auto rounded-xl border px-3 py-3 shadow-2xl shadow-black/40 backdrop-blur ${style.shell}`}
-          >
-            <div className="flex items-start gap-3">
-              <span className={`mt-0.5 flex h-8 w-8 shrink-0 items-center justify-center rounded-lg ${style.icon}`}>
-                <Icon size={15} />
-              </span>
-              <div className="min-w-0 flex-1">
-                <div className="mb-0.5 flex items-center justify-between gap-2">
-                  <span className={`text-[10px] font-semibold uppercase ${style.badge}`}>{toast.label}</span>
-                  <span className="tnum shrink-0 text-[10px] opacity-65">{new Date(toast.createdAt).toLocaleTimeString()}</span>
-                </div>
-                <p className="break-words text-sm font-semibold leading-snug">{toast.title}</p>
-                {toast.body && <p className="mt-1 line-clamp-3 break-words text-xs leading-relaxed opacity-80">{toast.body}</p>}
-              </div>
-              <button
-                type="button"
-                onClick={() => onDismiss(toast.id)}
-                aria-label="Dismiss toast"
-                className="shrink-0 cursor-pointer rounded-md p-1 opacity-70 transition-opacity hover:opacity-100 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent"
-              >
-                <IconX size={14} />
-              </button>
-            </div>
-          </div>
-        );
-      })}
+      {tab !== "Assistant" && <FloatingAssistant contextPage={tab} onNavigate={setTab} />}
+      <MobileBottomNav active={tab} onSelect={setTab} pendingApprovals={data?.pendingApprovals ?? 0} />
     </div>
   );
 }
 
 function notificationTone(type?: string): ToastTone {
   if (!type) return "info";
-  if (["emergency_stop", "risk_violation", "system_error", "margin_warning", "drawdown_warning", "daily_loss_warning", "stop_loss_hit"].includes(type)) return "danger";
-  if (["approval_request", "ai_avoid", "news_alert", "bot_paused"].includes(type)) return "warn";
+  if (["emergency_stop", "risk_violation", "system_error", "margin_warning", "drawdown_warning", "daily_loss_warning", "stop_loss_hit"].includes(type)) return "error";
+  if (["approval_request", "ai_avoid", "news_alert", "bot_paused"].includes(type)) return "warning";
   if (["trade_opened", "trade_closed", "take_profit_hit", "bot_resumed", "copy_update", "daily_report"].includes(type)) return "success";
   return "info";
 }
 
-function activityToast(activity: LiveAudit): Omit<ToastMessage, "id" | "createdAt"> {
+function activityToast(activity: LiveAudit): ToastInput {
   const category = activity.category ?? "activity";
   const action = humanize(activity.action ?? "event");
   const summary = summarizeActivity(activity);
   return {
     tone: activityTone(activity),
-    label: "Activity",
     title: `${capitalize(category)} - ${action}`,
-    body: summary || "New activity event received.",
+    description: summary || "New activity event received.",
   };
 }
 
 function activityTone(activity: LiveAudit): ToastTone {
   const category = activity.category ?? "";
   const action = activity.action ?? "";
-  if (category === "risk" || action.includes("failed") || action.includes("blocked") || action.includes("emergency")) return "danger";
+  if (category === "risk" || action.includes("failed") || action.includes("blocked") || action.includes("emergency")) return "error";
   if (action.includes("executed") || action.includes("approved") || action.includes("opened") || action.includes("resumed")) return "success";
-  if (category === "news" || category === "ai" || action.includes("veto") || action.includes("paused")) return "warn";
+  if (category === "news" || category === "ai" || action.includes("veto") || action.includes("paused")) return "warning";
   return "activity";
 }
 
@@ -455,7 +294,7 @@ interface Health {
   ok: boolean;
   degraded: string[];
   mt5Bridge: { ok: boolean; mock: boolean; connected: boolean };
-  ai: { reachable: boolean; modelPresent: boolean; model: string; provider: "ollama" | "anthropic"; recentValidRate: number | null; recentSamples: number; lastValidAt: string | null };
+  ai: { reachable: boolean; modelPresent: boolean; model: string; provider: "pure_logic" | "ollama" | "anthropic" | "openai" | "openrouter" | "nvidia"; recentValidRate: number | null; recentSamples: number; lastValidAt: string | null };
 }
 
 /**

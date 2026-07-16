@@ -34,9 +34,12 @@ services:
   mt5-bridge:
     build: ./mt5-bridge
     restart: unless-stopped
+    profiles: ["mock"]
     environment:
       MT5_MOCK: "true"
-      BRIDGE_API_KEY: ${MT5_BRIDGE_API_KEY}
+      # Development mock only. Production uses docker-compose.windows-mt5.yml
+      # with a mounted Windows-host secret file.
+      BRIDGE_API_KEY: change-me-bridge-key
     ports: ["5001:5001"]
     healthcheck:
       test: ["CMD", "python", "-c", "import os,urllib.request; r=urllib.request.Request('http://localhost:5001/health',headers={'x-api-key':os.environ['BRIDGE_API_KEY']}); urllib.request.urlopen(r,timeout=3)"]
@@ -47,17 +50,23 @@ services:
   backend:
     build: ./backend
     restart: unless-stopped
-    env_file: .env
     environment:
+      # Local-development bootstrap only. Production must mount unique secrets
+      # via its platform secret manager; see docs/DEPLOYMENT.md.
+      NODE_ENV: development
+      JWT_SECRET: local-development-only-jwt-secret-change-before-production
+      CREDENTIALS_ENC_KEY: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
       DATABASE_URL: postgresql://mt5bot:${POSTGRES_PASSWORD:-mt5bot}@postgres:5432/mt5bot
       REDIS_URL: redis://redis:6379
-      MT5_BRIDGE_URL: http://mt5-bridge:5001
       OLLAMA_URL: ${OLLAMA_DOCKER_URL:-http://ollama:11434}
+    extra_hosts:
+      # Lets the container reach the bridge attached to the existing macOS
+      # MetaTrader/Wine terminal. The actual URL and key live in DB Settings.
+      - "host.docker.internal:host-gateway"
     ports: ["4000:4000"]
     depends_on:
       postgres: { condition: service_healthy }
       redis: { condition: service_healthy }
-      mt5-bridge: { condition: service_healthy }
 
   frontend:
     build: ./frontend

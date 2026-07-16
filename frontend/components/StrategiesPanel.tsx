@@ -2,6 +2,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { api } from "@/lib/api";
 import { IconPlus, IconTrash, IconX } from "@/components/icons";
+import { useToast } from "@/components/ToastProvider";
 
 interface Strategy { id: string; name: string; type: string; enabled: boolean; config: Record<string, unknown> }
 interface Preset { name: string; type: string; config: Record<string, unknown> }
@@ -46,11 +47,11 @@ const FIELD_GUIDE: { key: string; desc: string }[] = [
 const TYPES = ["trend_following", "scalping", "swing", "price_action", "news_aware", "custom"];
 
 export function StrategiesPanel() {
+  const toast = useToast();
   const [strategies, setStrategies] = useState<Strategy[]>([]);
   const [presets, setPresets] = useState<Preset[]>([]);
   const [editing, setEditing] = useState<Strategy | null>(null);
   const [configText, setConfigText] = useState("");
-  const [message, setMessage] = useState("");
   const [showBuilder, setShowBuilder] = useState(false);
   const [builder, setBuilder] = useState({
     name: "", type: "custom", config: JSON.stringify(EXAMPLE_CONFIG, null, 2),
@@ -66,50 +67,47 @@ export function StrategiesPanel() {
   useEffect(() => { void load(); }, [load]);
 
   async function addPreset(p: Preset) {
-    setMessage("");
-    try { await api("/api/strategies", { method: "POST", body: p }); await load(); }
-    catch (err) { setMessage(err instanceof Error ? err.message : "failed"); }
+    try { await api("/api/strategies", { method: "POST", body: p }); await load(); toast.success("Strategy added", `${p.name} was added disabled. Backtest it before enabling.`); }
+    catch (err) { toast.error("Strategy not added", err instanceof Error ? err.message : "The preset could not be added."); }
   }
 
   async function createCustom(e: React.FormEvent) {
     e.preventDefault();
-    setMessage("");
     setBusy(true);
     try {
       let config: unknown;
       try {
         config = JSON.parse(builder.config);
       } catch {
-        setMessage("Config is not valid JSON — check for missing commas or quotes.");
+        toast.error("Invalid strategy configuration", "Config is not valid JSON — check for missing commas or quotes.");
         return;
       }
       await api("/api/strategies", { method: "POST", body: { name: builder.name, type: builder.type, config } });
-      setMessage(`Strategy "${builder.name}" created (disabled — enable it when ready, backtest it first).`);
+      toast.success("Strategy created", `"${builder.name}" is disabled. Backtest it before enabling.`);
       setBuilder({ name: "", type: "custom", config: JSON.stringify(EXAMPLE_CONFIG, null, 2) });
       setShowBuilder(false);
       await load();
     } catch (err) {
-      setMessage(err instanceof Error ? err.message : "failed");
+      toast.error("Strategy not created", err instanceof Error ? err.message : "The strategy could not be created.");
     } finally {
       setBusy(false);
     }
   }
 
   async function toggle(s: Strategy) {
-    try { await api(`/api/strategies/${s.id}`, { method: "PUT", body: { enabled: !s.enabled } }); await load(); }
-    catch (err) { setMessage(err instanceof Error ? err.message : "failed"); }
+    try { await api(`/api/strategies/${s.id}`, { method: "PUT", body: { enabled: !s.enabled } }); await load(); toast.success(`Strategy ${s.enabled ? "disabled" : "enabled"}`, s.name); }
+    catch (err) { toast.error("Strategy not updated", err instanceof Error ? err.message : "The strategy state could not be changed."); }
   }
 
   async function remove(s: Strategy) {
     if (!confirm(
       `Delete "${s.name}"?\n\n${s.enabled ? "It is currently ENABLED and will stop trading immediately. " : ""}Past trades keep their history but will no longer reference this strategy. This cannot be undone.`,
     )) return;
-    setMessage("");
     try {
       await api(`/api/strategies/${s.id}`, { method: "DELETE" });
-      setMessage(`Deleted "${s.name}".`);
+      toast.success("Strategy deleted", s.name);
       await load();
-    } catch (err) { setMessage(err instanceof Error ? err.message : "delete failed (admin only)"); }
+    } catch (err) { toast.error("Strategy not deleted", err instanceof Error ? err.message : "Delete failed. Administrator access may be required."); }
   }
 
   async function saveConfig() {
@@ -119,7 +117,8 @@ export function StrategiesPanel() {
       await api(`/api/strategies/${editing.id}`, { method: "PUT", body: { config } });
       setEditing(null);
       await load();
-    } catch (err) { setMessage(err instanceof Error ? err.message : "invalid JSON or rejected by server"); }
+      toast.success("Strategy configuration saved", editing.name);
+    } catch (err) { toast.error("Configuration not saved", err instanceof Error ? err.message : "The JSON is invalid or the server rejected it."); }
   }
 
   return (
@@ -218,8 +217,6 @@ export function StrategiesPanel() {
           ))}
         </div>
       </section>
-
-      {message && <p className="text-sm text-warn" role="status">{message}</p>}
 
       {editing && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4 backdrop-blur-sm" onClick={() => setEditing(null)}>

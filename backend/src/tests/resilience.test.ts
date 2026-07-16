@@ -61,4 +61,18 @@ describe("withResilience", () => {
     await expect(withResilience("ai", async () => "recovered", options)).resolves.toBe("recovered");
     expect(circuitSnapshot("ai")).toMatchObject({ status: "closed", failures: 0 });
   });
+
+  it("recovers a stale half-open circuit instead of wedging forever", async () => {
+    let clock = 1000;
+    const options = { retries: 0, failureThreshold: 1, cooldownMs: 5000, now: () => clock };
+    await expect(withResilience("mt5", async () => { throw new Error("down"); }, options)).rejects.toThrow("down");
+    clock = 7000;
+    // First post-cooldown call claims the probe and fails, persisting half-open.
+    await expect(withResilience("mt5", async () => { throw new Error("probe died"); }, options)).rejects.toThrow("probe died");
+    expect(circuitSnapshot("mt5")).toMatchObject({ status: "open" });
+
+    clock = 13000;
+    await expect(withResilience("mt5", async () => "recovered", options)).resolves.toBe("recovered");
+    expect(circuitSnapshot("mt5")).toMatchObject({ status: "closed", failures: 0 });
+  });
 });

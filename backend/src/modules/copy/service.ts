@@ -1,6 +1,6 @@
 import { prisma } from "../../lib/prisma.js";
 import { audit } from "../../lib/audit.js";
-import { askModel } from "../ai/service.js";
+import { askModel, getActiveProvider, PURE_LOGIC_PROVIDER } from "../ai/service.js";
 import { buildTraderEvaluationPrompt } from "../ai/prompts.js";
 import { mt5 } from "../mt5/client.js";
 import { assessNewsRisk } from "../news/service.js";
@@ -50,12 +50,17 @@ export function scoreTrader(m: TraderMetrics): { score: number; flags: string[] 
 export async function evaluateTrader(trader: CopyTrader) {
   const metrics = trader.metrics as unknown as TraderMetrics;
   const { score, flags } = scoreTrader(metrics);
-  const { decision } = await askModel(buildTraderEvaluationPrompt(metrics as unknown as Record<string, unknown>), `copy:${trader.name}`);
-  const recommend = score < 45 && decision.decision === "buy";
+  const pureLogic = (await getActiveProvider()) === PURE_LOGIC_PROVIDER;
+  const decision = pureLogic
+    ? null
+    : (await askModel(buildTraderEvaluationPrompt(metrics as unknown as Record<string, unknown>), `copy:${trader.name}`)).decision;
+  const recommend = score < 45 && (pureLogic || decision?.decision === "buy");
   const explanation = [
     `Risk score ${score}/100 (lower is safer).`,
     flags.length ? `Flags: ${flags.join("; ")}.` : "No major red flags.",
-    `AI verdict: ${decision.decision === "buy" ? "recommend" : "do not copy"} (confidence ${decision.confidence}) — ${decision.reasoning}`,
+    pureLogic
+      ? "Pure logic mode: recommendation is based on the deterministic risk score only; no model was called."
+      : `AI verdict: ${decision!.decision === "buy" ? "recommend" : "do not copy"} (confidence ${decision!.confidence}) — ${decision!.reasoning}`,
   ].join("\n");
   await prisma.copyTrader.update({ where: { id: trader.id }, data: { riskScore: score } });
   await audit({ actor: "system", userId: trader.userId, category: "copy", action: "trader_evaluated", detail: { traderId: trader.id, score, recommend, flags } });

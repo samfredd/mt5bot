@@ -45,7 +45,7 @@ vi.mock("../modules/incidents/service.js", () => ({
   }),
 }));
 
-const { openPaperTrade, paperPerformance, reconcilePaperTrades } = await import("../modules/trading/paper.js");
+const { buildPaperPromotionProposal, openPaperTrade, paperPerformance, reconcilePaperTrades } = await import("../modules/trading/paper.js");
 
 const spec = {
   symbol: "EURUSD",
@@ -67,6 +67,27 @@ beforeEach(() => {
 });
 
 describe("paper trading", () => {
+  it("rebuilds a promotable setup around the current price while preserving its risk geometry", () => {
+    const result = buildPaperPromotionProposal({
+      symbol: "EURUSD", direction: "BUY", lots: 0.2, entryPrice: 1.1,
+      stopLoss: 1.098, takeProfit: 1.104, instrumentSpec: spec,
+    }, 1.1005, 0.1);
+
+    expect(result).toMatchObject({
+      ok: true,
+      proposal: { entry: 1.1005, stopLoss: 1.0985, takeProfit: 1.1045, lots: 0.1 },
+    });
+  });
+
+  it("rejects paper promotion after price has moved more than half the initial risk", () => {
+    const result = buildPaperPromotionProposal({
+      symbol: "EURUSD", direction: "SELL", lots: 0.2, entryPrice: 1.1,
+      stopLoss: 1.102, takeProfit: 1.096, instrumentSpec: spec,
+    }, 1.0989);
+
+    expect(result).toMatchObject({ ok: false });
+  });
+
   it("opens at the executable side plus adverse slippage without a broker order", async () => {
     const trade = await openPaperTrade({
       userId: "u1",

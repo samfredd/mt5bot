@@ -34,12 +34,14 @@ export async function managePositions(): Promise<void> {
   });
   const tracked = new Set(openTrades.map((t) => t.mt5Ticket));
 
-  // Adopt positions opened OUTSIDE the bot (manually in the terminal, or
-  // already open before the bot saw them) so break-even / trailing / time-exit
-  // apply to them too. Their entry + current stop are captured once as the R
-  // reference, so subsequent ratchets stay stable.
+  // Never adopt or modify an untracked terminal position. It may belong to a
+  // human or another EA. Bot-owned positions with a durable intent are picked
+  // up by reconciliation using their client-order comment.
   const external = positions.filter((p) => !tracked.has(p.ticket));
-  const adoptedTrades = external.length ? await adoptExternalPositions(external) : [];
+  const adoptedTrades: Awaited<ReturnType<typeof adoptExternalPositions>> = [];
+  if (external.length) {
+    await logError("position-manager", "untracked positions left unmanaged", { positions: external.map((p) => ({ ticket: p.ticket, symbol: p.symbol, magic: p.magic, comment: p.comment })) });
+  }
 
   const byTicket = new Map(positions.map((p) => [p.ticket, p]));
 

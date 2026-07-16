@@ -1,6 +1,6 @@
-import { config } from "../../../config.js";
 import { withResilience } from "../../../lib/resilience.js";
 import { resolveProviderConfig } from "../provider-config.js";
+import { getOperationalConfig } from "../../system/operational-config.js";
 import type { GenerateRequest, ProviderStatus } from "./types.js";
 
 const API_URL = "https://api.anthropic.com/v1";
@@ -14,7 +14,9 @@ function headers(apiKey: string) {
 }
 
 export async function anthropicGenerate(request: GenerateRequest): Promise<string> {
-  const { apiKey, model } = await resolveProviderConfig("anthropic");
+  const { apiKey, model: configuredModel } = await resolveProviderConfig("anthropic");
+  const model = request.model?.trim() || configuredModel;
+  const { aiRequestTimeoutMs } = await getOperationalConfig();
   if (!apiKey || !model) throw new Error("Anthropic is not configured");
   return withResilience("ai-anthropic", async () => {
     const res = await fetch(`${API_URL}/messages`, {
@@ -27,7 +29,7 @@ export async function anthropicGenerate(request: GenerateRequest): Promise<strin
         system: request.system,
         messages: [{ role: "user", content: request.prompt }],
       }),
-      signal: AbortSignal.timeout(config.OLLAMA_TIMEOUT_MS),
+      signal: AbortSignal.timeout(aiRequestTimeoutMs),
     });
     if (!res.ok) throw new Error(`anthropic returned ${res.status}`);
     const payload = (await res.json()) as { content?: { type?: string; text?: string }[] };

@@ -1,9 +1,9 @@
-import { config } from "../../config.js";
 import { prisma } from "../../lib/prisma.js";
 import { audit, logError } from "../../lib/audit.js";
 import type { NewsImpact, RiskSettings } from "@prisma/client";
 import { CircuitOpenError, circuitSnapshot, withResilience } from "../../lib/resilience.js";
 import { reportIncident, resolveIncidentByDedupeKey } from "../incidents/service.js";
+import { getOperationalConfig } from "../system/operational-config.js";
 
 export interface NewsRiskAssessment {
   level: "low" | "medium" | "high";
@@ -40,8 +40,9 @@ function mapImpact(raw: string): NewsImpact {
 /** Pull the weekly economic calendar and upsert into the database. */
 export async function refreshCalendar(): Promise<number> {
   try {
+    const settings = await getOperationalConfig();
     const events = await withResilience("news", async () => {
-      const res = await fetch(config.NEWS_CALENDAR_URL, { signal: AbortSignal.timeout(15000) });
+      const res = await fetch(settings.newsCalendarUrl, { signal: AbortSignal.timeout(15000) });
       if (!res.ok) throw new Error(`calendar fetch failed: ${res.status}`);
       return await res.json() as FfEvent[];
     }, { retries: 2, baseDelayMs: 250, maxDelayMs: 1000, failureThreshold: 3, cooldownMs: 60_000 });
@@ -147,6 +148,30 @@ export async function assessNewsRisk(
       level: "medium",
       action: block ? "pause" : "reduce",
       reason: `Medium-impact event in window: ${medium[0].title} (${medium[0].currency})`,
+      upcomingEvents,
+    };
+  }
+
+  // Only independently confirmed or official intelligence may influence the
+  // risk layer. Community momentum, rumours, and single-source reports remain
+  // visible in Research but cannot pause or resize a trade.
+  const intelligence = await prisma.intelligenceItem.findMany({
+    where: {
+      archivedAt: null,
+      expectedImpact: "HIGH",
+      verificationStatus: { in: ["CONFIRMED", "OFFICIAL"] },
+      publishedAt: { gte: new Date(now - 2 * 3600_000) },
+    },
+    orderBy: [{ relevanceScore: "desc" }, { publishedAt: "desc" }],
+    take: 30,
+    include: { source: { select: { name: true } } },
+  });
+  const relevantIntel = intelligence.find((item) => ((item.relatedAssets as string[]) ?? []).some((asset) => currencies.includes(asset) || symbol.toUpperCase().includes(asset)));
+  if (relevantIntel) {
+    return {
+      level: "medium",
+      action: "reduce",
+      reason: `Verified high-impact intelligence: "${relevantIntel.title}" (${relevantIntel.source.name}, ${relevantIntel.verificationStatus}) — reducing size; deterministic risk controls remain authoritative`,
       upcomingEvents,
     };
   }

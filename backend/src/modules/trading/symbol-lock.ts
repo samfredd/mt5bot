@@ -9,13 +9,13 @@ import { prisma } from "../../lib/prisma.js";
  * sides that offset, bleeding spread + commission for ~zero net position.
  *
  * This guard lets the FIRST owner (any strategy, or a manual/scanner trade with
- * no strategyId) hold the pair, and makes every OTHER strategy stand aside until
- * that position is closed. Re-entry by the SAME strategy is left to the risk
- * engine's per-symbol cap, so single-strategy behaviour is unchanged.
+ * no strategyId) hold the pair, and makes every other entry stand aside until
+ * that position is closed. This includes same-strategy re-entry because MT5
+ * netting accounts would merge the fills and destroy per-trade attribution.
  */
 
 /** Statuses that mean a trade is occupying the market (live fill or pending fill). */
-export const OCCUPYING_STATUSES = ["EXECUTED", "PENDING_APPROVAL", "APPROVED"] as const;
+export const OCCUPYING_STATUSES = ["SUBMITTING", "PARTIALLY_FILLED", "UNKNOWN", "EXECUTED", "PENDING_APPROVAL", "APPROVED"] as const;
 
 /**
  * Stable identity for "the same market", tolerant of broker suffixes/separators.
@@ -30,16 +30,16 @@ export function marketKey(symbol: string): string {
 
 /**
  * Pure: among live/pending trades, find one on the same market owned by a
- * DIFFERENT strategy (or by none). Returns it, or null if the pair is free for
- * this strategy.
+ * any owner. One canonical market has one owner at a time, which is required
+ * for correct attribution on MT5 netting accounts.
  */
 export function conflictingTrade<T extends { symbol: string; strategyId: string | null }>(
   live: T[],
   symbol: string,
-  strategyId: string,
+  _strategyId: string,
 ): T | null {
   const key = marketKey(symbol);
-  return live.find((t) => t.strategyId !== strategyId && marketKey(t.symbol) === key) ?? null;
+  return live.find((t) => marketKey(t.symbol) === key) ?? null;
 }
 
 /**

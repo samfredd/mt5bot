@@ -2,6 +2,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { api } from "@/lib/api";
 import { IconClock, IconInfo, IconNews, IconRefresh, IconX } from "@/components/icons";
+import { useToast } from "@/components/ToastProvider";
 
 type NewsFilter = "all" | "calendar" | "headline" | "HIGH" | "MEDIUM" | "LOW";
 
@@ -42,6 +43,7 @@ const IMPACT_STYLES: Record<string, { chip: string; border: string; dot: string 
 };
 
 export function NewsPanel() {
+  const toast = useToast();
   const [events, setEvents] = useState<NewsEvent[]>([]);
   const [symbol, setSymbol] = useState("EURUSD");
   const [risk, setRisk] = useState<Risk | null>(null);
@@ -60,9 +62,13 @@ export function NewsPanel() {
 
   async function refresh() {
     setRefreshing(true);
-    await api("/api/news/refresh", { method: "POST" }).catch(() => {});
-    await load();
-    setRefreshing(false);
+    try {
+      await api("/api/news/refresh", { method: "POST" });
+      await load();
+      toast.success("News refreshed", "The economic calendar and market headlines are up to date.");
+    } catch (err) {
+      toast.error("News refresh failed", err instanceof Error ? err.message : "The latest news could not be loaded.");
+    } finally { setRefreshing(false); }
   }
 
   useEffect(() => {

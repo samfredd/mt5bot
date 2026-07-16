@@ -29,11 +29,25 @@ enum TradeStatus {
   ANALYZED
   PENDING_APPROVAL
   APPROVED
+  SUBMITTING
+  PARTIALLY_FILLED
+  UNKNOWN
   REJECTED
   RISK_BLOCKED
   EXECUTED
   FAILED
   CLOSED
+  CANCELLED
+}
+
+enum OrderIntentStatus {
+  PREPARED
+  SUBMITTING
+  PLACED
+  PARTIALLY_FILLED
+  FILLED
+  REJECTED
+  UNKNOWN
   CANCELLED
 }
 
@@ -103,6 +117,8 @@ model User {
   paperTrades        PaperTrade[]
   executionComparisons ExecutionComparison[]
   journalEntries     TradeJournalEntry[]
+  tradingMemories    TradingMemory[]
+  orderIntents       OrderIntent[]
 }
 
 model Mt5Account {
@@ -117,7 +133,12 @@ model Mt5Account {
   // AES-256-GCM encrypted investor/trade password; never stored in plaintext
   passwordEnc       String?
   createdAt         DateTime @default(now())
+  // Soft removal keeps historical trades attributable to this account while
+  // hiding it from account management and clearing its reusable credentials.
+  archivedAt        DateTime?
   trades            Trade[]
+  orderIntents      OrderIntent[]
+  marketReservations MarketReservation[]
 
   // One saved row per login per user: lets register()/connect() upsert by login
   // and slams the door on the duplicate-row race (two concurrent cache-miss
@@ -192,6 +213,9 @@ model PaperTrade {
   exitPrice              Float?
   exitReason             String?
   profit                 Float?
+  promotedAt             DateTime?
+  promotedTradeId        String?          @unique
+  promotedTrade          Trade?           @relation("PaperPromotion", fields: [promotedTradeId], references: [id], onDelete: SetNull)
   createdAt              DateTime         @default(now())
   updatedAt              DateTime         @updatedAt
 
@@ -314,12 +338,93 @@ model Trade {
   approval      TradeApproval?
   copiedTrade   CopiedTrade?
   executionComparison ExecutionComparison?
+  paperSource     PaperTrade?     @relation("PaperPromotion")
   attributionConfidence Float?
   attributionReason String?
   brokerExitPrice Float?
   journalEntry TradeJournalEntry?
+  memoryEntry TradingMemory?
+  orderIntent OrderIntent?
 
   @@index([accountId, createdAt])
+}
+
+model OrderIntent {
+  id                    String            @id @default(cuid())
+  clientOrderId         String            @unique
+  userId                String
+  user                  User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+  accountId             String
+  account               Mt5Account        @relation(fields: [accountId], references: [id])
+  tradeId               String            @unique
+  trade                 Trade             @relation(fields: [tradeId], references: [id], onDelete: Cascade)
+  marketKey             String
+  expectedLogin         String
+  expectedServer        String
+  request               Json
+  status                OrderIntentStatus @default(PREPARED)
+  requestedVolume       Float
+  filledVolume          Float             @default(0)
+  brokerOrderId         String?
+  brokerDealId          String?
+  brokerPositionId      String?
+  retcode               Int?
+  error                 String?
+  submittedAt           DateTime?
+  resolvedAt            DateTime?
+  createdAt             DateTime          @default(now())
+  updatedAt             DateTime          @updatedAt
+  reservation           MarketReservation?
+
+  @@index([status, updatedAt])
+  @@index([accountId, marketKey, status])
+}
+
+model MarketReservation {
+  id          String      @id @default(cuid())
+  accountId   String
+  account     Mt5Account  @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  marketKey   String
+  intentId    String      @unique
+  intent      OrderIntent @relation(fields: [intentId], references: [id], onDelete: Cascade)
+  status      String      @default("ACTIVE")
+  expiresAt   DateTime
+  createdAt   DateTime    @default(now())
+  releasedAt  DateTime?
+
+  @@unique([accountId, marketKey])
+  @@index([status, expiresAt])
+}
+
+model TradingMemory {
+  id              String   @id @default(cuid())
+  userId          String
+  user            User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tradeId         String   @unique
+  trade           Trade    @relation(fields: [tradeId], references: [id], onDelete: Cascade)
+  symbol          String
+  direction       TradeDirection
+  strategyId      String?
+  strategyName    String?
+  source          String
+  outcome         String
+  profit          Float
+  rMultiple       Float?
+  aiDecision      String?
+  aiConfidence    Float?
+  marketRegime    String?
+  newsRisk        String?
+  closeReason     String?
+  lesson          String
+  mistakes        Json     @default("[]")
+  strengths       Json     @default("[]")
+  context         Json     @default("{}")
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  @@index([userId, symbol, createdAt])
+  @@index([userId, strategyId, createdAt])
+  @@index([userId, outcome, createdAt])
 }
 
 model TradeApproval {
@@ -377,6 +482,206 @@ model NewsEvent {
   createdAt DateTime   @default(now())
 
   @@unique([title, eventTime])
+}
+
+model IntelligenceSource {
+  id                  String   @id @default(cuid())
+  slug                String   @unique
+  name                String
+  category            String
+  accessMethod        String
+  homepageUrl         String?
+  feedUrl             String?
+  enabled             Boolean  @default(false)
+  approved            Boolean  @default(false)
+  official            Boolean  @default(false)
+  baseReliability     Float    @default(0.5)
+  reliabilityScore    Float    @default(0.5)
+  pollIntervalMin     Int      @default(60)
+  termsNote           String?
+  healthStatus        String   @default("UNKNOWN")
+  consecutiveFailures Int      @default(0)
+  lastFetchedAt       DateTime?
+  nextFetchAt         DateTime?
+  lastError           String?
+  rateLimitRemaining  Int?
+  config              Json     @default("{}")
+  createdAt           DateTime @default(now())
+  updatedAt           DateTime @updatedAt
+  items               IntelligenceItem[]
+  ingestionRuns       IntelligenceIngestionRun[]
+
+  @@index([enabled, nextFetchAt])
+  @@index([category, reliabilityScore])
+}
+
+model IntelligenceStory {
+  id                String   @id @default(cuid())
+  fingerprint       String   @unique
+  title             String
+  topic             String
+  summary           String?
+  verificationStatus String  @default("UNCONFIRMED")
+  confirmationCount Int      @default(0)
+  sourceCount       Int      @default(0)
+  relatedAssets     Json     @default("[]")
+  firstSeenAt       DateTime
+  lastSeenAt        DateTime
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+  items             IntelligenceItem[]
+  claims            IntelligenceClaim[]
+
+  @@index([verificationStatus, lastSeenAt])
+}
+
+model IntelligenceItem {
+  id                      String   @id @default(cuid())
+  sourceId                String
+  source                  IntelligenceSource @relation(fields: [sourceId], references: [id], onDelete: Cascade)
+  storyId                 String?
+  story                   IntelligenceStory? @relation(fields: [storyId], references: [id], onDelete: SetNull)
+  externalId              String?
+  canonicalUrl            String?
+  title                   String
+  author                  String?
+  content                 String
+  summary                 String?
+  kind                    String   @default("NEWS")
+  topic                   String   @default("OTHER")
+  factuality              String   @default("REPORT")
+  verificationStatus      String   @default("UNCONFIRMED")
+  sentiment               String   @default("NEUTRAL")
+  urgency                 String   @default("NORMAL")
+  expectedImpact          String   @default("LOW")
+  credibilityScore        Float    @default(0.5)
+  relevanceScore          Float    @default(0)
+  noveltyScore            Float    @default(1)
+  communityMomentum       Float    @default(0)
+  promptInjectionDetected Boolean  @default(false)
+  relatedAssets           Json     @default("[]")
+  countries               Json     @default("[]")
+  entities                Json     @default("[]")
+  claims                  Json     @default("[]")
+  engagement              Json     @default("{}")
+  raw                     Json     @default("{}")
+  contentHash             String
+  searchText              String
+  embedding               Json     @default("[]")
+  publishedAt             DateTime?
+  retrievedAt             DateTime @default(now())
+  expiresAt               DateTime?
+  reviewedAt              DateTime?
+  approvedByUser          Boolean  @default(false)
+  archivedAt              DateTime?
+  createdAt               DateTime @default(now())
+  updatedAt               DateTime @updatedAt
+  claimRecords            IntelligenceClaim[]
+
+  @@unique([sourceId, contentHash])
+  @@index([storyId, publishedAt])
+  @@index([verificationStatus, relevanceScore])
+  @@index([kind, publishedAt])
+}
+
+model IntelligenceClaim {
+  id                 String   @id @default(cuid())
+  storyId            String
+  story              IntelligenceStory @relation(fields: [storyId], references: [id], onDelete: Cascade)
+  itemId             String
+  item               IntelligenceItem @relation(fields: [itemId], references: [id], onDelete: Cascade)
+  claimHash          String
+  text               String
+  stance             String   @default("SUPPORTS")
+  verificationStatus String   @default("UNCONFIRMED")
+  confidence         Float    @default(0.5)
+  createdAt          DateTime @default(now())
+
+  @@unique([itemId, claimHash])
+  @@index([storyId, claimHash])
+}
+
+model KnowledgeEntry {
+  id                 String   @id @default(cuid())
+  key                String   @unique
+  type               String
+  title              String
+  content            String
+  confidence         Float    @default(0.5)
+  verificationStatus String   @default("UNCONFIRMED")
+  status             String   @default("PENDING")
+  userApproved       Boolean  @default(false)
+  approvalMethod     String?
+  approvalDecision   String?
+  approvalReason     String?
+  approvalConfidence Float?
+  approvedBy         String?
+  approvedAt         DateTime?
+  provenance         Json     @default("[]")
+  relatedAssets      Json     @default("[]")
+  entities           Json     @default("[]")
+  embedding          Json     @default("[]")
+  currentVersion     Int      @default(1)
+  validFrom          DateTime @default(now())
+  expiresAt          DateTime?
+  reviewAt           DateTime?
+  lastValidatedAt    DateTime?
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+  versions           KnowledgeVersion[]
+
+  @@index([status, reviewAt])
+  @@index([type, updatedAt])
+}
+
+model KnowledgeVersion {
+  id                 String   @id @default(cuid())
+  knowledgeEntryId   String
+  knowledgeEntry     KnowledgeEntry @relation(fields: [knowledgeEntryId], references: [id], onDelete: Cascade)
+  version            Int
+  content            String
+  confidence         Float
+  verificationStatus String
+  changeReason       String
+  provenance         Json     @default("[]")
+  changedBy          String
+  createdAt          DateTime @default(now())
+
+  @@unique([knowledgeEntryId, version])
+}
+
+model IntelligenceIngestionRun {
+  id                 String   @id @default(cuid())
+  sourceId           String?
+  source             IntelligenceSource? @relation(fields: [sourceId], references: [id], onDelete: SetNull)
+  jobType            String
+  idempotencyKey     String   @unique
+  status             String   @default("RUNNING")
+  fetchedCount       Int      @default(0)
+  storedCount        Int      @default(0)
+  duplicateCount     Int      @default(0)
+  errorCount         Int      @default(0)
+  error              String?
+  rateLimit          Json     @default("{}")
+  detail             Json     @default("{}")
+  startedAt          DateTime @default(now())
+  completedAt        DateTime?
+
+  @@index([status, startedAt])
+  @@index([sourceId, startedAt])
+}
+
+model ResearchBrief {
+  id          String   @id @default(cuid())
+  type        String
+  periodStart DateTime
+  periodEnd   DateTime
+  title       String
+  content     String
+  citations   Json     @default("[]")
+  createdAt   DateTime @default(now())
+
+  @@unique([type, periodStart, periodEnd])
 }
 
 model AiAnalysisLog {

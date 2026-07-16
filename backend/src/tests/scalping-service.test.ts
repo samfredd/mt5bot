@@ -139,13 +139,30 @@ describe("attemptScalpEntries", () => {
     mocks.executeTrade.mockResolvedValue({ id: "trade1", mt5Ticket: "ticket1" });
   });
 
-  it("opens a scalp when scalping risk passes even if global risk settings would block", async () => {
+  it("blocks a scalp when the global risk engine vetoes it", async () => {
     const { attemptScalpEntries } = await import("../modules/scalping/scalping.service.js");
 
     const result = await attemptScalpEntries("test");
 
-    expect(mocks.prisma.riskSettings.findUnique).not.toHaveBeenCalled();
-    expect(mocks.validateTrade).not.toHaveBeenCalled();
+    expect(mocks.prisma.riskSettings.findUnique).toHaveBeenCalledTimes(1);
+    expect(mocks.buildRiskContext).toHaveBeenCalledTimes(1);
+    expect(mocks.validateTrade).toHaveBeenCalledTimes(1);
+    expect(mocks.executeTrade).not.toHaveBeenCalled();
+    expect(result.opened).toEqual([]);
+    expect(result.blocked).toEqual([{ symbol: "USDJPY", reason: "global risk blocked: exposure" }]);
+  });
+
+  it("opens a scalp only after both scalping and global risk pass", async () => {
+    mocks.validateTrade.mockReturnValue({
+      ok: true,
+      checks: [{ name: "all", passed: true, detail: "ok" }],
+      adjustedLots: 0.01,
+    });
+    const { attemptScalpEntries } = await import("../modules/scalping/scalping.service.js");
+
+    const result = await attemptScalpEntries("test");
+
+    expect(mocks.validateTrade).toHaveBeenCalledTimes(1);
     expect(mocks.executeTrade).toHaveBeenCalledTimes(1);
     expect(result.opened).toEqual([{ symbol: "USDJPY", direction: "buy", ticket: "ticket1" }]);
     expect(result.blocked).toEqual([]);

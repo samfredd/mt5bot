@@ -1,6 +1,8 @@
 import { z } from "zod";
 
 export const StrategyConfigSchema = z.object({
+  version: z.number().int().positive().default(1),
+  validationStatus: z.enum(["unvalidated", "paper", "validated"]).default("unvalidated"),
   symbols: z.array(z.string()).min(1),
   timeframes: z.array(z.string()).min(1).default(["M15", "H1"]),
   entry: z.object({
@@ -17,9 +19,20 @@ export const StrategyConfigSchema = z.object({
     useRsi: z.boolean().optional(),
     useStructure: z.boolean().optional(),
     minConfidence: z.number().min(0).max(1).default(0.6),
+    // Deterministic quality controls. minConfidence remains the separate live
+    // AI gate; these filters also apply when Pure Logic is selected.
+    minRuleConfidence: z.number().min(0).max(1).optional(),
+    trendMinAdx: z.number().min(0).optional(),
+    maxExtensionAtr: z.number().positive().optional(),
     // Mean-reversion regime filter: skip when trend strength (ADX) exceeds this.
     // Omit/0 to disable. ~25 is the textbook range/trend divide.
     regimeMaxAdx: z.number().min(0).optional(),
+    // Breakout quality: require a meaningful close outside a reasonably sized
+    // Asian range instead of trading every one-tick poke through its edge.
+    breakoutBufferAtr: z.number().min(0).optional(),
+    breakoutMinRangeAtr: z.number().min(0).optional(),
+    breakoutMaxRangeAtr: z.number().positive().optional(),
+    breakoutRequireHigherAlignment: z.boolean().optional(),
   }),
   exit: z.object({
     stopLossAtrMult: z.number().positive().default(1.5),

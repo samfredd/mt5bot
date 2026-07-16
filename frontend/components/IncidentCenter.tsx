@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useState } from "react";
 import { api } from "@/lib/api";
+import { useToast } from "@/components/ToastProvider";
 
 interface Incident {
   id: string;
@@ -15,13 +16,19 @@ interface Incident {
 }
 
 export function IncidentCenter({ refreshKey = 0 }: { refreshKey?: number }) {
+  const toast = useToast();
   const [items, setItems] = useState<Incident[] | null>(null);
   const [error, setError] = useState("");
   const load = useCallback(() => api<Incident[]>("/api/incidents?status=ACTIVE&limit=30").then((rows) => { setItems(rows); setError(""); }).catch((err) => setError(String(err))), []);
   useEffect(() => { void load(); }, [load, refreshKey]);
   const act = async (id: string, action: "acknowledge" | "resolve") => {
-    await api(`/api/incidents/${id}/${action}`, { method: "POST", body: {} });
-    await load();
+    try {
+      await api(`/api/incidents/${id}/${action}`, { method: "POST", body: {} });
+      await load();
+      toast.success(action === "resolve" ? "Incident resolved" : "Incident acknowledged", "The incident center has been updated.");
+    } catch (err) {
+      toast.error("Incident not updated", err instanceof Error ? err.message : "The action could not be completed.");
+    }
   };
   return (
     <section className="panel">

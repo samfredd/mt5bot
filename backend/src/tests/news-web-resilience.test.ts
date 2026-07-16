@@ -9,6 +9,13 @@ vi.mock("../config.js", () => ({
     WEB_SEARCH_API_KEY: "test-key",
   },
 }));
+vi.mock("../modules/system/operational-config.js", () => ({
+  getOperationalConfig: vi.fn(async () => ({
+    newsCalendarUrl: "https://calendar.test/events.json",
+    webSearchProvider: "tavily",
+    webSearchApiKey: "test-key",
+  })),
+}));
 
 vi.mock("../lib/redis.js", () => ({
   readJson: vi.fn(async () => null),

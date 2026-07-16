@@ -6,6 +6,7 @@ import { prisma } from "../../lib/prisma.js";
 import { audit } from "../../lib/audit.js";
 import { getBotState, setBotState } from "../system/state.js";
 import { registerUser, verifyLogin, verifyTotp, revokeUserTokens } from "./service.js";
+import { getTelegramBotProfile } from "../telegram/api.js";
 
 const Credentials = z.object({ email: z.string().email(), password: z.string().min(8) });
 
@@ -82,10 +83,23 @@ export async function authRoutes(app: FastifyInstance) {
   });
 
   // --- Connector link codes (shown in dashboard, consumed in chat) ---
-  app.post("/auth/link/telegram", { preHandler: [app.authenticate] }, async (req) => {
+  app.get("/auth/link/telegram/status", { preHandler: [app.authenticate] }, async (req) => {
+    const [profile, linked, pending] = await Promise.all([
+      getTelegramBotProfile(),
+      prisma.telegramUser.findFirst({ where: { userId: req.user.id, verified: true }, select: { telegramId: true, chatId: true } }),
+      prisma.telegramUser.findFirst({ where: { userId: req.user.id, verified: false }, select: { linkCode: true } }),
+    ]);
+    return { configured: Boolean(profile), bot: profile, linked: Boolean(linked), telegramId: linked?.telegramId ?? null, pendingCode: pending?.linkCode ?? null };
+  });
+
+  app.post("/auth/link/telegram", { preHandler: [app.authenticate] }, async (req, reply) => {
+    const profile = await getTelegramBotProfile();
+    if (!profile) return reply.code(409).send({ error: "Telegram bot is not configured or Telegram cannot be reached. Check the bot token in Operational Settings." });
     const code = randomBytes(4).toString("hex");
+    await prisma.telegramUser.deleteMany({ where: { userId: req.user.id, verified: false } });
     await prisma.telegramUser.create({ data: { userId: req.user.id, telegramId: `pending:${code}`, linkCode: code } });
-    return { code, instructions: `Send "/link ${code}" to the Telegram bot.` };
+    const deepLink = `https://t.me/${profile.username}?start=link_${code}`;
+    return { code, bot: profile, deepLink, instructions: `Open @${profile.username} and send /link ${code}, or use the one-click link.` };
   });
 
   app.post("/auth/link/whatsapp", { preHandler: [app.authenticate] }, async (req) => {

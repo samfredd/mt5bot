@@ -1,4 +1,4 @@
-import { readJson, writeJson } from "./redis.js";
+import { readJson, redisAvailable, writeJson } from "./redis.js";
 
 export type CircuitStatus = "closed" | "open" | "half_open";
 
@@ -68,7 +68,13 @@ export async function withResilience<T>(
     state = { ...state, status: "half_open", updatedAt: now() };
     await saveState(state);
   } else if (state.status === "half_open") {
-    throw new CircuitOpenError(dependency);
+    // A process can die after persisting half_open but before completing its
+    // probe. Do not leave the dependency permanently wedged: after one cooldown
+    // window, claim a new probe. Updating the timestamp keeps concurrent calls
+    // from all probing at once.
+    if (now() - state.updatedAt < cooldownMs) throw new CircuitOpenError(dependency);
+    state = { ...state, updatedAt: now() };
+    await saveState(state);
   }
 
   let lastError: unknown;
@@ -102,6 +108,14 @@ export async function withResilience<T>(
 export function circuitSnapshot(dependency?: string): CircuitState | CircuitState[] | null {
   if (dependency) return circuits.get(dependency) ?? null;
   return [...circuits.values()];
+}
+
+/** Close a circuit after an operator repairs or reconfigures its dependency. */
+export async function resetCircuit(dependency: string): Promise<void> {
+  // Ioredis uses lazyConnect; ping first so this administrative reset reaches
+  // shared Redis even in a short-lived configuration CLI process.
+  await redisAvailable();
+  await saveState({ dependency, status: "closed", failures: 0, openedAt: null, updatedAt: Date.now() });
 }
 
 export function __resetCircuitsForTests(): void {

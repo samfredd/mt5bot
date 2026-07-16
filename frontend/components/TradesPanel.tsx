@@ -1,6 +1,7 @@
 "use client";
 import { useCallback, useEffect, useState } from "react";
 import { api } from "@/lib/api";
+import { useToast } from "@/components/ToastProvider";
 import type { Overview } from "@/app/dashboard/page";
 import { IconBrain, IconCheck, IconClock, IconDown, IconUp, IconX } from "@/components/icons";
 
@@ -41,8 +42,8 @@ function modeBadge(t: Trade): { label: string; cls: string } {
 }
 
 export function TradesPanel({ openTrades, onChanged }: { openTrades: Overview["openTrades"]; onChanged: () => void }) {
+  const toast = useToast();
   const [trades, setTrades] = useState<Trade[]>([]);
-  const [message, setMessage] = useState("");
   const [detail, setDetail] = useState<Trade | null>(null);
   const [lotInputs, setLotInputs] = useState<Record<string, string>>({});
   const [durations, setDurations] = useState<Record<string, string>>({});
@@ -68,12 +69,11 @@ export function TradesPanel({ openTrades, onChanged }: { openTrades: Overview["o
   }
 
   async function act(path: string, body?: unknown) {
-    setMessage("");
     try {
       const res = await api<{ ok?: boolean; message?: string }>(path, { method: "POST", body });
-      if (res.message) setMessage(res.message);
+      toast.success("Trade request completed", res.message ?? "The request passed the server checks and was applied.");
       await load(); onChanged();
-    } catch (err) { setMessage(err instanceof Error ? err.message : "Request failed"); }
+    } catch (err) { toast.error("Trade request failed", err instanceof Error ? err.message : "The request could not be completed."); }
   }
 
   const pending = trades.filter((t) => t.status === "PENDING_APPROVAL");
@@ -132,7 +132,7 @@ export function TradesPanel({ openTrades, onChanged }: { openTrades: Overview["o
                     <button
                       onClick={() => {
                         const lots = Number(lotValue);
-                        if (!(lots > 0)) { setMessage("Enter a valid lot size."); return; }
+                        if (!(lots > 0)) { toast.error("Invalid lot size", "Enter a valid lot size before approving the trade."); return; }
                         const durationMin = durations[t.id] ? Number(durations[t.id]) : undefined;
                         void act(`/api/trades/${t.id}/approve`, { lots, durationMin });
                       }}
@@ -304,8 +304,6 @@ export function TradesPanel({ openTrades, onChanged }: { openTrades: Overview["o
         </div>
       </section>
 
-      {message && <p className="text-sm text-warn" role="status">{message}</p>}
-
       {detail && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4 backdrop-blur-sm" onClick={() => setDetail(null)}>
           <div className="card max-h-[80vh] w-full max-w-2xl overflow-auto" onClick={(e) => e.stopPropagation()}>
@@ -454,9 +452,9 @@ function Section({ title, children }: { title: string; children: React.ReactNode
 }
 
 function ManualTrade({ onDone }: { onDone: () => void }) {
+  const toast = useToast();
   const [form, setForm] = useState({ symbol: "EURUSD", direction: "buy", lots: "0.01", stopLoss: "", takeProfit: "", durationMin: "" });
   const [symbols, setSymbols] = useState<string[]>(["EURUSD"]);
-  const [message, setMessage] = useState("");
   const [busy, setBusy] = useState(false);
 
   useEffect(() => {
@@ -470,7 +468,6 @@ function ManualTrade({ onDone }: { onDone: () => void }) {
 
   async function submit(e: React.FormEvent) {
     e.preventDefault();
-    setMessage("");
     setBusy(true);
     try {
       await api("/api/trades/manual", {
@@ -482,10 +479,10 @@ function ManualTrade({ onDone }: { onDone: () => void }) {
           durationMin: form.durationMin ? Number(form.durationMin) : undefined,
         },
       });
-      setMessage("Trade submitted — passed all risk checks.");
+      toast.success("Trade submitted", "The order passed all risk checks.");
       onDone();
     } catch (err) {
-      setMessage(err instanceof Error ? err.message : "Submit failed");
+      toast.error("Trade submission failed", err instanceof Error ? err.message : "The order was not submitted.");
     } finally {
       setBusy(false);
     }
@@ -538,7 +535,6 @@ function ManualTrade({ onDone }: { onDone: () => void }) {
         </div>
         <button disabled={busy} className="btn-primary">{busy ? "Submitting…" : "Submit trade"}</button>
       </form>
-      {message && <p className="mt-3 text-sm text-warn" role="status">{message}</p>}
     </section>
   );
 }

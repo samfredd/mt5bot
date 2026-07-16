@@ -54,9 +54,9 @@ describe("conflictingTrade", () => {
     expect(conflictingTrade(live, "EURUSDm", "strat-B")).not.toBeNull();
   });
 
-  it("does NOT flag the pair when only this strategy holds it", () => {
+  it("flags same-strategy re-entry so netting positions remain attributable", () => {
     const live = [t("EURUSDm", "strat-B")];
-    expect(conflictingTrade(live, "EURUSD", "strat-B")).toBeNull();
+    expect(conflictingTrade(live, "EURUSD", "strat-B")).not.toBeNull();
   });
 
   it("ignores positions on other pairs", () => {

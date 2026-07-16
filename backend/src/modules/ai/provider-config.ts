@@ -1,4 +1,3 @@
-import { config } from "../../config.js";
 import { prisma } from "../../lib/prisma.js";
 import { encryptSecret, decryptSecret } from "../../lib/crypto.js";
 import { PROVIDER_NAMES, type ProviderName } from "./providers/types.js";
@@ -6,7 +5,7 @@ import { PROVIDER_NAMES, type ProviderName } from "./providers/types.js";
 /**
  * Provider configuration (API keys, models, base URLs) editable from the
  * Settings UI and persisted in the DB — so you can add/change a provider
- * without touching .env or restarting. DB values override env defaults.
+ * without touching .env or restarting.
  * API keys are encrypted at rest (AES-256-GCM) and never returned to clients.
  */
 
@@ -34,28 +33,33 @@ async function loadStored(): Promise<StoredConfig> {
     const row = await prisma.systemSetting.findUnique({ where: { key: KEY } });
     value = (row?.value as StoredConfig | undefined) ?? {};
   } catch {
-    /* fall back to env-only */
+    /* database not ready yet: use safe built-in defaults */
   }
   cache = { value, ts: Date.now() };
   return value;
 }
 
-function envDefaults(provider: ProviderName): ResolvedProviderConfig {
+function providerDefaults(provider: ProviderName): ResolvedProviderConfig {
   switch (provider) {
-    case "ollama": return { apiKey: "", model: config.OLLAMA_MODEL, baseUrl: config.OLLAMA_URL };
-    case "anthropic": return { apiKey: config.ANTHROPIC_API_KEY, model: config.ANTHROPIC_MODEL, baseUrl: "" };
-    case "openai": return { apiKey: config.OPENAI_API_KEY, model: config.OPENAI_MODEL, baseUrl: config.OPENAI_BASE_URL };
-    case "openrouter": return { apiKey: config.OPENROUTER_API_KEY, model: config.OPENROUTER_MODEL, baseUrl: config.OPENROUTER_BASE_URL };
+    case "ollama": return { apiKey: "", model: "gemma3:12b", baseUrl: "http://localhost:11434" };
+    case "anthropic": return { apiKey: "", model: "", baseUrl: "" };
+    case "openai": return { apiKey: "", model: "", baseUrl: "https://api.openai.com/v1" };
+    case "openrouter": return { apiKey: "", model: "", baseUrl: "https://openrouter.ai/api/v1" };
+    case "nvidia": return {
+      apiKey: "",
+      model: "nvidia/nemotron-3-super-120b-a12b",
+      baseUrl: "https://integrate.api.nvidia.com/v1",
+    };
   }
 }
 
-/** Effective config for a provider — stored values over env defaults. */
+/** Effective config for a provider — stored values over safe built-in defaults. */
 export async function resolveProviderConfig(provider: ProviderName): Promise<ResolvedProviderConfig> {
-  const env = envDefaults(provider);
+  const env = providerDefaults(provider);
   const stored = (await loadStored())[provider];
   let apiKey = env.apiKey;
   if (stored?.apiKeyEnc) {
-    try { apiKey = decryptSecret(stored.apiKeyEnc); } catch { /* keep env key */ }
+    try { apiKey = decryptSecret(stored.apiKeyEnc); } catch { /* treat unreadable key as unavailable */ }
   }
   return {
     apiKey,
@@ -73,7 +77,7 @@ export interface ProviderConfigSummary {
   requiresKey: boolean;
   hasKey: boolean;
   configured: boolean;
-  keySource: "db" | "env" | "none";
+  keySource: "db" | "none";
 }
 
 /** Per-provider config for the UI — never includes the secret itself. */
@@ -84,8 +88,8 @@ export async function providerConfigSummaries(): Promise<ProviderConfigSummary[]
     const needsKey = requiresKey(name);
     const hasKey = needsKey ? resolved.apiKey.length > 0 : true;
     const keySource: ProviderConfigSummary["keySource"] = !needsKey
-      ? "env"
-      : stored[name]?.apiKeyEnc ? "db" : resolved.apiKey ? "env" : "none";
+      ? "none"
+      : stored[name]?.apiKeyEnc ? "db" : "none";
     return {
       name,
       model: resolved.model,

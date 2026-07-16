@@ -1,7 +1,7 @@
 import { z } from "zod";
 import { prisma } from "../../lib/prisma.js";
 import { generateJson } from "../ai/service.js";
-import { webSearch, type WebResult } from "../web/search.js";
+import { webSearch, webSearchConfigured, type WebResult } from "../web/search.js";
 
 const SentimentInput = z.object({
   score: z.number(),
@@ -28,6 +28,41 @@ export function normalizeSentiment(
     ageSeconds: Math.max(0, Math.floor((now.getTime() - generatedAt.getTime()) / 1000)),
     sources: sources.map((source) => ({ title: source.title, url: source.url })),
   };
+}
+
+/**
+ * Cache-only sentiment read for the TRADE path: never searches the web, never
+ * calls the model, so it adds one DB read of latency to a trade decision.
+ * Returns null when there is no reading, the reading is stale, or it carries
+ * zero confidence — the decision context then lists sentiment as missing.
+ */
+export async function cachedSentiment(
+  symbol: string,
+  maxAgeMinutes = 60,
+): Promise<{ score: number; label: string; confidence: number; ageSeconds: number; summary: string } | null> {
+  const cached = await prisma.systemSetting.findUnique({ where: { key: `sentiment:${symbol.toUpperCase()}` } });
+  if (!cached) return null;
+  const value = cached.value as ReturnType<typeof normalizeSentiment>;
+  const generatedAt = new Date(value.generatedAt);
+  const ageMs = Date.now() - generatedAt.getTime();
+  if (Number.isNaN(generatedAt.getTime()) || ageMs > maxAgeMinutes * 60_000 || value.confidence <= 0) return null;
+  return {
+    score: value.score,
+    label: value.label,
+    confidence: value.confidence,
+    ageSeconds: Math.max(0, Math.floor(ageMs / 1000)),
+    summary: value.summary,
+  };
+}
+
+/**
+ * Fire-and-forget refresh so the NEXT decision has fresh sentiment without
+ * this one paying the web-search + model latency. No-op when web search is
+ * not configured (a zero-evidence reading would only pollute the cache).
+ */
+export function refreshSentimentSoon(symbol: string): void {
+  if (!webSearchConfigured()) return;
+  void sentimentForSymbol(symbol).catch(() => undefined);
 }
 
 export async function sentimentForSymbol(symbol: string) {

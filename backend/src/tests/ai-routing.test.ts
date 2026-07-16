@@ -19,6 +19,9 @@ vi.mock("../config.js", () => ({
     OLLAMA_TIMEOUT_MS: 1000,
   },
 }));
+vi.mock("../modules/system/operational-config.js", () => ({
+  getOperationalConfig: vi.fn(async () => ({ aiResearchFallbackToOllama: h.fallback })),
+}));
 
 vi.mock("../modules/ai/providers/anthropic.js", () => ({
   anthropicGenerate: h.anthropic,
@@ -28,6 +31,7 @@ vi.mock("../modules/ai/providers/ollama.js", () => ({ ollamaGenerate: h.ollama, 
 vi.mock("../modules/ai/providers/openai-compatible.js", () => ({
   openaiGenerate: vi.fn(), openaiStatus: vi.fn(async () => ({ reachable: false, modelPresent: false })),
   openrouterGenerate: vi.fn(), openrouterStatus: vi.fn(async () => ({ reachable: false, modelPresent: false })),
+  nvidiaGenerate: vi.fn(), nvidiaStatus: vi.fn(async () => ({ reachable: false, modelPresent: false })),
 }));
 vi.mock("../lib/prisma.js", () => ({
   prisma: {
@@ -38,8 +42,7 @@ vi.mock("../lib/prisma.js", () => ({
       }),
       findMany: vi.fn(async () => []),
     },
-    // No runtime override stored → getActiveProvider falls back to config.AI_PROVIDER.
-    systemSetting: { findUnique: vi.fn(async () => null), upsert: vi.fn(async () => ({})) },
+    systemSetting: { findUnique: vi.fn(async ({ where }: { where: { key: string } }) => where.key === "ai_provider" ? { value: { provider: h.provider } } : null), upsert: vi.fn(async () => ({})) },
   },
 }));
 vi.mock("../lib/audit.js", () => ({ logError: vi.fn(async () => {}) }));

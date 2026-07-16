@@ -1,0 +1,23 @@
+# Run this file independently on a Windows Server 2022 Docker host switched to
+# Windows containers. It is intentionally not part of docker-compose.yml:
+# Linux and Windows containers require separate daemons/nodes in production.
+services:
+  mt5-bridge:
+    build:
+      context: ./mt5-bridge
+      dockerfile: Dockerfile.windows
+    restart: unless-stopped
+    isolation: hyperv
+    ports:
+      # Bind to the Windows node's private-network address with a firewall rule;
+      # do not publish this service to the public Internet.
+      - "5001:5001"
+    volumes:
+      - mt5_terminal_data:C:\mt5-data
+      # Create this directory on the Windows host with ACLs limited to Docker.
+      - type: bind
+        source: C:\mt5-secrets
+        target: C:\run\secrets
+        read_only: true
+volumes:
+  mt5_terminal_data:

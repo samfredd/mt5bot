@@ -66,7 +66,20 @@ vi.mock("../lib/prisma.js", () => ({
     riskSettings: { findUnique: vi.fn(async () => settings) },
     trade: {
       create: vi.fn(async ({ data }: { data: Record<string, unknown> }) => { const t = { id: `t${h.created.length + 1}`, ...data }; h.created.push(t); return t; }),
-      update: vi.fn(async ({ where, data }: { where: { id: string }; data: Record<string, unknown> }) => { const t = { id: where.id, ...data }; h.updated.push(t); return t; }),
+      update: vi.fn(async ({ where, data }: { where: { id: string }; data: Record<string, unknown> }) => {
+        const prior = [...h.created, ...h.updated].reverse().find((item) => item.id === where.id) ?? {};
+        const t = { ...prior, id: where.id, ...data };
+        h.updated.push(t);
+        if (h.tradeForDecide && h.tradeForDecide.id === where.id) Object.assign(h.tradeForDecide, data);
+        return t;
+      }),
+      updateMany: vi.fn(async ({ where, data }: { where: { id?: string; status?: string }; data: Record<string, unknown> }) => {
+        const trade = h.tradeForDecide;
+        if (!trade || (where.id && trade.id !== where.id) || (where.status && trade.status !== where.status)) return { count: 0 };
+        Object.assign(trade, data);
+        h.updated.push({ id: trade.id, ...data });
+        return { count: 1 };
+      }),
       findUnique: vi.fn(async () => h.tradeForDecide),
       findFirst: vi.fn(async () => null),
       count: vi.fn(async () => 0),
@@ -125,6 +138,9 @@ vi.mock("../modules/strategy/service.js", () => ({
 
 vi.mock("../modules/ai/service.js", () => ({
   askModel: vi.fn(async () => ({ decision: h.ai, logId: "log1", valid: h.aiValid })),
+  getActiveProvider: vi.fn(async () => "ollama"),
+  PURE_LOGIC_PROVIDER: "pure_logic",
+  pureLogicDecision: vi.fn((direction: "buy" | "sell") => ({ ...h.ai, decision: direction, confidence: 1 })),
 }));
 
 vi.mock("../modules/mt5/account.js", () => ({
@@ -157,6 +173,26 @@ vi.mock("../modules/trading/execution-comparison.js", () => ({
   recordEntryComparison: vi.fn(async (input: Record<string, unknown>) => {
     h.comparisons.push(input);
     return input;
+  }),
+}));
+
+// Durable intent persistence has its own focused tests; these orchestration
+// tests keep the broker boundary lightweight while preserving state changes.
+vi.mock("../modules/trading/execution-intent.js", () => ({
+  prepareDurableExecution: vi.fn(async ({ proposal, mode, explanation, existingTradeId }: any) => {
+    const trade = existingTradeId
+      ? { id: existingTradeId, symbol: proposal.symbol, lots: proposal.lots, status: "SUBMITTING", explanation }
+      : { id: `t${h.created.length + 1}`, symbol: proposal.symbol, lots: proposal.lots, status: "SUBMITTING", mode, explanation };
+    if (existingTradeId) h.updated.push(trade); else h.created.push(trade);
+    return { trade, intent: { id: `i-${trade.id}`, clientOrderId: `mt5b-${trade.id}` }, request: { ...proposal, volume: proposal.lots, client_order_id: `mt5b-${trade.id}` } };
+  }),
+  markIntentSubmitting: vi.fn(async () => {}),
+  markIntentUnknown: vi.fn(async () => {}),
+  applyOrderResult: vi.fn(async (_intentId: string, tradeId: string, result: any) => {
+    const status = result.status ?? (result.ok ? "FILLED" : "REJECTED");
+    const trade = { id: tradeId, status: status === "FILLED" ? "EXECUTED" : "FAILED", mt5Ticket: result.position_id ?? result.ticket ?? null, entryPrice: result.price };
+    h.updated.push(trade);
+    return { intent: { id: _intentId, status }, trade };
   }),
 }));
 
@@ -339,21 +375,21 @@ describe("decideTrade — approval re-validation", () => {
 
   it("rejects cleanly when asked to reject", async () => {
     h.tradeForDecide = pendingTrade();
-    const r = await decideTrade("t1", false, "tester", "DASHBOARD");
+    const r = await decideTrade("t1", false, "tester", "DASHBOARD", { actorUserId: "u1" });
     expect(r.ok).toBe(true);
     expect(h.updated.some((t) => t.status === "REJECTED")).toBe(true);
   });
 
   it("cancels an expired approval instead of executing", async () => {
     h.tradeForDecide = pendingTrade({ approval: { id: "a1", expiresAt: new Date(Date.now() - 1000), status: "pending" } });
-    const r = await decideTrade("t1", true, "tester", "DASHBOARD");
+    const r = await decideTrade("t1", true, "tester", "DASHBOARD", { actorUserId: "u1" });
     expect(r.ok).toBe(false);
     expect(h.updated.some((t) => t.status === "CANCELLED")).toBe(true);
   });
 
   it("executes on approval when the fresh risk re-check passes", async () => {
     h.tradeForDecide = pendingTrade();
-    const r = await decideTrade("t1", true, "tester", "DASHBOARD");
+    const r = await decideTrade("t1", true, "tester", "DASHBOARD", { actorUserId: "u1" });
     expect(r.ok).toBe(true);
     expect(h.audits.some((a) => a.action === "trade_executed")).toBe(true);
   });
@@ -361,8 +397,24 @@ describe("decideTrade — approval re-validation", () => {
   it("blocks on approval when the fresh risk re-check fails (wide spread)", async () => {
     h.tradeForDecide = pendingTrade();
     h.tick = { ...h.tick, spread_points: 50 };
-    const r = await decideTrade("t1", true, "tester", "DASHBOARD");
+    const r = await decideTrade("t1", true, "tester", "DASHBOARD", { actorUserId: "u1" });
     expect(r.ok).toBe(false);
     expect(h.updated.some((t) => t.status === "RISK_BLOCKED")).toBe(true);
+  });
+
+  it("does not let another user decide the trade", async () => {
+    h.tradeForDecide = pendingTrade();
+    const r = await decideTrade("t1", true, "tester", "DASHBOARD", { actorUserId: "other-user" });
+    expect(r.ok).toBe(false);
+    expect(h.orders).toHaveLength(0);
+  });
+
+  it("submits at most one order when an approval is repeated", async () => {
+    h.tradeForDecide = pendingTrade();
+    const first = await decideTrade("t1", true, "tester", "DASHBOARD", { actorUserId: "u1" });
+    const second = await decideTrade("t1", true, "tester", "DASHBOARD", { actorUserId: "u1" });
+    expect(first.ok).toBe(true);
+    expect(second.ok).toBe(false);
+    expect(h.orders).toHaveLength(1);
   });
 });

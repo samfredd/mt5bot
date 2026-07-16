@@ -13,6 +13,7 @@ import {
 import { getRecentScalpingDecisions, getScalpingPlans, refreshStalePlans } from "./scalping.ai.js";
 import { currencies } from "./scalping.risk.js";
 import { SCALPING_SOURCE } from "./scalping.types.js";
+import { settingFailure, validationFailure } from "../../lib/validation.js";
 
 const SCALP_FILTER = { explanation: { path: ["source"], equals: SCALPING_SOURCE } } as const;
 
@@ -66,7 +67,7 @@ export async function scalpingRoutes(app: FastifyInstance) {
 
   app.put("/api/scalping", { preHandler: [app.requireRole("ADMIN", "MANAGER")] }, async (req, reply) => {
     const parsed = ScalpingConfigPatchSchema.safeParse(req.body ?? {});
-    if (!parsed.success) return reply.code(400).send({ error: "invalid scalping config", issues: parsed.error.issues });
+    if (!parsed.success) return reply.code(400).send(validationFailure("Invalid scalping configuration", parsed.error));
     return setScalpingConfig(parsed.data, req.user.email);
   });
 
@@ -75,11 +76,11 @@ export async function scalpingRoutes(app: FastifyInstance) {
 
   app.put("/api/scalping/risk-settings", { preHandler: [app.requireRole("ADMIN", "MANAGER")] }, async (req, reply) => {
     const parsed = ScalpingRiskPatchSchema.safeParse(req.body ?? {});
-    if (!parsed.success) return reply.code(400).send({ error: "invalid scalping risk settings", issues: parsed.error.issues });
+    if (!parsed.success) return reply.code(400).send(validationFailure("Invalid scalping risk settings", parsed.error));
     try {
       return await setScalpingRisk(parsed.data, req.user.email);
     } catch (err) {
-      if (err instanceof ScalpingRiskError) return reply.code(400).send({ error: err.message });
+      if (err instanceof ScalpingRiskError) return reply.code(400).send(settingFailure("scalping risk", err.message, "Lower Maximum open trades or Risk per trade, then save again."));
       throw err;
     }
   });
@@ -87,11 +88,11 @@ export async function scalpingRoutes(app: FastifyInstance) {
   // --- Apply a risk preset (low/medium/aggressive) over the current settings ---
   app.post("/api/scalping/preset", { preHandler: [app.requireRole("ADMIN", "MANAGER")] }, async (req, reply) => {
     const parsed = z.object({ preset: z.enum(["low", "medium", "aggressive"]) }).safeParse(req.body ?? {});
-    if (!parsed.success) return reply.code(400).send({ error: "invalid preset", issues: parsed.error.issues });
+    if (!parsed.success) return reply.code(400).send(validationFailure("Invalid scalping preset", parsed.error));
     try {
       return await applyScalpingPreset(parsed.data.preset, req.user.email);
     } catch (err) {
-      if (err instanceof ScalpingRiskError) return reply.code(400).send({ error: err.message });
+      if (err instanceof ScalpingRiskError) return reply.code(400).send(settingFailure("scalping preset", err.message, "Choose a lower-risk preset or reduce total exposure."));
       throw err;
     }
   });

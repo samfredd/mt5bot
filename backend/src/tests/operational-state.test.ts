@@ -73,7 +73,7 @@ describe("operational state", () => {
     }
   });
 
-  it("loads bot state from Redis before Postgres", async () => {
+  it("uses PostgreSQL as authority instead of reviving stale Redis state", async () => {
     h.redisValues.set("bot:state", {
       status: "paused",
       mode: "SEMI_AUTO",
@@ -81,8 +81,10 @@ describe("operational state", () => {
       demoMode: true,
       liveTradingEnabled: false,
     });
+    h.systemValues.set("bot_state", { status: "stopped", mode: "MANUAL", emergencyStop: false });
     const { getBotState } = await import("../modules/system/state.js");
-    await expect(getBotState()).resolves.toMatchObject({ status: "paused", mode: "SEMI_AUTO" });
+    await expect(getBotState()).resolves.toMatchObject({ status: "stopped", mode: "MANUAL" });
+    expect(h.redisValues.get("bot:state")).toMatchObject({ status: "stopped", mode: "MANUAL" });
   });
 
   it("persists state durably and mirrors it to Redis", async () => {

@@ -2,14 +2,25 @@ import type { FastifyInstance } from "fastify";
 import { z } from "zod";
 import { prisma } from "../../lib/prisma.js";
 import { mt5 } from "../mt5/client.js";
-import { aiHealth, availableProviders, getActiveProvider, isProviderName, setActiveProvider } from "../ai/service.js";
+import { aiHealth, availableProviders, getActiveProvider, isAiMode, isProviderName, PURE_LOGIC_PROVIDER, setActiveProvider } from "../ai/service.js";
 import { updateProviderConfig } from "../ai/provider-config.js";
+import { fetchProviderModels } from "../ai/model-catalog.js";
 import { getBotState, setBotState } from "../system/state.js";
 import { emergencyStopAll } from "../trading/service.js";
 import { notify } from "../notifications/service.js";
 import { audit } from "../../lib/audit.js";
 import { operationalHealth } from "../../lib/operational-health.js";
 import { resolveIncidentByDedupeKey } from "../incidents/service.js";
+import { OperationalConfigSchema, createMcpAccessToken, getOperationalConfigSummary, revokeMcpAccessToken, updateOperationalConfig } from "./operational-config.js";
+import { settingFailure, validationFailure } from "../../lib/validation.js";
+
+function actionsForNotification(type: string) {
+  if (/approval/.test(type)) return [{ label: "Review trade", href: "/dashboard?tab=Trades" }, { label: "Open settings", href: "/dashboard?tab=Settings" }];
+  if (/trade|profit|loss|stop/.test(type)) return [{ label: "View trades", href: "/dashboard?tab=Trades" }, { label: "View activity", href: "/dashboard?tab=Activity" }];
+  if (/news/.test(type)) return [{ label: "Open news", href: "/dashboard?tab=News" }, { label: "Review settings", href: "/dashboard?tab=Settings" }];
+  if (/error|risk|emergency|paused/.test(type)) return [{ label: "View incidents", href: "/dashboard?tab=Activity" }, { label: "Review settings", href: "/dashboard?tab=Settings" }];
+  return [{ label: "View activity", href: "/dashboard?tab=Activity" }];
+}
 
 export async function systemRoutes(app: FastifyInstance) {
   app.get("/health", async () => {
@@ -23,8 +34,10 @@ export async function systemRoutes(app: FastifyInstance) {
     const degraded: string[] = [];
     if (!bridge.connected) degraded.push("mt5_bridge");
     if (!operational.redis) degraded.push("redis");
-    if (!ai.reachable) degraded.push("ai_unreachable");
-    else if (!ai.modelPresent) degraded.push("ai_model_missing");
+    if (ai.provider !== PURE_LOGIC_PROVIDER) {
+      if (!ai.reachable) degraded.push("ai_unreachable");
+      else if (!ai.modelPresent) degraded.push("ai_model_missing");
+    }
     for (const circuit of operational.circuits.filter((item) => item.status === "open")) {
       degraded.push(`${circuit.dependency}_circuit`);
     }
@@ -50,20 +63,108 @@ export async function systemRoutes(app: FastifyInstance) {
 
   app.get("/api/bot/state", { preHandler: [app.authenticate] }, async () => getBotState());
 
+  // Operational settings deliberately live in Postgres, not .env. Secrets are
+  // encrypted at rest and the GET response returns only their presence flags.
+  app.get("/api/system/operational-settings", { preHandler: [app.requireRole("ADMIN")] }, async () => getOperationalConfigSummary());
+
+  app.put("/api/system/operational-settings", { preHandler: [app.requireRole("ADMIN")] }, async (req, reply) => {
+    const body = z.intersection(
+      OperationalConfigSchema.partial(),
+      z.object({
+        mt5BridgeApiKey: z.string().max(500).optional(),
+        telegramBotToken: z.string().max(500).optional(),
+        twilioAccountSid: z.string().max(500).optional(),
+        twilioAuthToken: z.string().max(500).optional(),
+        webSearchApiKey: z.string().max(500).optional(),
+        youtubeApiKey: z.string().max(500).optional(),
+        githubToken: z.string().max(500).optional(),
+        xBearerToken: z.string().max(1000).optional(),
+        clearMt5BridgeApiKey: z.boolean().optional(),
+        clearTelegramBotToken: z.boolean().optional(),
+        clearTwilioAccountSid: z.boolean().optional(),
+        clearTwilioAuthToken: z.boolean().optional(),
+        clearWebSearchApiKey: z.boolean().optional(),
+        clearYoutubeApiKey: z.boolean().optional(),
+        clearGithubToken: z.boolean().optional(),
+        clearXBearerToken: z.boolean().optional(),
+      }),
+    ).safeParse(req.body ?? {});
+    if (!body.success) return reply.code(400).send(validationFailure("Invalid operational settings", body.error));
+    const next = await updateOperationalConfig(body.data);
+    await audit({
+      actor: req.user.email,
+      userId: req.user.id,
+      category: "system",
+      action: "operational_settings_updated",
+      detail: {
+        ...body.data,
+        mt5BridgeApiKey: body.data.mt5BridgeApiKey ? "[updated]" : undefined,
+        telegramBotToken: body.data.telegramBotToken ? "[updated]" : undefined,
+        twilioAccountSid: body.data.twilioAccountSid ? "[updated]" : undefined,
+        twilioAuthToken: body.data.twilioAuthToken ? "[updated]" : undefined,
+        webSearchApiKey: body.data.webSearchApiKey ? "[updated]" : undefined,
+        youtubeApiKey: body.data.youtubeApiKey ? "[updated]" : undefined,
+        githubToken: body.data.githubToken ? "[updated]" : undefined,
+        xBearerToken: body.data.xBearerToken ? "[updated]" : undefined,
+      },
+    });
+    return next;
+  });
+
+  app.post("/api/system/mcp-token", { preHandler: [app.requireRole("ADMIN")] }, async (req) => {
+    const generated = await createMcpAccessToken(req.user.id);
+    await updateOperationalConfig({ mcpEnabled: true });
+    await audit({
+      actor: req.user.email,
+      userId: req.user.id,
+      category: "system",
+      action: "mcp_access_token_rotated",
+      detail: { createdAt: generated.createdAt },
+    });
+    return {
+      token: generated.token,
+      createdAt: generated.createdAt,
+      warning: "Copy this token now. It will not be shown again.",
+    };
+  });
+
+  app.delete("/api/system/mcp-token", { preHandler: [app.requireRole("ADMIN")] }, async (req) => {
+    await revokeMcpAccessToken();
+    await updateOperationalConfig({ mcpEnabled: false });
+    await audit({ actor: req.user.email, userId: req.user.id, category: "system", action: "mcp_access_revoked" });
+    return { ok: true };
+  });
+
   // --- AI provider: one active provider, switched + configured live (no restart) ---
   app.get("/api/ai/provider", { preHandler: [app.authenticate] }, async () => {
     const [active, providers] = await Promise.all([getActiveProvider(), availableProviders()]);
     return { active, providers };
   });
 
+  app.get("/api/ai/provider-models/:provider", { preHandler: [app.authenticate] }, async (req, reply) => {
+    const params = z.object({ provider: z.string() }).safeParse(req.params);
+    if (!params.success || !isProviderName(params.data.provider)) {
+      return reply.code(400).send(params.success
+        ? settingFailure("provider", `unsupported provider "${params.data.provider}"`, "Select a provider shown in Settings.")
+        : validationFailure("Invalid AI provider", params.error));
+    }
+    try {
+      const models = await fetchProviderModels(params.data.provider);
+      return { provider: params.data.provider, models };
+    } catch (error) {
+      return reply.code(502).send({ error: error instanceof Error ? error.message : "could not load provider models" });
+    }
+  });
+
   app.put("/api/ai/provider", { preHandler: [app.requireRole("ADMIN")] }, async (req, reply) => {
     const body = z.object({ provider: z.string() }).safeParse(req.body);
-    if (!body.success || !isProviderName(body.data.provider)) {
-      return reply.code(400).send({ error: "provider must be one of: ollama, anthropic, openai, openrouter" });
+    if (!body.success) return reply.code(400).send(validationFailure("Invalid AI provider setting", body.error));
+    if (!isAiMode(body.data.provider)) {
+      return reply.code(400).send(settingFailure("provider", `"${body.data.provider}" is not supported`, "Choose pure_logic, ollama, anthropic, openai, openrouter, or nvidia."));
     }
     const provider = body.data.provider;
-    const entry = (await availableProviders()).find((p) => p.name === provider);
-    if (!entry?.configured) {
+    const entry = isProviderName(provider) ? (await availableProviders()).find((p) => p.name === provider) : undefined;
+    if (provider !== PURE_LOGIC_PROVIDER && !entry?.configured) {
       return reply.code(409).send({ error: `${provider} is not configured — set its API key and model first` });
     }
     await setActiveProvider(provider);
@@ -81,7 +182,9 @@ export async function systemRoutes(app: FastifyInstance) {
       clearKey: z.boolean().optional(),
     }).safeParse(req.body);
     if (!body.success || !isProviderName(body.data.provider)) {
-      return reply.code(400).send({ error: "invalid provider configuration" });
+      return reply.code(400).send(body.success
+        ? settingFailure("provider", `"${body.data.provider}" is not supported`, "Select a provider shown in Settings.")
+        : validationFailure("Invalid provider configuration", body.error));
     }
     const { provider, ...patch } = body.data;
     await updateProviderConfig(provider, patch);
@@ -110,7 +213,7 @@ export async function systemRoutes(app: FastifyInstance) {
 
   app.post("/api/bot/mode", { preHandler: [app.requireRole("ADMIN", "MANAGER")] }, async (req, reply) => {
     const body = z.object({ mode: z.enum(["MANUAL", "SEMI_AUTO", "AUTO", "COPY"]) }).safeParse(req.body);
-    if (!body.success) return reply.code(400).send({ error: "invalid mode" });
+    if (!body.success) return reply.code(400).send(validationFailure("Invalid bot mode", body.error));
     return setBotState({ mode: body.data.mode }, req.user.email);
   });
 
@@ -122,8 +225,9 @@ export async function systemRoutes(app: FastifyInstance) {
       liveTradingEnabled: z.boolean().optional(),
       requireLiveTwoFactor: z.boolean().optional(),
       autoLiveAuthorized: z.boolean().optional(),
+      adaptiveRiskEnabled: z.boolean().optional(),
     }).safeParse(req.body ?? {});
-    if (!body.success) return reply.code(400).send({ error: "invalid live-settings payload" });
+    if (!body.success) return reply.code(400).send(validationFailure("Invalid live-trading settings", body.error));
     // Keep demoMode in lockstep with the live master switch (as /auth/live/enable
     // does): otherwise a stale demoMode=true wrongly blocks manual live trades.
     const patch = body.data.liveTradingEnabled === undefined
@@ -137,6 +241,7 @@ export async function systemRoutes(app: FastifyInstance) {
         liveTradingEnabled: next.liveTradingEnabled,
         requireLiveTwoFactor: next.requireLiveTwoFactor,
         autoLiveAuthorized: next.autoLiveAuthorized,
+        adaptiveRiskEnabled: next.adaptiveRiskEnabled,
       },
     });
     return next;
@@ -144,7 +249,7 @@ export async function systemRoutes(app: FastifyInstance) {
 
   app.post("/api/bot/paper-forward", { preHandler: [app.requireRole("ADMIN", "MANAGER")] }, async (req, reply) => {
     const body = z.object({ enabled: z.boolean() }).safeParse(req.body);
-    if (!body.success) return reply.code(400).send({ error: "invalid paper-forward setting" });
+    if (!body.success) return reply.code(400).send(validationFailure("Invalid paper-trading setting", body.error));
     return setBotState({ paperForward: body.data.enabled }, req.user.email);
   });
 
@@ -170,7 +275,17 @@ export async function systemRoutes(app: FastifyInstance) {
   });
 
   app.get("/api/notifications", { preHandler: [app.authenticate] }, async (req) => {
-    return prisma.notification.findMany({ where: { userId: req.user.id }, orderBy: { createdAt: "desc" }, take: 50 });
+    const { notificationHistoryLimit } = await getOperationalConfigSummary();
+    const rows = await prisma.notification.findMany({ where: { userId: req.user.id }, orderBy: { createdAt: "desc" }, take: notificationHistoryLimit });
+    return rows.map((row) => ({ ...row, actions: actionsForNotification(row.type) }));
+  });
+
+  app.get("/api/notifications/:id", { preHandler: [app.authenticate] }, async (req, reply) => {
+    const parsed = z.object({ id: z.string().min(1) }).safeParse(req.params);
+    if (!parsed.success) return reply.code(400).send(validationFailure("Invalid notification reference", parsed.error));
+    const row = await prisma.notification.findFirst({ where: { id: parsed.data.id, userId: req.user.id } });
+    if (!row) return reply.code(404).send({ error: "Notification not found", reason: "The notification was removed or does not belong to this account.", action: "Refresh the notification center." });
+    return { ...row, actions: actionsForNotification(row.type) };
   });
 
   app.put("/api/notifications/prefs", { preHandler: [app.authenticate] }, async (req) => {
