@@ -136,12 +136,16 @@ async function stored(): Promise<StoredConfig> {
     ...(parsed.success ? parsed.data : {}),
     ...((row?.value ?? {}) as Pick<StoredConfig, "mt5BridgeApiKeyEnc" | "telegramBotTokenEnc" | "twilioAccountSidEnc" | "twilioAuthTokenEnc" | "webSearchApiKeyEnc" | "youtubeApiKeyEnc" | "githubTokenEnc" | "xBearerTokenEnc" | "mcpTokenHash" | "mcpUserId" | "mcpTokenCreatedAt">),
   };
+  const persisted = (row?.value ?? {}) as Record<string, unknown>;
+  const missingRuntimeFields = Object.keys(defaults()).some((key) => !(key in persisted));
   if (!row && prisma.systemSetting?.upsert) {
     await prisma.systemSetting.upsert({
       where: { key: KEY },
       create: { key: KEY, value: value as object },
       update: {},
     }).catch(() => undefined);
+  } else if (row && missingRuntimeFields) {
+    await prisma.systemSetting.update({ where: { key: KEY }, data: { value: value as object } }).catch(() => undefined);
   }
   cache = { value, at: Date.now() };
   return value;
