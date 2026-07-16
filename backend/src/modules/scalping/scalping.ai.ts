@@ -9,6 +9,7 @@ import type { ScalpingConfig } from "./scalping.schema.js";
 import { aiFireControlActive } from "./scalping.types.js";
 import type { ScalpingAiDecision } from "./scalping.types.js";
 import { prisma } from "../../lib/prisma.js";
+import { getOperationalConfig } from "../system/operational-config.js";
 
 /**
  * Scalping AI "fire control".
@@ -70,7 +71,6 @@ export interface ScalpingPlan {
 
 const planCache = new Map<string, ScalpingPlan>();
 const decisionHistory: ScalpingAiDecision[] = [];
-const MAX_HISTORY = 50;
 
 function key(symbol: string): string {
   return symbol.toUpperCase();
@@ -146,7 +146,8 @@ export async function refreshPlan(symbol: string, config: ScalpingConfig): Promi
     );
     ai = toScalpingDecision(symbol, decision, logId, valid, config.aiDecisionTtlSeconds);
     decisionHistory.unshift(ai);
-    decisionHistory.length = Math.min(decisionHistory.length, MAX_HISTORY);
+    const { scalpingDecisionHistoryLimit } = await getOperationalConfig();
+    decisionHistory.length = Math.min(decisionHistory.length, scalpingDecisionHistoryLimit);
     // Emit each fire-control verdict to the live activity feed. Frequency is
     // bounded by the per-symbol TTL (default 60s), so this does not spam.
     await audit({

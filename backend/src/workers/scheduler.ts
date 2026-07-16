@@ -43,6 +43,7 @@ let workersRunning = false;
  */
 async function protectiveTick() {
   const state = await getBotState();
+  const operationalConfig = await getOperationalConfig();
   broadcast("bot_state", state);
   await expirePendingTradeApprovals().catch((err) =>
     logError("scheduler", "approval expiry cleanup failed", { error: String(err) }),
@@ -109,7 +110,7 @@ async function protectiveTick() {
   await syncClosedTrades().catch((err) =>
     logError("scheduler", "broker reconciliation failed", { error: String(err) }),
   );
-  await backfillTradeMemories(undefined, 100).catch((err) =>
+  await backfillTradeMemories(undefined, operationalConfig.tradingMemoryBackfillBatchSize).catch((err) =>
     logError("scheduler", "trading-memory learning failed", { error: String(err) }),
   );
 }

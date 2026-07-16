@@ -53,4 +53,5 @@ export function setToken(token: string | null) {
   if (typeof window === "undefined") return;
   if (token) window.localStorage.setItem(TOKEN_KEY, token);
   else window.localStorage.removeItem(TOKEN_KEY);
+  window.dispatchEvent(new Event("mt5bot-auth-changed"));
 }

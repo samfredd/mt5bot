@@ -67,6 +67,15 @@ export async function systemRoutes(app: FastifyInstance) {
   // encrypted at rest and the GET response returns only their presence flags.
   app.get("/api/system/operational-settings", { preHandler: [app.requireRole("ADMIN")] }, async () => getOperationalConfigSummary());
 
+  app.get("/api/system/ui-settings", { preHandler: [app.authenticate] }, async () => {
+    const config = await getOperationalConfigSummary();
+    return {
+      toastDefaultDurationMs: config.toastDefaultDurationMs,
+      toastErrorDurationMs: config.toastErrorDurationMs,
+      toastStackLimit: config.toastStackLimit,
+    };
+  });
+
   app.put("/api/system/operational-settings", { preHandler: [app.requireRole("ADMIN")] }, async (req, reply) => {
     const body = z.intersection(
       OperationalConfigSchema.partial(),

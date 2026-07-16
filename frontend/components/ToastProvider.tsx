@@ -2,6 +2,7 @@
 
 import { createContext, useCallback, useContext, useEffect, useMemo, useState } from "react";
 import { IconActivity, IconBell, IconCheck, IconInfo, IconX } from "@/components/icons";
+import { api, getToken } from "@/lib/api";
 
 export type ToastTone = "info" | "success" | "warning" | "error" | "activity";
 export interface ToastInput {
@@ -28,11 +29,22 @@ interface ToastApi {
 }
 
 const ToastContext = createContext<ToastApi | null>(null);
-const DEFAULT_DURATION_MS = 6500;
-const MAX_TOASTS = 5;
+interface ToastPreferences { toastDefaultDurationMs: number; toastErrorDurationMs: number; toastStackLimit: number; }
+const INITIAL_PREFERENCES: ToastPreferences = { toastDefaultDurationMs: 6500, toastErrorDurationMs: 9000, toastStackLimit: 5 };
 
 export function ToastProvider({ children }: { children: React.ReactNode }) {
   const [items, setItems] = useState<ToastItem[]>([]);
+  const [preferences, setPreferences] = useState<ToastPreferences>(INITIAL_PREFERENCES);
+
+  useEffect(() => {
+    const load = () => {
+      if (!getToken()) return;
+      void api<ToastPreferences>("/api/system/ui-settings").then(setPreferences).catch(() => undefined);
+    };
+    load();
+    window.addEventListener("mt5bot-auth-changed", load);
+    return () => window.removeEventListener("mt5bot-auth-changed", load);
+  }, []);
 
   const dismiss = useCallback((id: string) => {
     setItems((current) => current.filter((item) => item.id !== id));
@@ -48,29 +60,29 @@ export function ToastProvider({ children }: { children: React.ReactNode }) {
         item.title === input.title && item.description === input.description && now - item.createdAt < 1500,
       );
       if (duplicate) return current;
-      return [{ ...input, tone: input.tone ?? "info", id, createdAt: now }, ...current].slice(0, MAX_TOASTS);
+      return [{ ...input, tone: input.tone ?? "info", id, createdAt: now }, ...current].slice(0, preferences.toastStackLimit);
     });
     return id;
-  }, []);
+  }, [preferences.toastStackLimit]);
 
   useEffect(() => {
     if (items.length === 0) return;
     const timer = window.setInterval(() => {
       const now = Date.now();
-      setItems((current) => current.filter((item) => now - item.createdAt < (item.durationMs ?? DEFAULT_DURATION_MS)));
+      setItems((current) => current.filter((item) => now - item.createdAt < (item.durationMs ?? preferences.toastDefaultDurationMs)));
     }, 500);
     return () => window.clearInterval(timer);
-  }, [items.length]);
+  }, [items.length, preferences.toastDefaultDurationMs]);
 
   const value = useMemo<ToastApi>(() => ({
     show,
     success: (title, description) => show({ tone: "success", title, description }),
-    error: (title, description) => show({ tone: "error", title, description, durationMs: 9000 }),
+    error: (title, description) => show({ tone: "error", title, description, durationMs: preferences.toastErrorDurationMs }),
     warning: (title, description) => show({ tone: "warning", title, description }),
     info: (title, description) => show({ tone: "info", title, description }),
     dismiss,
     dismissAll,
-  }), [dismiss, dismissAll, show]);
+  }), [dismiss, dismissAll, preferences.toastErrorDurationMs, show]);
 
   return (
     <ToastContext.Provider value={value}>

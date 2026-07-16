@@ -52,7 +52,7 @@ export function NotificationsBell({ liveEvent }: { liveEvent: number }) {
 
   const unread = items.filter((notification) => notification.createdAt > lastSeen).length;
   const visibleItems = useMemo(
-    () => (unreadOnly ? items.filter((notification) => notification.createdAt > lastSeen) : items).slice(0, 50),
+    () => (unreadOnly ? items.filter((notification) => notification.createdAt > lastSeen) : items),
     [items, lastSeen, unreadOnly],
   );
 

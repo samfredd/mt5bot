@@ -52,6 +52,11 @@ export const OperationalConfigSchema = z.object({
   paperExpectedSlippagePoints: z.number().min(0).default(2),
   paperCommissionPerLot: z.number().min(0).default(7),
   notificationHistoryLimit: z.number().int().positive().default(50),
+  toastDefaultDurationMs: z.number().int().min(250).default(6_500),
+  toastErrorDurationMs: z.number().int().min(250).default(9_000),
+  toastStackLimit: z.number().int().positive().default(5),
+  scalpingDecisionHistoryLimit: z.number().int().positive().default(50),
+  tradingMemoryBackfillBatchSize: z.number().int().positive().default(100),
 });
 
 export type OperationalConfig = z.infer<typeof OperationalConfigSchema>;

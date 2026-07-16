@@ -224,6 +224,11 @@ type Operational = {
   paperExpectedSlippagePoints: number;
   paperCommissionPerLot: number;
   notificationHistoryLimit: number;
+  toastDefaultDurationMs: number;
+  toastErrorDurationMs: number;
+  toastStackLimit: number;
+  scalpingDecisionHistoryLimit: number;
+  tradingMemoryBackfillBatchSize: number;
 };
 
 function OperationalSettings({ onMsg }: { onMsg: ToastReporter }) {
@@ -318,6 +323,11 @@ function OperationalSettings({ onMsg }: { onMsg: ToastReporter }) {
             ["paperExpectedSlippagePoints", "Paper slippage (points)", 0],
             ["paperCommissionPerLot", "Paper commission per lot", 0],
             ["notificationHistoryLimit", "Notification history size", 1],
+            ["toastDefaultDurationMs", "Toast duration (ms)", 250],
+            ["toastErrorDurationMs", "Error toast duration (ms)", 250],
+            ["toastStackLimit", "Maximum stacked toasts", 1],
+            ["scalpingDecisionHistoryLimit", "Scalping decision history size", 1],
+            ["tradingMemoryBackfillBatchSize", "Memory learning batch size", 1],
           ] as const).map(([key, label, min]) => <label key={key}><span className="label">{label}</span><input className="input tnum" type="number" min={min} step={min >= 1 ? 1 : 0.01} value={cfg[key]} onChange={(event) => setCfg({ ...cfg, [key]: Number(event.target.value) })} /></label>)}
         </div>
       </div>
